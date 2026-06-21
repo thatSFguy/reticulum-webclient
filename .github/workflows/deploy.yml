@@ -41,6 +41,33 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: JS module syntax check
+        # No build step means a JavaScript syntax error ships straight to
+        # users. A duplicate top-level declaration is a SyntaxError that
+        # aborts the WHOLE module (this bit us in v0.7.0–v0.9.0: app.js
+        # silently failed to load). Parse every module AS an ES module via
+        # `node --check` (.mjs) so module-scope errors — duplicate top-level
+        # let/const/function/class, bad import/export syntax — fail the
+        # deploy before anything goes live. `--check` only parses; it does
+        # not resolve imports, so bare specifiers and relative paths are fine.
+        run: |
+          node --version
+          fail=0
+          for f in js/*.js lib/*.js; do
+            tmp="$(mktemp --suffix=.mjs)"
+            cp "$f" "$tmp"
+            if err="$(node --check "$tmp" 2>&1)"; then
+              echo "ok    $f"
+            else
+              echo "FAIL  $f"; echo "$err"; fail=1
+            fi
+            rm -f "$tmp"
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::JavaScript module syntax check failed — not deploying"
+            exit 1
+          fi
+
       - name: Sync version badge from package.json
         # Single source of truth for the semantic version is package.json.
         # This step rewrites the two "v?.?.?" tokens that immediately

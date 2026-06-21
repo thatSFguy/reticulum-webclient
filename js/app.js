@@ -2572,6 +2572,29 @@ function isLocalWs(wsUrl) {
   } catch { return false; }
 }
 
+// Build the full WebSocket URL from the ws-url + ws-rnsd fields, appending
+// the Go bridge's required ?host=X&port=Y query params. Returns
+// { baseUrl, rnsdTarget, url } or { error }. Shared by connect() and the
+// bridge liveness probe so both hit the bridge the same way — the Go bridge
+// rejects (HTTP 400) any WS without host/port, so probing the bare baseUrl
+// would always look "down" even with the bridge running.
+function buildWsTarget() {
+  const baseUrl = ($('ws-url')?.value || '').trim();
+  const rnsdTarget = ($('ws-rnsd')?.value || '').trim();
+  if (!baseUrl) return { error: 'WebSocket URL is empty' };
+  let url = baseUrl;
+  if (rnsdTarget) {
+    const colonIx = rnsdTarget.lastIndexOf(':');
+    if (colonIx <= 0) return { error: `Reticulum daemon target must be host:port (got "${rnsdTarget}")` };
+    const host = rnsdTarget.slice(0, colonIx);
+    const port = rnsdTarget.slice(colonIx + 1);
+    if (!/^\d+$/.test(port)) return { error: `Reticulum daemon port must be numeric (got "${port}")` };
+    const sep = baseUrl.includes('?') ? '&' : '?';
+    url = `${baseUrl}${sep}host=${encodeURIComponent(host)}&port=${encodeURIComponent(port)}`;
+  }
+  return { baseUrl, rnsdTarget, url };
+}
+
 // Resolve true if a WebSocket to baseUrl reaches the open state within
 // timeoutMs (i.e. the bridge is listening). No query params — we only
 // want a liveness check, not to make the bridge dial the rnsd.
@@ -2590,9 +2613,9 @@ function stopBridgePoll() { if (bridgePollTimer) { clearInterval(bridgePollTimer
 
 function hideBridgeModal() { stopBridgePoll(); $('bridge-modal')?.classList.add('hidden'); }
 
-async function attemptBridgeReconnect(baseUrl) {
-  if (!baseUrl) return false;
-  if (await probeBridge(baseUrl)) {
+async function attemptBridgeReconnect(probeUrl) {
+  if (!probeUrl) return false;
+  if (await probeBridge(probeUrl)) {
     hideBridgeModal();
     connect('ws');
     return true;
@@ -2600,7 +2623,9 @@ async function attemptBridgeReconnect(baseUrl) {
   return false;
 }
 
-function showBridgeModal(baseUrl) {
+// `baseUrl` is shown to the user; `probeUrl` (with ?host&port) is what we
+// actually poll so the Go bridge accepts the upgrade.
+function showBridgeModal(baseUrl, probeUrl) {
   const modal = $('bridge-modal');
   if (!modal) return;
   $('bridge-target').textContent = baseUrl;
@@ -2624,7 +2649,7 @@ function showBridgeModal(baseUrl) {
   modal.classList.remove('hidden');
   // Auto-reconnect the moment the bridge starts listening.
   stopBridgePoll();
-  bridgePollTimer = setInterval(() => { attemptBridgeReconnect(baseUrl); }, 2500);
+  bridgePollTimer = setInterval(() => { attemptBridgeReconnect(probeUrl || baseUrl); }, 2500);
 }
 
 // ---- TCP connect dialog (main-screen entry point) -------------------
@@ -2667,30 +2692,15 @@ async function connect(transportType) {
     //   'ble' / 'serial' → RNode-over-KISS (owns a radio)
     //   'ws'             → rnsd-over-HDLC (no radio, direct to a Reticulum daemon)
     if (transportType === 'ws') {
-      const baseUrl = ($('ws-url').value || '').trim();
-      const rnsdTarget = ($('ws-rnsd').value || '').trim();
-      if (!baseUrl) { log('err', 'WebSocket URL is empty'); return; }
-
-      // The Go bridge takes the rnsd target per-connection via query
-      // params (?host=X&port=Y). The Python bridge ignores the query
-      // and uses its own --rnsd-host/--rnsd-port flags, so the same
-      // URL works against either bridge — the Python one just ignores
-      // the extra params.
-      let url = baseUrl;
-      if (rnsdTarget) {
-        const colonIx = rnsdTarget.lastIndexOf(':');
-        if (colonIx <= 0) {
-          log('err', `Reticulum daemon target must be host:port (got "${rnsdTarget}")`);
-          return;
-        }
-        const host = rnsdTarget.slice(0, colonIx);
-        const port = rnsdTarget.slice(colonIx + 1);
-        if (!/^\d+$/.test(port)) {
-          log('err', `Reticulum daemon port must be numeric (got "${port}")`);
-          return;
-        }
-        const sep = baseUrl.includes('?') ? '&' : '?';
-        url = `${baseUrl}${sep}host=${encodeURIComponent(host)}&port=${encodeURIComponent(port)}`;
+      // The Go bridge takes the rnsd target per-connection via query params
+      // (?host=X&port=Y) and REJECTS a WS with no target (HTTP 400). The
+      // Python bridge ignores the query and uses its own flags, so the same
+      // URL works against either. buildWsTarget() assembles it.
+      const t = buildWsTarget();
+      if (t.error) { log('err', t.error); return; }
+      const { baseUrl, rnsdTarget, url } = t;
+      if (!rnsdTarget) {
+        log('err', 'No Reticulum daemon target set. The bundled (Go) bridge needs a host:port — enter it in the TCP dialog or Settings (e.g. localhost:4242).');
       }
 
       // Persist both fields so the user doesn't re-type on every reload.
@@ -2760,8 +2770,8 @@ async function connect(transportType) {
     // A failed connection to a local bridge almost always means the
     // bridge isn't running — offer the one-click download + auto-retry.
     if (transportType === 'ws') {
-      const baseUrl = ($('ws-url').value || '').trim();
-      if (baseUrl && isLocalWs(baseUrl)) showBridgeModal(baseUrl);
+      const t = buildWsTarget();
+      if (t.baseUrl && isLocalWs(t.baseUrl)) showBridgeModal(t.baseUrl, t.url);
     }
   } finally {
     setConnectButtonsDisabled(false);
