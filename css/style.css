@@ -892,7 +892,7 @@ a { color: var(--accent); }
   flex: 1;
   min-width: 0;
   display: flex;
-  padding: 16px 16px 16px 24px;
+  padding: 16px 24px 16px 16px;
 }
 
 .nodes-map {
@@ -924,7 +924,7 @@ a { color: var(--accent); }
 .nodes-sidebar {
   width: 320px;
   flex-shrink: 0;
-  border-left: 0.5px solid var(--border);
+  border-right: 0.5px solid var(--border);
   background: var(--surface);
   display: flex;
   flex-direction: column;
@@ -933,6 +933,9 @@ a { color: var(--accent); }
 .nodes-sidebar-header {
   padding: 14px 18px 10px;
   border-bottom: 0.5px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .nodes-list {
@@ -1521,12 +1524,12 @@ textarea:focus {
   .view-settings > .notice { margin: 8px 16px; }
 
   .nodes-layout { flex-direction: column; }
-  .nodes-map-wrap { padding: 12px 16px 0; }
+  .nodes-map-wrap { padding: 12px 16px 16px; }
   .nodes-map { min-height: 260px; }
   .nodes-sidebar {
     width: 100%;
-    border-left: none;
-    border-top: 0.5px solid var(--border);
+    border-right: none;
+    border-bottom: 0.5px solid var(--border);
     max-height: 45vh;
   }
   .nodes-list { padding: 12px 16px 24px; }
@@ -1580,11 +1583,28 @@ textarea:focus {
 .nn-body { flex: 1 1 auto; display: flex; min-height: 0; }
 .nn-sidebar {
   flex: 0 0 220px;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
   border-right: 1px solid var(--border);
   background: var(--surface);
   padding: 8px;
+  min-height: 0;
 }
+.nn-nodes-list { overflow-y: auto; flex: 1 1 auto; min-height: 0; }
+
+/* Shared filter input for the Nodes and NomadNet sidebars. */
+.list-search {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+.list-search::placeholder { color: var(--text-muted); }
 .nn-side-title {
   font-size: 11px;
   text-transform: uppercase;

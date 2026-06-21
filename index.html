@@ -171,17 +171,19 @@
         <button id="btn-clear-nodes" class="btn-secondary">Clear all</button>
       </div>
       <div class="nodes-layout">
+        <aside class="nodes-sidebar">
+          <div class="nodes-sidebar-header">
+            <span class="rp-title">Nodes seen</span>
+            <input id="nodes-search" class="list-search" type="text" placeholder="Filter nodes…"
+                   autocomplete="off" autocapitalize="off" spellcheck="false">
+          </div>
+          <div id="nodes-list" class="nodes-list"></div>
+        </aside>
         <div class="nodes-map-wrap">
           <div id="nodes-map" class="nodes-map">
             <div class="nodes-map-placeholder">Open the Nodes view to initialise the map. No nodes with coordinates yet.</div>
           </div>
         </div>
-        <aside class="nodes-sidebar">
-          <div class="nodes-sidebar-header">
-            <span class="rp-title">Nodes seen</span>
-          </div>
-          <div id="nodes-list" class="nodes-list"></div>
-        </aside>
       </div>
     </section>
 
@@ -496,7 +498,11 @@
         <button id="nn-bookmark" class="btn-icon" title="Bookmark this page">☆</button>
       </div>
       <div class="nn-body">
-        <aside class="nn-sidebar" id="nn-nodes"></aside>
+        <aside class="nn-sidebar">
+          <input id="nn-search" class="list-search" type="text" placeholder="Filter nodes & bookmarks…"
+                 autocomplete="off" autocapitalize="off" spellcheck="false">
+          <div id="nn-nodes" class="nn-nodes-list"></div>
+        </aside>
         <div class="nn-main">
           <div id="nn-status" class="nn-status nn-status-info">Pick a NomadNet node, or enter a node hash above.</div>
           <article id="nn-page" class="nn-page"></article>

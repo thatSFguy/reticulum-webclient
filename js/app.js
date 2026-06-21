@@ -647,6 +647,20 @@ async function renderNodesList() {
 
   // Push the enriched rows to the map so markers follow the list.
   updateMapMarkers(rows);
+  applyListFilter('nodes-list', '.node-row', 'nodes-search');
+}
+
+// Client-side filter for a sidebar list: hide rows whose text / hash /
+// url don't contain the search term. Re-applied after each re-render so
+// the filter survives list refreshes.
+function applyListFilter(containerId, rowSelector, inputId) {
+  const term = ($(inputId)?.value || '').trim().toLowerCase();
+  const container = $(containerId);
+  if (!container) return;
+  container.querySelectorAll(rowSelector).forEach((row) => {
+    const hay = `${row.textContent} ${row.dataset.hash || ''} ${row.dataset.url || ''}`.toLowerCase();
+    row.style.display = (!term || hay.includes(term)) ? '' : 'none';
+  });
 }
 
 // ---- Nodes map (Leaflet, lazy-loaded) --------------------------------
@@ -1445,19 +1459,54 @@ async function openLinkToContact(contact, timeoutMs = 15000) {
     throw new Error('Contact has no known sig pub; need an announce first');
   }
 
+  // Path preamble — mirror sendMessage: if the destination isn't in our
+  // pathTable, issue a path? request so (a) the relay has a route and
+  // (b) we learn the hop count for the HEADER_2 decision below. Without
+  // this, a LINKREQUEST to a multi-hop NomadNet node is dropped at the
+  // relay and the link silently times out (the cause of "link timeout" on
+  // every page).
+  if (!pathTable.has(toHex(contact.destHash))) {
+    log('info', `  No path known to ${toHex(contact.destHash).substring(0,16)}... — issuing path? preamble`);
+    await requestPath(contact.destHash);
+  }
+
   const { link, requestData } = Link.createInitiator(
     contact.identity.sigPubKey,
     contact.destHash,
   );
 
-  const lrPacket = buildPacket({
-    headerType: HEADER_1,
-    destType:   DEST_SINGLE,
-    packetType: PACKET_LINKREQ,
-    destHash:   contact.destHash,
-    context:    CTX_NONE,
-    payload:    requestData,
-  });
+  // SPEC §2.3 originator HEADER_1 → HEADER_2 conversion, identical to the
+  // messaging path: a LINKREQUEST to a destination >= 1 hop away must carry
+  // the upstream rnsd's transport_id or the relay drops it. link_id is
+  // invariant under H1/H2 (computeLinkId masks the header bits and skips the
+  // transport_id slot, SPEC §6.3), so the responder derives the same id.
+  const pathInfo = pathTable.get(toHex(contact.destHash));
+  let lrPacket;
+  if (pathInfo && pathInfo.hops >= 1 && upstreamTransportId) {
+    lrPacket = buildPacket({
+      headerType:    HEADER_2,
+      transportType: TRANSPORT_TRANSPORT,
+      destType:      DEST_SINGLE,
+      packetType:    PACKET_LINKREQ,
+      destHash:      contact.destHash,
+      transportId:   upstreamTransportId,
+      context:       CTX_NONE,
+      payload:       requestData,
+    });
+    log('info', `  LINKREQUEST HEADER_2: dest ${pathInfo.hops} hops away, transport_id=${toHex(upstreamTransportId).substring(0,16)}...`);
+  } else {
+    lrPacket = buildPacket({
+      headerType: HEADER_1,
+      destType:   DEST_SINGLE,
+      packetType: PACKET_LINKREQ,
+      destHash:   contact.destHash,
+      context:    CTX_NONE,
+      payload:    requestData,
+    });
+    if (pathInfo && pathInfo.hops >= 1) {
+      log('info', `  LINKREQUEST HEADER_1 to ${pathInfo.hops}-hop dest (upstream identity not yet learned — may be dropped at the relay)`);
+    }
+  }
 
   // link_id is derived from the packed LINKREQUEST packet, so it
   // must be computed AFTER buildPacket. Feed the parsed version back
@@ -1844,6 +1893,7 @@ async function renderNomadNetSidebar() {
       renderNomadNetSidebar();
     });
   });
+  applyListFilter('nn-nodes', '.nn-side-row', 'nn-search');
 }
 
 async function nnBookmarkCurrent() {
@@ -2914,6 +2964,10 @@ $('btn-clear-nodes').addEventListener('click', async () => {
   renderNodesList();
   log('info', 'Cleared all nodes');
 });
+
+// Sidebar list filters (Nodes view + NomadNet browser).
+$('nodes-search')?.addEventListener('input', () => applyListFilter('nodes-list', '.node-row', 'nodes-search'));
+$('nn-search')?.addEventListener('input', () => applyListFilter('nn-nodes', '.nn-side-row', 'nn-search'));
 
 // TCP connect dialog (opened from the main-screen "Connect via TCP" buttons).
 document.querySelectorAll('.js-tcp-connect').forEach(b => b.addEventListener('click', openTcpModal));
