@@ -173,9 +173,15 @@
       <div class="nodes-layout">
         <aside class="nodes-sidebar">
           <div class="nodes-sidebar-header">
-            <span class="rp-title">Nodes seen</span>
-            <input id="nodes-search" class="list-search" type="text" placeholder="Filter nodes…"
+            <span class="rp-title">Discovered</span>
+            <input id="nodes-search" class="list-search" type="text" placeholder="Search the mesh…"
                    autocomplete="off" autocapitalize="off" spellcheck="false">
+            <div class="node-filter-chips">
+              <button class="chip active" data-nodefilter="all">All</button>
+              <button class="chip" data-nodefilter="messagable">Peers</button>
+              <button class="chip" data-nodefilter="contacts">Contacts</button>
+              <button class="chip" data-nodefilter="nodes">Nodes</button>
+            </div>
           </div>
           <div id="nodes-list" class="nodes-list"></div>
         </aside>
@@ -540,6 +546,12 @@
     </button>
   </nav>
 
+</div>
+
+<!-- Destination detail sheet (full hash, facts, and Message / Contact /
+     Delete actions). Populated dynamically by openDestDetail(). -->
+<div id="dest-modal" class="modal-overlay hidden">
+  <div class="modal dest-sheet" id="dest-modal-card"></div>
 </div>
 
 <!-- TCP / rnsd connection dialog (reachable from the main screen so

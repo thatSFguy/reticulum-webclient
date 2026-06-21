@@ -1715,3 +1715,74 @@ textarea:focus {
 }
 .modal-link { color: var(--accent-text); font-size: 12px; }
 .modal-buttons { display: flex; gap: 8px; }
+
+/* ---- Messages/Nodes redesign (reticulum-mobile-app parity) ---------- */
+
+/* Hash-seeded avatars get light text regardless of the inline bg color. */
+.contact-avatar, .node-avatar, .dest-avatar { color: #fff; }
+
+.contact-main { cursor: pointer; }
+.contact-star { color: var(--accent); font-size: 11px; }
+.contact-info-btn {
+  width: 22px; height: 22px;
+  border-radius: var(--radius-sm);
+  border: 0.5px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px; line-height: 1; padding: 0;
+  flex-shrink: 0; cursor: pointer;
+}
+.contact-info-btn:hover { color: var(--text); background: var(--surface-hover); }
+
+/* Nodes filter chips */
+.node-filter-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip {
+  padding: 4px 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 12px; cursor: pointer;
+}
+.chip:hover { background: var(--surface-hover); }
+.chip.active { background: var(--accent-bg); color: var(--accent-text); border-color: var(--accent); }
+
+/* Unified node rows */
+.node-row-id { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.node-avatar {
+  width: 30px; height: 30px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 600; flex-shrink: 0; text-transform: uppercase;
+}
+.node-chevron { color: var(--text-muted); font-size: 18px; flex-shrink: 0; }
+
+/* Destination detail sheet */
+.dest-sheet { max-width: 440px; }
+.dest-head { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+.dest-avatar {
+  width: 48px; height: 48px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 600; flex-shrink: 0; text-transform: uppercase;
+}
+.dest-headtext { min-width: 0; }
+.dest-name { font-size: 17px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.dest-sub { font-size: 12px; color: var(--text-muted); }
+.dest-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.dest-actions button { flex: 1 1 auto; }
+.dest-hashrow {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 10px; padding: 10px 0; border-top: 1px solid var(--border);
+}
+.dest-hashrow code { font-size: 11px; word-break: break-all; color: var(--text); font-family: var(--font-mono); }
+.dest-fact-label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 3px; }
+.dest-copy {
+  flex-shrink: 0; width: 30px; height: 30px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface-2); color: var(--text-2);
+  cursor: pointer; font-size: 14px;
+}
+.dest-copy:hover { background: var(--surface-hover); color: var(--text); }
+.dest-facts { padding: 6px 0; border-top: 1px solid var(--border); }
+.dest-fact { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; padding: 3px 0; }
+.dest-fact span:first-child { color: var(--text-muted); }
+.dest-fact span:last-child { color: var(--text); text-align: right; word-break: break-word; }

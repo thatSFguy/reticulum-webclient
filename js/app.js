@@ -105,8 +105,14 @@ let rnode = new RNode('ble');  // default; can be reassigned
 
 let myIdentity = null;     // Identity instance
 let myDestHash = null;     // Our LXMF destination hash (16 bytes)
-let contacts = new Map();  // hash_hex → { hash, publicKey, displayName, destHash, identity }
+let contacts = new Map();  // hash_hex → { hash, publicKey, displayName, destHash, identity, favorite }
 let activeContactHash = null;
+// destHashHex of every contact we've exchanged a message with — drives the
+// "Messages = favorites + conversations" filter (matches reticulum-mobile-app:
+// the conversation list is message-history ∪ favorited messagable dests, not
+// every announced identity).
+const conversedHashes = new Set();
+let nodeFilter = 'all';  // Nodes-view filter: all | messagable | contacts | nodes
 let radioOn = false;
 let links = new Map();     // hex link_id → Link instance (responder / incoming)
 let initiatorLinks = new Map();  // hex link_id → { link, contact, resolve, reject, timer }
@@ -247,6 +253,11 @@ async function initIdentity() {
   if (purged > 0) {
     log('info', `Removed ${purged} legacy contact${purged === 1 ? '' : 's'} (no verifiable name_hash); valid LXMF peers will return on their next announce`);
   }
+  // Seed the conversation set so the Messages filter knows which contacts
+  // have history (one IDB read at startup; kept current on send/receive).
+  try {
+    for (const m of await getAllMessages()) if (m.contactHash) conversedHashes.add(m.contactHash);
+  } catch (_) { /* non-fatal */ }
   renderContactList();
   renderNodesList();
 }
@@ -395,6 +406,7 @@ async function handleAnnounce(pkt, rssi) {
     ratchetPub: announce.ratchet ? Array.from(announce.ratchet) : null,
     displayName,
     pinned: !!existingContact?.pinned,
+    favorite: !!existingContact?.favorite,
     lastSeen: Date.now(),
     rssi,
   };
@@ -587,66 +599,80 @@ function nodeDisplayLabel(n) {
 async function renderNodesList() {
   const list = $('nodes-list');
   if (!list) return;
-  let rows;
+
+  let nodes;
   try {
-    rows = await getAllNodes();
+    nodes = await getAllNodes();
   } catch (e) {
     list.innerHTML = `<div class="err">Could not load nodes: ${escapeHtml(e.message)}</div>`;
     return;
   }
-  if (!rows.length) {
-    list.innerHTML = '<div class="nodes-empty">No non-LXMF announces yet. This view fills up with repeater telemetry, heartbeats, and anything else on the mesh that is not an LXMF delivery destination.</div>';
-    updateMapMarkers([]);
+  nodes.forEach(enrichNode);
+  // The map always reflects every located non-LXMF node, independent of the
+  // list filter chosen below.
+  updateMapMarkers(nodes);
+
+  // Unified discovery list: LXMF peers (contacts) + non-LXMF nodes, narrowed
+  // by the active filter (mirrors reticulum-mobile-app's single Nodes list).
+  const entries = [];
+  if (nodeFilter === 'messagable' || nodeFilter === 'contacts' || nodeFilter === 'all') {
+    for (const [hash, c] of contacts) {
+      if (nodeFilter === 'contacts' && !c.favorite) continue;
+      entries.push({
+        kind: 'contact', hash, name: c.displayName || shortFingerprint(hash),
+        service: 'lxmf.delivery', rssi: c.rssi, lastSeen: c.lastSeen,
+        favorite: !!c.favorite, located: false, ref: { kind: 'contact', hash },
+      });
+    }
+  }
+  if (nodeFilter === 'nodes' || nodeFilter === 'all') {
+    for (const n of nodes) {
+      entries.push({
+        kind: 'node', hash: n.hash, name: nodeDisplayLabel(n),
+        service: n.appName || 'node', rssi: n.rssi, lastSeen: n.lastSeen,
+        favorite: false, located: n.lat != null && n.lon != null, ref: { kind: 'node', node: n },
+      });
+    }
+  }
+  entries.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+
+  if (entries.length === 0) {
+    const labels = {
+      messagable: 'No messagable peers seen yet.',
+      contacts: 'No Contacts yet — tap a peer and choose Add Contact.',
+      nodes: 'No non-LXMF nodes seen yet.',
+      all: 'Nothing seen on the mesh yet. Announces will appear here.',
+    };
+    list.innerHTML = `<div class="nodes-empty">${labels[nodeFilter] || labels.all}</div>`;
     return;
   }
-  // Enrich once, then sort newest-first.
-  rows.forEach(enrichNode);
-  rows.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+
   list.innerHTML = '';
-  for (const n of rows) {
-    const li = document.createElement('div');
-    li.className = 'node-row';
-    li.dataset.hash = n.hash;
-    const ts = n.lastSeen ? new Date(n.lastSeen).toLocaleString() : '(unknown)';
-    const rssi = (typeof n.rssi === 'number') ? `${n.rssi} dBm` : 'n/a';
-    const label = nodeDisplayLabel(n);
-    const hasCoords = n.lat != null && n.lon != null;
-    const nameHashHex = toHex(new Uint8Array(n.nameHash)).substring(0, 12);
-    const serviceCell = n.appName
-      ? `<span>service <code>${escapeHtml(n.appName)}</code></span>`
-      : `<span>name_hash <code>${nameHashHex}…</code></span>`;
-    const identityCell = n.identityHash
-      ? `<span title="Identity hash — stable per-node identifier">node <code>${n.identityHash.substring(0, 16)}…</code></span>`
-      : '';
-    li.innerHTML =
+  for (const e of entries) {
+    const row = document.createElement('div');
+    row.className = 'node-row';
+    row.dataset.hash = e.hash;
+    const ts = e.lastSeen ? new Date(e.lastSeen).toLocaleString() : '(unknown)';
+    const rssi = (typeof e.rssi === 'number') ? `${e.rssi} dBm` : 'n/a';
+    const geo = e.located ? ' <span class="node-geo-dot" title="Has coordinates">●</span>' : '';
+    const fav = e.favorite ? ' <span class="contact-star" title="Contact">★</span>' : '';
+    row.innerHTML =
       `<div class="node-row-top">
-         <div class="node-name">${escapeHtml(label)}${hasCoords ? ' <span class="node-geo-dot" title="Has coordinates">●</span>' : ''}</div>
-         <button class="node-delete" title="Forget this node">\u00d7</button>
+         <div class="node-row-id">
+           <span class="node-avatar" style="background:${avatarColor(e.hash)}">${escapeHtml(initialsFor(e.name))}</span>
+           <span class="node-name">${escapeHtml(e.name)}${fav}${geo}</span>
+         </div>
+         <span class="node-chevron">›</span>
        </div>
        <div class="node-meta">
-         ${identityCell}
-         <span title="Destination hash — service endpoint on this node">dest <code>${n.hash.substring(0, 16)}…</code></span>
-         ${serviceCell}
+         <span>${escapeHtml(e.service)}</span>
+         <span><code>${shortFingerprint(e.hash)}</code></span>
          <span>RSSI ${rssi}</span>
          <span>${ts}</span>
        </div>`;
-    li.querySelector('.node-delete').addEventListener('click', async (e) => {
-      e.stopPropagation();
-      await deleteNode(n.hash);
-      // Also drop the marker so the map stays in sync.
-      const marker = nodeMarkers.get(n.hash);
-      if (marker && nodesMap) nodesMap.removeLayer(marker);
-      nodeMarkers.delete(n.hash);
-      renderNodesList();
-    });
-    if (hasCoords) {
-      li.addEventListener('click', () => focusNodeOnMap(n.hash));
-    }
-    list.appendChild(li);
+    row.addEventListener('click', () => openDestDetail(e.ref));
+    list.appendChild(row);
   }
-
-  // Push the enriched rows to the map so markers follow the list.
-  updateMapMarkers(rows);
   applyListFilter('nodes-list', '.node-row', 'nodes-search');
 }
 
@@ -1196,6 +1222,7 @@ async function dispatchIncomingMessage(msg, rxInfo) {
     dupeCount: 1,
   };
   const dbId = await saveMessage(savedMsg);
+  conversedHashes.add(savedMsg.contactHash);  // surface this thread in Messages
   log('info', `  Saved under contactHash=${savedMsg.contactHash.substring(0, 16)}... activeContact=${activeContactHash ? activeContactHash.substring(0, 16) + '...' : '(none)'}`);
 
   // Track in the dedupe map so future duplicates increment the count.
@@ -2029,6 +2056,7 @@ async function sendMessage() {
       nextRetryAt: 0,
     };
     const id = await saveMessage(row);
+    conversedHashes.add(activeContactHash);  // keep this thread in Messages
 
     $('msg-content').value = '';
     await renderMessages(activeContactHash);
@@ -2220,16 +2248,14 @@ async function sendAnnounce({ pathResponse = false } = {}) {
 
 function renderContactList() {
   const list = $('contact-list');
-  if (contacts.size === 0) {
-    list.innerHTML = '<li class="contact-empty">Listening for announces…</li>';
-    return;
-  }
 
-  // Apply pinned-only and search filters before rendering. Search
-  // matches against displayName and hash (case-insensitive substring).
+  // Messages = conversations: favorited (Contact) or pinned identities, plus
+  // anyone with message history. Announced-but-unmessaged peers live on the
+  // Nodes tab, not here (mirrors reticulum-mobile-app).
   const term = contactSearchTerm.trim().toLowerCase();
   const rows = [];
   for (const [hash, c] of contacts) {
+    if (!(c.favorite || c.pinned || conversedHashes.has(hash))) continue;
     if (contactFilterPinnedOnly && !c.pinned) continue;
     if (term) {
       const name = (c.displayName || '').toLowerCase();
@@ -2241,11 +2267,11 @@ function renderContactList() {
   rows.sort((a, b) => (b[1].pinned ? 1 : 0) - (a[1].pinned ? 1 : 0));
 
   if (rows.length === 0) {
-    const msg = contactFilterPinnedOnly && contacts.size > 0
-      ? 'No pinned contacts. Click ☆ on a contact to pin it.'
+    const msg = contactFilterPinnedOnly
+      ? 'No pinned conversations.'
       : term
-        ? `No contacts match "${escapeHtml(contactSearchTerm)}"`
-        : 'Listening for announces…';
+        ? `No conversations match "${escapeHtml(contactSearchTerm)}"`
+        : 'No conversations yet — open the Nodes tab, tap a node, and choose Message (or ★ to add a Contact).';
     list.innerHTML = `<li class="contact-empty">${msg}</li>`;
     return;
   }
@@ -2259,11 +2285,13 @@ function renderContactList() {
     const initials = initialsFor(c.displayName || hash);
     const shortHash = `${hash.substring(0, 8)}…${hash.substring(hash.length - 4)}`;
     const placeholderTag = c.placeholder ? ' <span class="contact-tag">unannounced</span>' : '';
+    const star = c.favorite ? ' <span class="contact-star" title="Contact">★</span>' : '';
     const info = document.createElement('div');
+    info.className = 'contact-main';
     info.innerHTML = `
-      <div class="contact-avatar">${escapeHtml(initials)}</div>
+      <div class="contact-avatar" style="background:${avatarColor(hash)}">${escapeHtml(initials)}</div>
       <div style="flex:1; min-width:0">
-        <div class="contact-name">${escapeHtml(c.displayName || hash.substring(0, 8))}${unread}${placeholderTag}</div>
+        <div class="contact-name">${escapeHtml(c.displayName || hash.substring(0, 8))}${star}${unread}${placeholderTag}</div>
         <div class="contact-hash">${shortHash}</div>
       </div>`;
     info.addEventListener('click', () => selectContact(hash));
@@ -2286,9 +2314,21 @@ function renderContactList() {
       removeContact(hash);
     });
 
+    // Details button — opens the shared sheet with the full hash, facts, and
+    // the Contact (favorite) toggle (mobile "lead with the human" pattern).
+    const infoBtn = document.createElement('button');
+    infoBtn.className = 'contact-info-btn';
+    infoBtn.title = 'Details';
+    infoBtn.textContent = 'ℹ';   // info
+    infoBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openDestDetail({ kind: 'contact', hash });
+    });
+
     li.appendChild(info);
     li.appendChild(pin);
     li.appendChild(del);
+    li.appendChild(infoBtn);
     list.appendChild(li);
   }
 }
@@ -2309,11 +2349,184 @@ async function togglePin(hash) {
     displayName: c.displayName,
     placeholder: !!c.placeholder,
     pinned: c.pinned,
+    favorite: !!c.favorite,
     lastSeen: c.lastSeen,
     rssi: c.rssi,
   };
   await saveContact(stored);
   renderContactList();
+}
+
+// Serialize an in-memory contact to the plain IDB shape (Identity instances
+// and typed arrays stripped). Shared by the favorite toggle and node-derived
+// contact creation so every persisted contact has the same fields.
+function serializeContact(c) {
+  return {
+    hash: c.hash,
+    identityHash: c.identityHash,
+    publicKey: c.publicKey instanceof Uint8Array ? Array.from(c.publicKey) : (c.publicKey || []),
+    destHash: c.destHash instanceof Uint8Array ? Array.from(c.destHash) : c.destHash,
+    nameHash: c.nameHash instanceof Uint8Array ? Array.from(c.nameHash) : c.nameHash,
+    ratchetPub: c.ratchetPub instanceof Uint8Array ? Array.from(c.ratchetPub) : (c.ratchetPub || null),
+    displayName: c.displayName,
+    placeholder: !!c.placeholder,
+    pinned: !!c.pinned,
+    favorite: !!c.favorite,
+    lastSeen: c.lastSeen,
+    rssi: c.rssi,
+  };
+}
+
+// ---- Destination detail sheet ----------------------------------------
+//
+// The one place full technical detail lives (mirrors reticulum-mobile-app's
+// DestinationDetailSheet): full hash + copy, identity hash, public-key
+// known/not, last seen / RSSI, and the actions Message / Contact toggle /
+// Pin / Delete. Opened from an info button on Messages and Nodes rows.
+
+let destModalEntry = null;
+
+function hideDestModal() { destModalEntry = null; $('dest-modal')?.classList.add('hidden'); }
+
+// Derive (and persist, first time) the LXMF delivery contact for a node from
+// its announced public key, so the user can message a node's operator or add
+// them as a Contact. Returns the in-memory contact, or null if no key yet.
+async function lxmfContactFromNode(node) {
+  if (!node?.publicKey || node.publicKey.length !== 64) return null;
+  const identity = new Identity();
+  await identity.loadFromPublicKey(new Uint8Array(node.publicKey));
+  const lxmfDest = await computeDestinationHash('lxmf.delivery', identity.hash);
+  const destHex = toHex(lxmfDest);
+  let c = contacts.get(destHex);
+  if (!c) {
+    c = {
+      hash: destHex,
+      identityHash: toHex(identity.hash),
+      publicKey: Array.from(node.publicKey),
+      destHash: lxmfDest,
+      nameHash: Array.from(lxmfNameHash),
+      ratchetPub: null,
+      displayName: node.displayName || destHex.slice(0, 8),
+      placeholder: false,
+      pinned: false,
+      favorite: false,
+      lastSeen: node.lastSeen,
+      rssi: node.rssi,
+      identity,
+    };
+    contacts.set(destHex, c);
+    await saveContact(serializeContact(c));
+  }
+  return c;
+}
+
+// Toggle the Contact (favorite) flag on a contact and persist + re-render.
+async function toggleFavorite(hash) {
+  const c = contacts.get(hash);
+  if (!c) return;
+  c.favorite = !c.favorite;
+  await saveContact(serializeContact(c));
+  renderContactList();
+  renderNodesList();
+}
+
+// Open a conversation with a contact hash: switch to Messages and select it.
+function messageContact(hash) {
+  hideDestModal();
+  switchView('messages');
+  selectContact(hash);
+}
+
+// Open the detail sheet. `entry` = { kind:'contact', hash } or { kind:'node', node }.
+async function openDestDetail(entry) {
+  const card = $('dest-modal-card');
+  const modal = $('dest-modal');
+  if (!card || !modal) return;
+  destModalEntry = entry;
+
+  // Resolve a common view model from either a contact or a node.
+  let name, fullHash, identityHash, keyKnown, lastSeen, rssi, source, messagableHash, isFavorite, isPinned, telemetry;
+  if (entry.kind === 'contact') {
+    const c = contacts.get(entry.hash);
+    if (!c) { hideDestModal(); return; }
+    name = c.displayName || shortFingerprint(c.hash);
+    fullHash = c.hash;
+    identityHash = c.identityHash || null;
+    keyKnown = !!(c.publicKey && c.publicKey.length);
+    lastSeen = c.lastSeen; rssi = c.rssi; source = 'announce';
+    messagableHash = keyKnown ? c.hash : null;
+    isFavorite = !!c.favorite; isPinned = !!c.pinned;
+  } else {
+    const n = entry.node;
+    name = nodeDisplayLabel ? nodeDisplayLabel(n) : (n.displayName || n.hash.slice(0, 8));
+    fullHash = n.hash;
+    identityHash = n.identityHash || null;
+    keyKnown = !!(n.publicKey && n.publicKey.length === 64);
+    lastSeen = n.lastSeen; rssi = n.rssi; source = n.appName || 'announce';
+    telemetry = n.telemetry || null;
+    // A node is messagable if we can derive its operator's lxmf identity.
+    const derived = keyKnown ? await computeDestinationHash('lxmf.delivery', (await (async () => { const id = new Identity(); await id.loadFromPublicKey(new Uint8Array(n.publicKey)); return id.hash; })())) : null;
+    messagableHash = derived ? toHex(derived) : null;
+    const dc = messagableHash ? contacts.get(messagableHash) : null;
+    isFavorite = !!dc?.favorite; isPinned = !!dc?.pinned;
+  }
+
+  const fact = (label, val) => val == null || val === '' ? '' :
+    `<div class="dest-fact"><span>${label}</span><span>${escapeHtml(String(val))}</span></div>`;
+  const seenAgo = lastSeen ? new Date(lastSeen).toLocaleString() : null;
+  const rssiTxt = (typeof rssi === 'number') ? `${rssi} dBm` : null;
+
+  card.innerHTML = `
+    <div class="dest-head">
+      <div class="dest-avatar" style="background:${avatarColor(fullHash)}">${escapeHtml(initialsFor(name))}</div>
+      <div class="dest-headtext"><div class="dest-name">${escapeHtml(name)}</div>
+        <div class="dest-sub">${escapeHtml(source || '')}</div></div>
+    </div>
+    <div class="dest-actions">
+      ${messagableHash ? '<button id="dest-message" class="btn-primary">Message</button>' : ''}
+      <button id="dest-fav" class="btn-secondary">${isFavorite ? 'Remove Contact' : 'Add Contact'}</button>
+      <button id="dest-delete" class="btn-danger">Delete</button>
+    </div>
+    <div class="dest-hashrow">
+      <div><div class="dest-fact-label">Destination hash</div><code id="dest-hash">${escapeHtml(fullHash)}</code></div>
+      <button class="dest-copy" data-copy="${escapeHtml(fullHash)}" title="Copy">⧉</button>
+    </div>
+    ${identityHash ? `<div class="dest-hashrow"><div><div class="dest-fact-label">Identity hash</div><code>${escapeHtml(identityHash)}</code></div><button class="dest-copy" data-copy="${escapeHtml(identityHash)}" title="Copy">⧉</button></div>` : ''}
+    <div class="dest-facts">
+      ${fact('Public key', keyKnown ? 'known' : 'not yet known')}
+      ${fact('Last seen', seenAgo)}
+      ${fact('Signal', rssiTxt)}
+      ${telemetry ? fact('Telemetry', Object.entries(telemetry).map(([k, v]) => `${k}=${v}`).join(' ')) : ''}
+    </div>
+    <div class="modal-actions"><span class="modal-hint">Address details — never sent on the wire beyond the hash.</span>
+      <button id="dest-close" class="btn-secondary">Close</button></div>`;
+
+  modal.classList.remove('hidden');
+
+  card.querySelectorAll('.dest-copy').forEach((b) => b.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = '✓'; setTimeout(() => { b.textContent = '⧉'; }, 1200); }
+    catch { /* clipboard blocked */ }
+  }));
+  $('dest-close')?.addEventListener('click', hideDestModal);
+
+  $('dest-message')?.addEventListener('click', async () => {
+    let target = messagableHash;
+    if (entry.kind === 'node') { const c = await lxmfContactFromNode(entry.node); target = c?.hash || target; }
+    if (target) messageContact(target);
+  });
+
+  $('dest-fav')?.addEventListener('click', async () => {
+    let target = entry.kind === 'contact' ? entry.hash : messagableHash;
+    if (entry.kind === 'node') { const c = await lxmfContactFromNode(entry.node); target = c?.hash || target; }
+    if (target) { await toggleFavorite(target); }
+    hideDestModal();
+  });
+
+  $('dest-delete')?.addEventListener('click', async () => {
+    hideDestModal();
+    if (entry.kind === 'contact') removeContact(entry.hash);
+    else { await deleteNode(entry.node.hash); renderNodesList(); }
+  });
 }
 
 async function removeContact(hash) {
@@ -2453,6 +2666,22 @@ function initialsFor(name) {
     return (parts[0][0] + parts[1][0]).toUpperCase();
   }
   return clean.substring(0, 2).toUpperCase();
+}
+
+// Hash-seeded avatar background (Meshtastic/reticulum-mobile-app style): every
+// destination gets a stable, distinct chip color derived from its hash hex.
+function avatarColor(seed) {
+  let h = 0;
+  const s = String(seed || '');
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return `hsl(${h % 360} 55% 45%)`;
+}
+
+// Short fingerprint shown on list rows — first8…last8 of the hash hex. Full
+// hashes live only in the detail sheet ("lead with the human, hide the machine").
+function shortFingerprint(hex) {
+  if (!hex) return '';
+  return hex.length > 18 ? `${hex.slice(0, 8)}…${hex.slice(-8)}` : hex;
 }
 
 function setConnectionState(on, label) {
@@ -2968,6 +3197,16 @@ $('btn-clear-nodes').addEventListener('click', async () => {
 // Sidebar list filters (Nodes view + NomadNet browser).
 $('nodes-search')?.addEventListener('input', () => applyListFilter('nodes-list', '.node-row', 'nodes-search'));
 $('nn-search')?.addEventListener('input', () => applyListFilter('nn-nodes', '.nn-side-row', 'nn-search'));
+
+// Nodes-view filter chips (All / Peers / Contacts / Nodes).
+document.querySelectorAll('[data-nodefilter]').forEach((b) => b.addEventListener('click', () => {
+  nodeFilter = b.dataset.nodefilter;
+  document.querySelectorAll('[data-nodefilter]').forEach((x) => x.classList.toggle('active', x === b));
+  renderNodesList();
+}));
+
+// Destination detail sheet: click the dimmed backdrop (not the card) to close.
+$('dest-modal')?.addEventListener('click', (e) => { if (e.target === $('dest-modal')) hideDestModal(); });
 
 // TCP connect dialog (opened from the main-screen "Connect via TCP" buttons).
 document.querySelectorAll('.js-tcp-connect').forEach(b => b.addEventListener('click', openTcpModal));
