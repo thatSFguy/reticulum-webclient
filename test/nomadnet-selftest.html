@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NomadNet modules self-test</title>
+<style>
+  body { font-family: ui-monospace, Menlo, monospace; background: #1a1a1a; color: #ddd; padding: 20px; }
+  h1 { font-size: 16px; }
+  .pass { color: #5DCAA5; }
+  .fail { color: #F09595; font-weight: 700; }
+  .case { padding: 2px 0; white-space: pre-wrap; }
+  #summary { font-size: 15px; margin: 12px 0; padding: 8px; border: 1px solid #444; }
+  #preview { margin-top: 20px; padding: 12px; background: #fff; color: #111; }
+</style>
+<!-- Same bare-specifier resolution as index.html, adjusted for test/ depth. -->
+<script type="importmap">
+{
+  "imports": {
+    "@noble/curves/ed25519": "../lib/noble-curves-ed25519.js",
+    "@msgpack/msgpack": "../lib/msgpack.js"
+  }
+}
+</script>
+</head>
+<body>
+<h1>NomadNet modules self-test</h1>
+<div id="summary">running…</div>
+<div id="results"></div>
+<h1>micron render preview</h1>
+<div id="preview"></div>
+
+<script type="module">
+import { bunzip2 } from '../lib/bz2.js';
+import { renderMicron } from '../js/micron.js';
+import { encode as mp } from '@msgpack/msgpack';
+import { buildRequest, parseResponse, parseLinkTarget, stripPageHeaders, requestPathHash } from '../js/nomadnet.js';
+import { parseAdvertisement } from '../js/resource.js';
+import { decode as mpDecode } from '@msgpack/msgpack';
+
+const results = document.getElementById('results');
+let pass = 0, fail = 0;
+function check(name, cond, detail = '') {
+  const div = document.createElement('div');
+  div.className = 'case ' + (cond ? 'pass' : 'fail');
+  div.textContent = (cond ? '✓ ' : '✗ ') + name + (cond ? '' : '  — ' + detail);
+  results.appendChild(div);
+  cond ? pass++ : fail++;
+}
+const hex = (b) => Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
+const fromHex = (h) => { const a = new Uint8Array(h.length / 2); for (let i = 0; i < a.length; i++) a[i] = parseInt(h.substr(i*2,2),16); return a; };
+const eqBytes = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+try {
+  // ---- bz2 ----
+  const vectors = await (await fetch('./bz2-vectors.json')).json();
+  for (const [name, v] of Object.entries(vectors)) {
+    try {
+      const out = bunzip2(fromHex(v.in_hex), 64 * 1024 * 1024);
+      check(`bz2: ${name} (${v.out_len}B)`, hex(out) === v.out_hex, `got ${out.length}B`);
+    } catch (e) { check(`bz2: ${name}`, false, e.message); }
+  }
+  // bz2 cap enforcement
+  try { bunzip2(fromHex(vectors.repeat.in_hex), 10); check('bz2: cap aborts oversized', false, 'no throw'); }
+  catch { check('bz2: cap aborts oversized', true); }
+
+  // ---- nomadnet request/response ----
+  const ph = await requestPathHash('/page/index.mu');
+  check('requestPathHash(/page/index.mu)', hex(ph) === 'fb40abf359b3f25fa0086107c5eee516', hex(ph));
+
+  const reqBytes = await buildRequest('/page/index.mu', null);
+  const env = mpDecode(reqBytes);
+  check('buildRequest envelope shape', Array.isArray(env) && env.length === 3 && typeof env[0] === 'number' && env[1].length === 16 && env[2] === null);
+
+  const rid = new Uint8Array(16).fill(7);
+  const respWire = new Uint8Array(mp([rid, 'page bytes']));
+  const parsed = parseResponse(respWire);
+  check('parseResponse roundtrip', eqBytes(parsed.requestId, rid) && parsed.response === 'page bytes');
+
+  // ---- link target parsing ----
+  const tHash = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6';
+  check('target: same-node path', parseLinkTarget('/page/help.mu').kind === 'page');
+  check('target: bare node hash', (() => { const t = parseLinkTarget(tHash); return t.kind === 'node' && t.path === '/page/index.mu'; })());
+  check('target: node hash + path', (() => { const t = parseLinkTarget(tHash + ':/page/x.mu'); return t.kind === 'node' && t.path === '/page/x.mu'; })());
+  check('target: nnn@ shorthand', parseLinkTarget('nnn@' + tHash).kind === 'node');
+  check('target: lxmf@ shorthand', parseLinkTarget('lxmf@' + tHash).kind === 'lxmf');
+  check('target: rejects bad hash', parseLinkTarget('dead:beef').kind === 'unknown');
+
+  // ---- page headers ----
+  const sh = stripPageHeaders('#!c=0\n#!fg=ff0\nbody line');
+  check('stripPageHeaders', sh.headers.cache === 0 && sh.headers.fg === 'ff0' && sh.body === 'body line');
+
+  // ---- advertisement parse ----
+  const adv = parseAdvertisement(new Uint8Array(mp({
+    t: 500, d: 400, n: 2, h: new Uint8Array(32).fill(1), r: new Uint8Array(4).fill(2),
+    o: new Uint8Array(32).fill(1), i: 1, l: 1, q: new Uint8Array(16).fill(9), f: 0x13,
+    m: new Uint8Array(8).fill(3),
+  })));
+  check('parseAdvertisement fields', adv.parts === 2 && adv.encrypted && adv.compressed && adv.isResponse && adv.hashmapFragment.length === 8);
+
+  // ---- micron render ----
+  const sample = '>Heading One\n\nNormal `!bold`! and `*italic`* and `_under`_.\n`Ff00colored`f text.\n`[Click me`/page/next.mu]\n-\nlast line';
+  const html = renderMicron(sample);
+  document.getElementById('preview').innerHTML = html;
+  check('micron: heading', html.includes('mu-h1') && html.includes('Heading One'));
+  check('micron: bold span', html.includes('mu-b'));
+  check('micron: italic span', html.includes('mu-i'));
+  check('micron: color style', html.includes('color:#f00'));
+  check('micron: link with data-target', html.includes('data-target="/page/next.mu"') && html.includes('mu-link'));
+  check('micron: divider', html.includes('mu-hr'));
+  check('micron: escapes html', renderMicron('a <script> b').includes('&lt;script&gt;'));
+} catch (e) {
+  check('FATAL', false, e.message + '\n' + e.stack);
+}
+
+const s = document.getElementById('summary');
+s.textContent = `${pass} passed, ${fail} failed`;
+s.style.color = fail === 0 ? '#5DCAA5' : '#F09595';
+</script>
+</body>
+</html>

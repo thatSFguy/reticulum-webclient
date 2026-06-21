@@ -62,6 +62,10 @@
           Nodes
           <span class="nav-badge hidden" id="nav-badge-nodes"></span>
         </button>
+        <button class="nav-item" data-view="nomadnet">
+          <svg viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="1" stroke="currentColor" stroke-width="1.2" fill="none"/><path d="M2 6h12" stroke="currentColor" stroke-width="1.2"/></svg>
+          Browser
+        </button>
         <button class="nav-item" data-view="settings">
           <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.5" stroke="currentColor" stroke-width="1.2" fill="none"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3 3l1.5 1.5M11.5 11.5L13 13M3 13l1.5-1.5M11.5 4.5L13 3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
           Settings
@@ -475,6 +479,26 @@
       </div>
 
     </section>
+
+    <!-- NomadNet browser -->
+    <section class="view view-nomadnet">
+      <div class="nn-toolbar">
+        <button id="nn-back" class="btn-icon" title="Back" disabled>‹</button>
+        <button id="nn-forward" class="btn-icon" title="Forward" disabled>›</button>
+        <button id="nn-reload" class="btn-icon" title="Reload">⟳</button>
+        <input id="nn-address" class="nn-address" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+               placeholder="node hash (32 hex)  e.g. a1b2…:/page/index.mu" />
+        <button id="nn-go" class="btn-primary">Go</button>
+        <button id="nn-bookmark" class="btn-icon" title="Bookmark this page">☆</button>
+      </div>
+      <div class="nn-body">
+        <aside class="nn-sidebar" id="nn-nodes"></aside>
+        <div class="nn-main">
+          <div id="nn-status" class="nn-status nn-status-info">Pick a NomadNet node, or enter a node hash above.</div>
+          <article id="nn-page" class="nn-page"></article>
+        </div>
+      </div>
+    </section>
   </main>
 
   <!-- Mobile scroll hint — shown on first paint on narrow viewports
@@ -495,6 +519,10 @@
     <button class="bn-item" data-view="nodes">
       <svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M3 10h14M10 3c-2 3.5-2 10.5 0 14M10 3c2 3.5 2 10.5 0 14" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
       <span>Nodes</span>
+    </button>
+    <button class="bn-item" data-view="nomadnet">
+      <svg viewBox="0 0 20 20"><rect x="3" y="4" width="14" height="12" rx="1" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M3 8h14" stroke="currentColor" stroke-width="1.3"/></svg>
+      <span>Browser</span>
     </button>
     <button class="bn-item" data-view="settings">
       <svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="3" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M10 2v2M10 16v2M2 10h2M16 10h2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>

@@ -3,7 +3,7 @@
 'use strict';
 
 const DB_NAME = 'reticulum-webclient';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 let db = null;
 
@@ -41,6 +41,19 @@ export async function openDatabase() {
       // can see the mesh activity in the Nodes panel.
       if (!db.objectStoreNames.contains('nodes')) {
         const store = db.createObjectStore('nodes', { keyPath: 'hash' });
+      }
+
+      // NomadNet browser bookmarks — keyed by a "url" of the form
+      // "<dest_hash_hex>:<path>". Added in DB v3.
+      if (!db.objectStoreNames.contains('bookmarks')) {
+        db.createObjectStore('bookmarks', { keyPath: 'url' });
+      }
+
+      // NomadNet browse history — autoincrement rows, most-recent-first
+      // by the `visited` timestamp index. Added in DB v3.
+      if (!db.objectStoreNames.contains('history')) {
+        const store = db.createObjectStore('history', { keyPath: 'id', autoIncrement: true });
+        store.createIndex('visited', 'visited', { unique: false });
       }
     };
 
@@ -214,6 +227,68 @@ export async function deleteAllNodes() {
   const d = await openDatabase();
   const tx = d.transaction('nodes', 'readwrite');
   tx.objectStore('nodes').clear();
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// ---- NomadNet bookmarks & history -----------------------------------
+
+export async function saveBookmark(bookmark) {
+  const d = await openDatabase();
+  const tx = d.transaction('bookmarks', 'readwrite');
+  tx.objectStore('bookmarks').put(bookmark);
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function getAllBookmarks() {
+  const d = await openDatabase();
+  const tx = d.transaction('bookmarks', 'readonly');
+  const req = tx.objectStore('bookmarks').getAll();
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function deleteBookmark(url) {
+  const d = await openDatabase();
+  const tx = d.transaction('bookmarks', 'readwrite');
+  tx.objectStore('bookmarks').delete(url);
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function addHistory(entry) {
+  const d = await openDatabase();
+  const tx = d.transaction('history', 'readwrite');
+  tx.objectStore('history').add(entry);
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function getAllHistory() {
+  const d = await openDatabase();
+  const tx = d.transaction('history', 'readonly');
+  const req = tx.objectStore('history').getAll();
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function clearHistory() {
+  const d = await openDatabase();
+  const tx = d.transaction('history', 'readwrite');
+  tx.objectStore('history').clear();
   return new Promise((resolve, reject) => {
     tx.oncomplete = resolve;
     tx.onerror = () => reject(tx.error);

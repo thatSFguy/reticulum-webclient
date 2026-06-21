@@ -14,6 +14,9 @@ import { unpackMessage, unpackLinkMessage, verifyMessageSignature, packMessage }
 import { Link, LINK_ACTIVE, LINK_CLOSED, computePacketFullHash } from './link.js';
 import { lookupDestination } from './known-destinations.js';
 import { ed25519 } from '@noble/curves/ed25519';
+import { CTX_REQUEST, CTX_RESPONSE, NN_DEFAULT_PATH, buildRequest, parseResponse, responseToText, stripPageHeaders, parseLinkTarget } from './nomadnet.js';
+import { ResourceReceiver, parseAdvertisement, CTX_RESOURCE, CTX_RESOURCE_ADV, CTX_RESOURCE_HMU, CTX_RESOURCE_ICL } from './resource.js';
+import { renderMicron } from './micron.js';
 
 // Reticulum packet context values relevant to link traffic
 const CTX_NONE          = 0x00;
@@ -38,7 +41,7 @@ const MSG_MAX_ATTEMPTS = 3;
 // etc. After MSG_MAX_ATTEMPTS attempts the row transitions to failed.
 const MSG_BACKOFF_MS = [5000, 15000, 60000];
 const MSG_RETRY_TICK_MS = 5000;
-import { openDatabase, saveIdentity, loadIdentity, saveContact, getContact, getAllContacts, deleteContact, deleteMessagesForContact, saveMessage, getMessages, getAllMessages, getMessageById, updateMessage, saveNode, getAllNodes, deleteNode, deleteAllNodes } from './store.js';
+import { openDatabase, saveIdentity, loadIdentity, saveContact, getContact, getAllContacts, deleteContact, deleteMessagesForContact, saveMessage, getMessages, getAllMessages, getMessageById, updateMessage, saveNode, getAllNodes, deleteNode, deleteAllNodes, saveBookmark, getAllBookmarks, deleteBookmark, addHistory } from './store.js';
 
 const $ = id => document.getElementById(id);
 
@@ -468,6 +471,10 @@ async function handleNonLxmfAnnounce(announce, pkt, rssi) {
     appName: known ? known.name : null,
     appLabel: known ? known.label : null,
     displayName,
+    // Persist the 64-byte public key so the NomadNet browser can open a
+    // Link to nomadnetwork.node destinations (it needs the Ed25519 half to
+    // verify the LRPROOF). The signature was already validated above.
+    publicKey: Array.from(announce.publicKey),
     telemetry: telemetry || null,
     lat: Number.isFinite(lat) ? lat : null,
     lon: Number.isFinite(lon) ? lon : null,
@@ -1346,6 +1353,34 @@ async function handleLinkData(pkt, rxInfo) {
         }
         break;
       }
+      case CTX_RESPONSE: {
+        // Inline NomadNet RESPONSE (fits one packet) — msgpack [request_id, response].
+        const plaintext = await link.decrypt(pkt.payload);
+        const { requestId, response } = parseResponse(plaintext);
+        await handleNomadNetResponse(link, requestId, response);
+        break;
+      }
+      case CTX_RESOURCE_ADV: {
+        // A large RESPONSE arriving as a Resource (§10).
+        const plaintext = await link.decrypt(pkt.payload);
+        const adv = parseAdvertisement(plaintext);
+        startResourceReceive(link, adv);
+        break;
+      }
+      case CTX_RESOURCE: {
+        // A raw part slice — NOT individually decrypted (§10.6).
+        if (link._resource) await link._resource.handlePart(pkt.payload);
+        break;
+      }
+      case CTX_RESOURCE_HMU: {
+        const plaintext = await link.decrypt(pkt.payload);
+        if (link._resource) link._resource.handleHashmapUpdate(plaintext);
+        break;
+      }
+      case CTX_RESOURCE_ICL: {
+        if (link._resource) link._resource.cancel('sender cancelled the resource');
+        break;
+      }
       default: {
         log('info', `  Link packet context 0x${pkt.context.toString(16)} not handled`);
       }
@@ -1557,6 +1592,272 @@ async function handleLinkDeliveryProof(pkt) {
     }
     return;
   }
+}
+
+// ---- NomadNet browser ------------------------------------------------
+//
+// Drives the existing initiator-link path (openLinkToContact → sendViaLink
+// → handleLinkData) to fetch NomadNet pages over the REQUEST/RESPONSE
+// protocol (§11), reassembling large pages via the Resource receiver (§10)
+// and rendering micron markup.
+
+const nnState = {
+  destHashHex: null,   // node we're currently linked to
+  link: null,          // active browse link
+  path: null,          // current path
+};
+let nnHistory = [];
+let nnHistoryIdx = -1;
+
+function nnSetStatus(msg, kind = 'info') {
+  const el = $('nn-status');
+  if (el) { el.textContent = msg; el.className = `nn-status nn-status-${kind}`; }
+  if (msg) log(kind === 'err' ? 'err' : 'info', `  NomadNet: ${msg}`);
+}
+
+function nnSetAddress(destHashHex, path) {
+  const el = $('nn-address');
+  if (el) el.value = `${destHashHex}:${path}`;
+}
+
+// Build a contact-shaped object for a nomadnetwork.node from its stored
+// announce so openLinkToContact can establish a Link.
+async function nnNodeContact(destHashHex) {
+  const nodes = await getAllNodes();
+  const node = nodes.find(n => n.hash === destHashHex);
+  if (!node) throw new Error('node not seen yet — wait for its announce');
+  if (!node.publicKey || node.publicKey.length !== 64) {
+    throw new Error('node announce predates browser support — wait for a fresh announce');
+  }
+  const identity = new Identity();
+  await identity.loadFromPublicKey(new Uint8Array(node.publicKey));
+  const destHash = hexToBytes(destHashHex);
+  return { identity, destHash, displayName: node.displayName || destHashHex.slice(0, 8), hash: destHashHex };
+}
+
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+
+// Get an active link to destHashHex, reusing the current browse link when
+// it targets the same node, otherwise opening a fresh one (closing the old).
+async function nnEnsureLink(destHashHex) {
+  if (nnState.link && nnState.link.status === LINK_ACTIVE && nnState.destHashHex === destHashHex) {
+    return nnState.link;
+  }
+  if (nnState.link && nnState.link.status === LINK_ACTIVE) {
+    closeLink(nnState.link).catch(() => {});
+  }
+  nnSetStatus(`opening link to ${destHashHex.slice(0, 12)}…`);
+  const contact = await nnNodeContact(destHashHex);
+  const link = await openLinkToContact(contact);
+  nnState.link = link;
+  nnState.destHashHex = destHashHex;
+  return link;
+}
+
+// The send callback the ResourceReceiver uses to emit REQ/PRF/RCL packets.
+function nnResourceSend(link) {
+  return async (context, payload, isProof) => {
+    let packet;
+    if (isProof) {
+      packet = buildPacket({
+        headerType: HEADER_1, destType: DEST_LINK, packetType: PACKET_PROOF,
+        destHash: link.linkId, context, payload,
+      });
+    } else {
+      const enc = await link.encrypt(payload);
+      packet = buildPacket({
+        headerType: HEADER_1, destType: DEST_LINK, packetType: PACKET_DATA,
+        destHash: link.linkId, context, payload: enc,
+      });
+    }
+    await rnode.sendPacket(packet);
+  };
+}
+
+// Create and start a Resource receiver for an inbound advertisement.
+function startResourceReceive(link, adv) {
+  // Only the browser drives resources today. An advertisement on a link
+  // with no pending page request is something else (e.g. a large inbound
+  // LXMF message over a responder link) — out of scope; don't misparse it.
+  if (!link._nnRequest) {
+    log('info', `  Resource advertised on link ${toHex(link.linkId).substring(0,12)}... with no pending request — ignoring`);
+    return;
+  }
+  if (link._resource) { link._resource.cancel('superseded'); }
+  nnSetStatus(`receiving page (${adv.parts} parts)…`);
+  link._resource = new ResourceReceiver(link, adv, {
+    send: nnResourceSend(link),
+    onProgress: (frac) => nnSetStatus(`receiving page… ${Math.round(frac * 100)}%`),
+    onError: (reason) => { link._resource = null; nnSetStatus(reason, 'err'); },
+    onComplete: async ({ data }) => {
+      link._resource = null;
+      try {
+        // A page RESPONSE delivered as a Resource carries the packed
+        // [request_id, response] envelope (§11.2).
+        const { requestId, response } = parseResponse(data);
+        await handleNomadNetResponse(link, requestId, response);
+      } catch (e) {
+        nnSetStatus(`failed to parse page: ${e.message}`, 'err');
+      }
+    },
+  });
+  link._resource.start();
+}
+
+// Validate a response against the pending request and render it.
+async function handleNomadNetResponse(link, requestId, response) {
+  const pending = link._nnRequest;
+  if (!pending) { nnSetStatus('unexpected response (no pending request)', 'err'); return; }
+  if (!arraysEqual(requestId, pending.expectedId)) {
+    // SPEC §11.2: drop responses whose request_id doesn't match.
+    nnSetStatus('response request_id mismatch — dropped', 'err');
+    return;
+  }
+  link._nnRequest = null;
+  const text = responseToText(response);
+  nnRenderPage(text, nnState.destHashHex, pending.path);
+  nnSetStatus(`loaded ${pending.path}`, 'ok');
+  await addHistory({ url: `${nnState.destHashHex}:${pending.path}`, title: pending.path, visited: Date.now() }).catch(() => {});
+}
+
+// Send a NomadNet page request over an active link.
+async function nnSendRequest(link, path) {
+  const body = await buildRequest(path, null);
+  const enc = await link.encrypt(body);
+  const packet = buildPacket({
+    headerType: HEADER_1, destType: DEST_LINK, packetType: PACKET_DATA,
+    destHash: link.linkId, context: CTX_REQUEST, payload: enc,
+  });
+  // request_id = SHA-256(request packet's hashable part)[:16] (§11.1).
+  const fullHash = await computePacketFullHash(parsePacket(packet));
+  link._nnRequest = { expectedId: fullHash.subarray(0, 16), path };
+  nnSetStatus(`requesting ${path}…`);
+  await rnode.sendPacket(packet);
+}
+
+// Navigate to a node/path: ensure link, send request. `push` records history.
+async function nnNavigate(destHashHex, path, { push = true } = {}) {
+  if (!radioOn) { nnSetStatus('radio is off', 'err'); return; }
+  path = path || NN_DEFAULT_PATH;
+  try {
+    nnSetAddress(destHashHex, path);
+    const link = await nnEnsureLink(destHashHex);
+    nnState.path = path;
+    if (push) {
+      nnHistory = nnHistory.slice(0, nnHistoryIdx + 1);
+      nnHistory.push({ destHashHex, path });
+      nnHistoryIdx = nnHistory.length - 1;
+    }
+    await nnSendRequest(link, path);
+  } catch (e) {
+    nnSetStatus(e.message, 'err');
+  }
+  nnUpdateNavButtons();
+}
+
+// Render a fetched page: strip headers, render micron, wire links.
+function nnRenderPage(rawText, destHashHex, path) {
+  const { headers, body } = stripPageHeaders(rawText);
+  const pageEl = $('nn-page');
+  if (!pageEl) return;
+  if (path.startsWith('/file/')) {
+    pageEl.innerHTML = '<div class="mu-line">[file downloads not supported yet]</div>';
+    return;
+  }
+  pageEl.innerHTML = renderMicron(body);
+  if (headers.bg) pageEl.style.background = headers.bg.startsWith('#') ? headers.bg : `#${headers.bg}`;
+  else pageEl.style.background = '';
+  // Wire micron links.
+  pageEl.querySelectorAll('a.mu-link').forEach((a) => {
+    a.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      const tgt = parseLinkTarget(a.dataset.target);
+      if (tgt.kind === 'page') nnNavigate(destHashHex, tgt.path);
+      else if (tgt.kind === 'node') nnNavigate(tgt.hash, tgt.path);
+      else if (tgt.kind === 'lxmf') nnSetStatus(`link opens an LXMF conversation with ${tgt.hash.slice(0,12)}… (open it from Messages)`, 'info');
+      else nnSetStatus('unsupported link target', 'err');
+    });
+  });
+}
+
+function nnUpdateNavButtons() {
+  const back = $('nn-back'), fwd = $('nn-forward');
+  if (back) back.disabled = nnHistoryIdx <= 0;
+  if (fwd) fwd.disabled = nnHistoryIdx >= nnHistory.length - 1;
+}
+
+function nnGoBack() {
+  if (nnHistoryIdx <= 0) return;
+  nnHistoryIdx--;
+  const { destHashHex, path } = nnHistory[nnHistoryIdx];
+  nnNavigate(destHashHex, path, { push: false });
+}
+
+function nnGoForward() {
+  if (nnHistoryIdx >= nnHistory.length - 1) return;
+  nnHistoryIdx++;
+  const { destHashHex, path } = nnHistory[nnHistoryIdx];
+  nnNavigate(destHashHex, path, { push: false });
+}
+
+// Parse whatever is in the address bar and navigate.
+function nnGoToAddress() {
+  const raw = ($('nn-address')?.value || '').trim();
+  if (!raw) return;
+  const tgt = parseLinkTarget(raw);
+  if (tgt.kind === 'node') nnNavigate(tgt.hash, tgt.path);
+  else if (tgt.kind === 'page' && nnState.destHashHex) nnNavigate(nnState.destHashHex, tgt.path);
+  else nnSetStatus('enter a node hash (32 hex), optionally with :/page/x.mu', 'err');
+}
+
+// Render the browser sidebar: discovered nomadnetwork.node nodes + bookmarks.
+async function renderNomadNetSidebar() {
+  const listEl = $('nn-nodes');
+  if (!listEl) return;
+  const nodes = (await getAllNodes()).filter(n => n.appName === 'nomadnetwork.node' && n.publicKey);
+  const bookmarks = await getAllBookmarks();
+
+  let html = '<div class="nn-side-title">Bookmarks</div>';
+  if (bookmarks.length === 0) html += '<div class="nn-side-empty">none</div>';
+  for (const b of bookmarks) {
+    html += `<div class="nn-side-row" data-url="${b.url}"><span class="nn-side-name">${escapeHtml(b.title || b.url)}</span><button class="nn-side-del" data-del-bm="${b.url}">✕</button></div>`;
+  }
+  html += '<div class="nn-side-title">Nodes</div>';
+  if (nodes.length === 0) html += '<div class="nn-side-empty">no NomadNet nodes seen yet</div>';
+  for (const n of nodes) {
+    html += `<div class="nn-side-row" data-hash="${n.hash}"><span class="nn-side-name">${escapeHtml(n.displayName || n.hash.slice(0,8))}</span><span class="nn-side-hash">${n.hash.slice(0,8)}</span></div>`;
+  }
+  listEl.innerHTML = html;
+
+  listEl.querySelectorAll('.nn-side-row[data-hash]').forEach(el => {
+    el.addEventListener('click', () => nnNavigate(el.dataset.hash, NN_DEFAULT_PATH));
+  });
+  listEl.querySelectorAll('.nn-side-row[data-url]').forEach(el => {
+    el.addEventListener('click', (ev) => {
+      if (ev.target.dataset.delBm) return;
+      const [hash, path] = el.dataset.url.split(/:(.+)/);
+      nnNavigate(hash, path);
+    });
+  });
+  listEl.querySelectorAll('[data-del-bm]').forEach(btn => {
+    btn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      await deleteBookmark(btn.dataset.delBm);
+      renderNomadNetSidebar();
+    });
+  });
+}
+
+async function nnBookmarkCurrent() {
+  if (!nnState.destHashHex || !nnState.path) { nnSetStatus('nothing to bookmark', 'err'); return; }
+  const url = `${nnState.destHashHex}:${nnState.path}`;
+  await saveBookmark({ url, title: url, added: Date.now() });
+  nnSetStatus('bookmarked', 'ok');
+  renderNomadNetSidebar();
 }
 
 // ---- Send message ----------------------------------------------------
@@ -2174,6 +2475,9 @@ function switchView(name) {
       if (map) setTimeout(() => map.invalidateSize(), 50);
     }).catch(() => { /* handled inside initNodesMap */ });
   }
+  if (name === 'nomadnet') {
+    renderNomadNetSidebar().catch(() => { /* best effort */ });
+  }
 }
 
 // ---- Theme -----------------------------------------------------------
@@ -2475,6 +2779,14 @@ $('btn-clear-nodes').addEventListener('click', async () => {
   renderNodesList();
   log('info', 'Cleared all nodes');
 });
+
+// NomadNet browser controls.
+$('nn-go')?.addEventListener('click', nnGoToAddress);
+$('nn-address')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); nnGoToAddress(); } });
+$('nn-back')?.addEventListener('click', nnGoBack);
+$('nn-forward')?.addEventListener('click', nnGoForward);
+$('nn-reload')?.addEventListener('click', () => { if (nnState.destHashHex && nnState.path) nnNavigate(nnState.destHashHex, nnState.path, { push: false }); });
+$('nn-bookmark')?.addEventListener('click', nnBookmarkCurrent);
 
 // Browser check — disable buttons for unsupported transports. Every
 // connect surface (sidebar, mobile hero, settings) is selected by

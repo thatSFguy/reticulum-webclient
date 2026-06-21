@@ -98,15 +98,17 @@ jobs:
           PY
 
       - name: Stage static site
-        # Copy only the files the browser actually needs. Leaves tests/,
-        # tools/, docs/, .github/, package.json, node_modules/, etc.
-        # out of the Pages artifact so the public deploy is not bloated
-        # with Python scripts and CI config.
+        # Copy only the files the browser actually needs. Leaves tools/,
+        # docs/, .github/, package.json, node_modules/, etc. out of the
+        # Pages artifact so the public deploy is not bloated with Python
+        # scripts and CI config. The test/ self-test harness IS published
+        # (it's a static, dependency-free page) so module regressions can
+        # be checked in a real browser straight from the live deploy.
         run: |
           mkdir -p _site
           cp index.html _site/
           cp flasher.html _site/
-          cp -r css js lib _site/
+          cp -r css js lib test _site/
           # .nojekyll disables Jekyll processing so GitHub Pages serves
           # files with underscores and other Jekyll-hostile names.
           touch _site/.nojekyll
