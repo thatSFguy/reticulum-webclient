@@ -156,13 +156,33 @@ export function verifyMessageSignature(message, senderIdentity) {
 
 // ---- Pack an outbound LXMF message -----------------------------------
 
+// Encode a number as a msgpack float64 (0xcb + 8 bytes big-endian),
+// regardless of whether the value is integer-valued.
+function encodeFloat64(value) {
+  const buf = new Uint8Array(9);
+  buf[0] = 0xcb;
+  new DataView(buf.buffer).setFloat64(1, value, false);  // big-endian
+  return buf;
+}
+
 export async function packMessage(sourceIdentity, destHash, sourceHash, title, content, fields = {}) {
   const titleBytes   = new TextEncoder().encode(title || '');
   const contentBytes = new TextEncoder().encode(content || '');
   const timestamp    = Date.now() / 1000;  // float seconds
 
-  // Msgpack encode payload
-  const msgpackData = new Uint8Array(msgpackEncode([timestamp, titleBytes, contentBytes, fields]));
+  // Msgpack encode payload. The timestamp MUST be a float64 (0xcb) even when
+  // it lands on a whole second — the default encoder routes integer-valued
+  // numbers to a msgpack integer, which breaks the signed bytes against
+  // upstream LXMF/umsgpack (RNS LXMF emits float64 unconditionally). We can't
+  // force-float the whole array because the fields map uses integer keys, so
+  // assemble the 4-element fixarray by hand with a hand-encoded float64 stamp.
+  const msgpackData = concatBytes([
+    new Uint8Array([0x94]),                       // fixarray, 4 elements
+    encodeFloat64(timestamp),                     // [0] timestamp (float64)
+    new Uint8Array(msgpackEncode(titleBytes)),    // [1] title (bin)
+    new Uint8Array(msgpackEncode(contentBytes)),  // [2] content (bin)
+    new Uint8Array(msgpackEncode(fields)),        // [3] fields (map)
+  ]);
 
   // Compute message hash
   const hashedPart = concatBytes([destHash, sourceHash, msgpackData]);

@@ -37,9 +37,19 @@ export async function parseAnnounce(payload, contextFlag, destHashFromHeader) {
   // Compute identity hash from public key
   const identityHash = await truncatedHash(publicKey);
 
-  // For LXMF announces, the dest hash in the header is the authoritative
-  // value. We use it directly rather than recomputing.
-  const destHash = destHashFromHeader;
+  // Recompute the destination hash from name_hash + identity_hash and
+  // verify it matches the header value (SPEC §4.5 step 3). This is the
+  // core anti-spoofing check: the signature only proves the announcer
+  // holds the private key for `public_key` — it does NOT prove that key
+  // is bound to the dest_hash the packet claims. Without this check a
+  // valid signature paired with a victim's dest_hash would be accepted,
+  // letting an attacker hijack a known destination. dest_hash =
+  // SHA256(name_hash + identity_hash)[:16].
+  const expectedDestHash = await truncatedHash(concatBytes([nameHash, identityHash]));
+  if (destHashFromHeader && !arraysEqual(expectedDestHash, destHashFromHeader)) {
+    return null;  // dest_hash does not derive from this key — reject
+  }
+  const destHash = destHashFromHeader || expectedDestHash;
 
   return {
     publicKey, nameHash, randomHash, ratchet, signature, appData,

@@ -305,7 +305,7 @@ rnode._onPacket = onPacket;
 async function handleAnnounce(pkt, rssi) {
   const announce = await parseAnnounce(pkt.payload, pkt.contextFlag, pkt.destHash);
   if (!announce) {
-    log('info', '  (announce parse failed)');
+    log('info', '  (announce rejected: malformed or dest_hash mismatch)');
     return;
   }
 
@@ -366,6 +366,19 @@ async function handleAnnounce(pkt, rssi) {
   const destHashBytes = announce.destHash || pkt.destHash;
   const destHashHex = toHex(destHashBytes);
   const existingContact = contacts.get(destHashHex);
+
+  // Public-key-collision rejection (SPEC §4.5 step 4): first-announcer-wins.
+  // Once a dest_hash is bound to a public key, refuse to replace that key
+  // with a different one. The dest_hash check above already pins the key
+  // cryptographically (dest_hash derives from identity_hash = SHA256(key)),
+  // so a same-dest_hash/different-key announce implies a forgery attempt or
+  // hash collision — drop it rather than overwrite the established identity.
+  // A placeholder contact carrying no key yet is allowed to receive its first.
+  if (existingContact?.publicKey?.length && !arraysEqual(announce.publicKey, existingContact.publicKey)) {
+    log('err', `  Announce for ${destHashHex.substring(0,12)}... carries a different key — ignoring (first-announcer-wins)`);
+    return;
+  }
+
   const contact = {
     hash: destHashHex,
     identityHash: idHash,
@@ -409,14 +422,22 @@ async function handleNonLxmfAnnounce(announce, pkt, rssi) {
   // Skip our own echoed announces — noisy and never useful.
   if (myIdentity && idHash === toHex(myIdentity.hash)) return;
 
+  // Validate the Ed25519 signature before trusting anything in this
+  // announce (SPEC §4.5 step 2). Non-LXMF announces feed trackPath (and
+  // thus upstream rnsd identity learning) and the Nodes panel; an
+  // unverified announce lets an attacker forge a service/telemetry beacon
+  // to poison the path table or inject bogus map nodes. parseAnnounce has
+  // already confirmed the dest_hash derives from this key (§4.5 step 3).
+  const valid = validateAnnounce(announce, pkt.destHash);
+  if (!valid) {
+    log('err', `  Non-LXMF announce from ${idHash.substring(0,12)}... sig=INVALID — ignoring`);
+    return;
+  }
+
   // Track in pathTable. Non-LXMF announces are how we typically learn
   // the upstream rnsd's identity: rnsd announces a few SINGLE service
   // destinations (rnstransport.broadcasts etc.) that arrive at us
   // with hops=0 — only the directly-connected rnsd produces those.
-  // We don't gate on signature validity here because handleNonLxmfAnnounce
-  // currently doesn't validate signatures (a pre-existing gap); the
-  // hops=0 / WS-interface check below is what guards the upstream
-  // identity learning against forgery.
   trackPath(announce, pkt);
 
   const destHashBytes = announce.destHash || pkt.destHash;
@@ -1251,12 +1272,16 @@ async function handleLinkData(pkt, rxInfo) {
         // application-level data packet arrives on an established
         // link. The proof carries the full 32-byte SHA-256 of the
         // received packet's hashable_part plus an Ed25519 signature
-        // over that hash, signed with our long-term identity key so
-        // the initiator verifies it against the sig_pub it already
-        // knows from our announce and LRPROOF.
+        // over that hash. SPEC §6.5.1: the signing key is the LINK's
+        // Ed25519 key (`Link.sig_prv`) — on the responder side that is
+        // our long-term identity key, on the initiator side it is the
+        // link's ephemeral key. `link.ourSigPriv` already holds the
+        // right one for each role, so the peer verifies against the
+        // matching pub (our announce key, or our LINKREQUEST ephemeral
+        // key it cached).
         try {
           const packetHash = await computePacketFullHash(pkt);
-          const signature  = ed25519.sign(packetHash, myIdentity.sigPrivKey);
+          const signature  = ed25519.sign(packetHash, link.ourSigPriv);
           const proofData  = new Uint8Array(packetHash.length + signature.length);
           proofData.set(packetHash, 0);
           proofData.set(signature, packetHash.length);
@@ -1296,8 +1321,29 @@ async function handleLinkData(pkt, rxInfo) {
         break;
       }
       case CTX_KEEPALIVE: {
-        // Responder has no action to take on keepalives from the
-        // initiator during a short delivery session.
+        // KEEPALIVE is NOT Token-encrypted — the body is a single clear
+        // sentinel byte: 0xFF = ping (initiator→responder), 0xFE = pong
+        // (responder→initiator). SPEC §6.7.1: the responder MUST answer
+        // an inbound ping with a pong, otherwise the initiator's watchdog
+        // declares the link stale on its next cycle and tears it down. A
+        // pong itself needs no reply — any inbound link traffic already
+        // refreshes the peer's staleness clock.
+        if (pkt.payload.length >= 1 && pkt.payload[0] === 0xFF) {
+          const pong = buildPacket({
+            headerType: HEADER_1,
+            destType:   DEST_LINK,
+            packetType: PACKET_DATA,
+            destHash:   link.linkId,
+            context:    CTX_KEEPALIVE,
+            payload:    new Uint8Array([0xFE]),
+          });
+          try {
+            await rnode.sendPacket(pong);
+            log('info', `  Link ${linkIdHex.substring(0,12)}... keepalive ping → pong`);
+          } catch (e) {
+            log('info', `  Keepalive pong send failed: ${e.message}`);
+          }
+        }
         break;
       }
       default: {
@@ -1306,6 +1352,48 @@ async function handleLinkData(pkt, rxInfo) {
     }
   } catch (e) {
     log('err', `  Link packet handling failed (ctx=0x${pkt.context.toString(16)}): ${e.message}`);
+  }
+}
+
+// Cleanly tear down an active link by emitting a LINKCLOSE (SPEC §6.7.3):
+// a DATA packet, context=LINKCLOSE, dest_hash=link_id, body = the 16-byte
+// link_id Token-encrypted with the link session key. The peer decrypts and
+// checks the plaintext equals link_id before closing, so the body is both
+// encrypted and authenticated. Without this the peer holds the link open
+// until its own watchdog declares it stale (2× keepalive later). Only
+// meaningful for links that reached ACTIVE (have a derived session key);
+// pending links are dropped silently. We do NOT echo a LINKCLOSE when the
+// peer closes us (upstream doesn't), so this is for locally-initiated
+// teardown only.
+async function closeLink(link) {
+  const linkIdHex = toHex(link.linkId);
+  try {
+    if (link.status === LINK_ACTIVE && link.derivedKey) {
+      const encrypted = await link.encrypt(link.linkId);
+      const closePacket = buildPacket({
+        headerType: HEADER_1,
+        destType:   DEST_LINK,
+        packetType: PACKET_DATA,
+        destHash:   link.linkId,
+        context:    CTX_LINKCLOSE,
+        payload:    encrypted,
+      });
+      await rnode.sendPacket(closePacket);
+      log('info', `  Sent LINKCLOSE for link ${linkIdHex.substring(0,12)}...`);
+    }
+  } catch (e) {
+    log('info', `  LINKCLOSE send failed for ${linkIdHex.substring(0,12)}...: ${e.message}`);
+  } finally {
+    link.status = LINK_CLOSED;
+    links.delete(linkIdHex);
+  }
+}
+
+// Cleanly close every active link — used on disconnect so peers tear down
+// immediately instead of waiting out their watchdog.
+async function closeAllLinks() {
+  for (const link of Array.from(links.values())) {
+    await closeLink(link);
   }
 }
 
@@ -2282,6 +2370,9 @@ document.querySelectorAll('.js-connect-btn').forEach(b => {
 $('btn-disconnect').addEventListener('click', async () => {
   if (announceTimer) { clearInterval(announceTimer); announceTimer = null; }
   if (outboundRetryTimer) { clearInterval(outboundRetryTimer); outboundRetryTimer = null; }
+  // Gracefully LINKCLOSE any active links before the transport drops, so
+  // peers don't hold them open until their watchdog expires (SPEC §6.7.3).
+  if (radioOn) await closeAllLinks();
   await rnode.disconnect();
   setConnectionState(false, 'Disconnected');
   $('btn-disconnect').classList.add('hidden');

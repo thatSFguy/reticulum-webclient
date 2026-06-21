@@ -38,11 +38,29 @@ export function parsePacket(data) {
   const flags   = data[0];
   const hops    = data[1];
 
+  const ifacFlag      = (flags >> 7) & 0x01;
   const headerType    = (flags >> 6) & 0x01;
   const contextFlag   = (flags >> 5) & 0x01;
   const transportType = (flags >> 4) & 0x01;
   const destType      = (flags >> 2) & 0x03;
   const packetType    = flags & 0x03;
+
+  // IFAC-protected packets (SPEC §2.1, flag bit 7) carry an
+  // interface-keyed IFAC field of interface-configured size (1–64 bytes)
+  // inserted between the hops byte and the addresses. We don't implement
+  // IFAC and can't even locate the addresses without knowing ifac_size,
+  // so reject these outright — parsing on would misread the IFAC bytes as
+  // the dest_hash and shift every subsequent field.
+  if (ifacFlag) return null;
+
+  // Validate the length for the specific header form. HEADER_2 inserts a
+  // 16-byte transport_id, so its minimum is 35 bytes; the HEADER_MINSIZE
+  // (19) check above only covers HEADER_1, leaving short HEADER_2 packets
+  // to read past the buffer (subarray clamps silently, data[34] → undefined).
+  const minSize = headerType === HEADER_2
+    ? 2 + 2 * TRUNCATED_HASHLENGTH + 1   // flags+hops+transport_id+dest_hash+context = 35
+    : HEADER_MINSIZE;                     // 19
+  if (data.length < minSize) return null;
 
   let destHash, transportId, context, payload;
 
