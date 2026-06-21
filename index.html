@@ -168,7 +168,10 @@
           <h2 class="view-title">Nodes</h2>
           <p class="view-subtitle">Non-LXMF announces on the mesh — telemetry beacons, heartbeats, repeaters. Nodes whose announce carries <code>lat=</code>/<code>lon=</code> appear on the map.</p>
         </div>
-        <button id="btn-clear-nodes" class="btn-secondary">Clear all</button>
+        <div class="view-header-actions">
+          <button id="btn-add-dest" class="btn-primary">+ Add / Share</button>
+          <button id="btn-clear-nodes" class="btn-secondary">Clear all</button>
+        </div>
       </div>
       <div class="nodes-layout">
         <aside class="nodes-sidebar">
@@ -546,6 +549,31 @@
     </button>
   </nav>
 
+</div>
+
+<!-- Add / share contact: paste a contact card or hash, scan a QR, or copy
+     your own card for someone else to add. -->
+<div id="add-modal" class="modal-overlay hidden">
+  <div class="modal">
+    <h2 class="modal-title">Add / share contact</h2>
+    <p class="modal-text">Paste a contact card or a destination hash from another Reticulum app, or scan its QR.</p>
+    <textarea id="add-input" class="add-input" rows="3" spellcheck="false" autocapitalize="off"
+              placeholder='{"destHash":"…","publicKey":"…"}   — or a 32-character hex hash'></textarea>
+    <video id="add-video" class="add-video hidden" playsinline muted></video>
+    <div id="add-status" class="modal-hint"></div>
+    <div class="modal-actions">
+      <button id="add-scan" class="btn-secondary">Scan QR</button>
+      <div class="modal-buttons">
+        <button id="add-cancel" class="btn-secondary">Close</button>
+        <button id="add-submit" class="btn-primary">Add</button>
+      </div>
+    </div>
+    <hr class="mu-hr">
+    <div class="dest-fact-label">Your address card — share so others can add you</div>
+    <code id="my-card" class="add-mycard"></code>
+    <div class="modal-actions"><span class="modal-hint">QR image export is coming next; for now copy &amp; share the text.</span>
+      <button id="my-card-copy" class="btn-secondary">Copy</button></div>
+  </div>
 </div>
 
 <!-- Destination detail sheet (full hash, facts, and Message / Contact /

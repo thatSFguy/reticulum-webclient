@@ -203,6 +203,16 @@ export async function saveNode(node) {
   });
 }
 
+export async function getNode(hash) {
+  const d = await openDatabase();
+  const tx = d.transaction('nodes', 'readonly');
+  const req = tx.objectStore('nodes').get(hash);
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
 export async function getAllNodes() {
   const d = await openDatabase();
   const tx = d.transaction('nodes', 'readonly');

@@ -1786,3 +1786,26 @@ textarea:focus {
 .dest-fact { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; padding: 3px 0; }
 .dest-fact span:first-child { color: var(--text-muted); }
 .dest-fact span:last-child { color: var(--text); text-align: right; word-break: break-word; }
+
+/* ---- Add / share contact modal ------------------------------------- */
+.view-header-actions { display: flex; gap: 8px; align-items: center; }
+.add-input {
+  width: 100%; box-sizing: border-box;
+  font-family: var(--font-mono); font-size: 12px;
+  padding: 9px 11px; border: 1px solid var(--border-strong);
+  border-radius: 8px; background: var(--surface-2); color: var(--text);
+  resize: vertical; margin-bottom: 8px;
+}
+.add-video {
+  width: 100%; max-height: 240px; border-radius: 8px;
+  background: #000; margin-bottom: 8px; object-fit: cover;
+}
+.add-mycard {
+  display: block; width: 100%; box-sizing: border-box;
+  font-family: var(--font-mono); font-size: 11px; word-break: break-all;
+  background: var(--surface-hover); color: var(--text);
+  padding: 8px 10px; border-radius: 6px; margin: 4px 0 8px;
+  max-height: 90px; overflow-y: auto;
+}
+.modal-hint.ok { color: var(--accent-text); }
+.modal-hint.err { color: var(--err); }

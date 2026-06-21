@@ -41,7 +41,7 @@ const MSG_MAX_ATTEMPTS = 3;
 // etc. After MSG_MAX_ATTEMPTS attempts the row transitions to failed.
 const MSG_BACKOFF_MS = [5000, 15000, 60000];
 const MSG_RETRY_TICK_MS = 5000;
-import { openDatabase, saveIdentity, loadIdentity, saveContact, getContact, getAllContacts, deleteContact, deleteMessagesForContact, saveMessage, getMessages, getAllMessages, getMessageById, updateMessage, saveNode, getAllNodes, deleteNode, deleteAllNodes, saveBookmark, getAllBookmarks, deleteBookmark, addHistory } from './store.js';
+import { openDatabase, saveIdentity, loadIdentity, saveContact, getContact, getAllContacts, deleteContact, deleteMessagesForContact, saveMessage, getMessages, getAllMessages, getMessageById, updateMessage, saveNode, getNode, getAllNodes, deleteNode, deleteAllNodes, saveBookmark, getAllBookmarks, deleteBookmark, addHistory } from './store.js';
 
 const $ = id => document.getElementById(id);
 
@@ -405,6 +405,7 @@ async function handleAnnounce(pkt, rssi) {
     // identity key in sendMessage when this is null.
     ratchetPub: announce.ratchet ? Array.from(announce.ratchet) : null,
     displayName,
+    userLabel: existingContact?.userLabel || null,
     pinned: !!existingContact?.pinned,
     favorite: !!existingContact?.favorite,
     lastSeen: Date.now(),
@@ -494,6 +495,9 @@ async function handleNonLxmfAnnounce(announce, pkt, rssi) {
     lastSeen: Date.now(),
     rssi,
   };
+  // Preserve a user-assigned local nickname across re-announces (local-only).
+  const existingNode = await getNode(destHashHex);
+  node.userLabel = existingNode?.userLabel || null;
   await saveNode(node);
 
   const serviceLabel = known ? ` (${known.name})` : '';
@@ -576,6 +580,8 @@ function nodeNameFromContacts(identityHashHex) {
 // → "Telemetry" placeholder. Telemetry beacons get a summarised
 // "BAT / UP / coords" tail so the list stays readable.
 function nodeDisplayLabel(n) {
+  // A user-assigned local nickname wins over everything (local-only).
+  if (n.userLabel) return n.userLabel;
   const nodeName = nodeNameFromContacts(n.identityHash);
   if (n.telemetry) {
     const bits = [];
@@ -619,7 +625,7 @@ async function renderNodesList() {
     for (const [hash, c] of contacts) {
       if (nodeFilter === 'contacts' && !c.favorite) continue;
       entries.push({
-        kind: 'contact', hash, name: c.displayName || shortFingerprint(hash),
+        kind: 'contact', hash, name: c.userLabel || c.displayName || shortFingerprint(hash),
         service: 'lxmf.delivery', rssi: c.rssi, lastSeen: c.lastSeen,
         favorite: !!c.favorite, located: false, ref: { kind: 'contact', hash },
       });
@@ -2291,7 +2297,7 @@ function renderContactList() {
     info.innerHTML = `
       <div class="contact-avatar" style="background:${avatarColor(hash)}">${escapeHtml(initials)}</div>
       <div style="flex:1; min-width:0">
-        <div class="contact-name">${escapeHtml(c.displayName || hash.substring(0, 8))}${star}${unread}${placeholderTag}</div>
+        <div class="contact-name">${escapeHtml(c.userLabel || c.displayName || hash.substring(0, 8))}${star}${unread}${placeholderTag}</div>
         <div class="contact-hash">${shortHash}</div>
       </div>`;
     info.addEventListener('click', () => selectContact(hash));
@@ -2369,6 +2375,7 @@ function serializeContact(c) {
     nameHash: c.nameHash instanceof Uint8Array ? Array.from(c.nameHash) : c.nameHash,
     ratchetPub: c.ratchetPub instanceof Uint8Array ? Array.from(c.ratchetPub) : (c.ratchetPub || null),
     displayName: c.displayName,
+    userLabel: c.userLabel || null,
     placeholder: !!c.placeholder,
     pinned: !!c.pinned,
     favorite: !!c.favorite,
@@ -2449,7 +2456,7 @@ async function openDestDetail(entry) {
   if (entry.kind === 'contact') {
     const c = contacts.get(entry.hash);
     if (!c) { hideDestModal(); return; }
-    name = c.displayName || shortFingerprint(c.hash);
+    name = c.userLabel || c.displayName || shortFingerprint(c.hash);
     fullHash = c.hash;
     identityHash = c.identityHash || null;
     keyKnown = !!(c.publicKey && c.publicKey.length);
@@ -2485,6 +2492,7 @@ async function openDestDetail(entry) {
     <div class="dest-actions">
       ${messagableHash ? '<button id="dest-message" class="btn-primary">Message</button>' : ''}
       <button id="dest-fav" class="btn-secondary">${isFavorite ? 'Remove Contact' : 'Add Contact'}</button>
+      <button id="dest-rename" class="btn-secondary">Rename</button>
       <button id="dest-delete" class="btn-danger">Delete</button>
     </div>
     <div class="dest-hashrow">
@@ -2522,11 +2530,182 @@ async function openDestDetail(entry) {
     hideDestModal();
   });
 
+  $('dest-rename')?.addEventListener('click', async () => {
+    const current = entry.kind === 'contact' ? (contacts.get(entry.hash)?.userLabel || '') : (entry.node.userLabel || '');
+    const v = prompt('Local nickname (stored on this device only — never sent on the wire):', current);
+    if (v === null) return;
+    const label = v.trim() || null;
+    if (entry.kind === 'contact') {
+      const c = contacts.get(entry.hash);
+      if (c) { c.userLabel = label; await saveContact(serializeContact(c)); }
+    } else {
+      entry.node.userLabel = label;
+      await saveNode(entry.node);
+    }
+    renderContactList();
+    renderNodesList();
+    openDestDetail(entry);  // refresh the sheet with the new name
+  });
+
   $('dest-delete')?.addEventListener('click', async () => {
     hideDestModal();
     if (entry.kind === 'contact') removeContact(entry.hash);
     else { await deleteNode(entry.node.hash); renderNodesList(); }
   });
+}
+
+// ---- Contact cards / QR exchange / manual add ------------------------
+//
+// Byte-compatible with reticulum-mobile-app's IdentityCard: a JSON object
+//   {"destHash":"<32hex>","publicKey":"<128hex>","ratchetPub":"<64hex?>","displayName":"…"}
+// The scanner/importer also accepts a bare 32-hex hash (a key-less stub that
+// becomes messagable once its announce arrives).
+
+// Our own shareable card. Key order matches the mobile app exactly.
+function myContactCardString() {
+  if (!myIdentity || !myDestHash) return '';
+  const card = { destHash: toHex(myDestHash), publicKey: toHex(myIdentity.publicKey) };
+  if (myIdentity.ratchetPubKey) card.ratchetPub = toHex(myIdentity.ratchetPubKey);
+  card.displayName = ($('my-name')?.value || '').trim() || 'Reticulum Web';
+  return JSON.stringify(card);
+}
+
+// Import a full contact card (with public key → immediately messagable).
+async function importContactCard(card) {
+  const destHash = String(card.destHash || '').toLowerCase();
+  const pubHex = String(card.publicKey || '').toLowerCase();
+  if (!/^[0-9a-f]{32}$/.test(destHash)) return { ok: false, msg: 'Card has no valid destHash' };
+  if (!/^[0-9a-f]{128}$/.test(pubHex)) return { ok: false, msg: 'Card has no valid 64-byte publicKey' };
+
+  const pubBytes = hexToBytes(pubHex);
+  const identity = new Identity();
+  await identity.loadFromPublicKey(pubBytes);
+  // Binding check (mobile applyIdentityCard / SPEC §4.5): the destHash MUST
+  // derive from this key for lxmf.delivery, or it's not a valid LXMF contact.
+  const expected = toHex(await computeDestinationHash('lxmf.delivery', identity.hash));
+  if (expected !== destHash) return { ok: false, msg: 'Card destHash does not match its public key' };
+
+  const existing = contacts.get(destHash);
+  if (existing?.publicKey?.length === 64) {
+    const exBytes = existing.publicKey instanceof Uint8Array ? existing.publicKey : new Uint8Array(existing.publicKey);
+    if (!arraysEqual(pubBytes, exBytes)) return { ok: false, msg: 'A different key is already known for this address — ignored' };
+  }
+
+  const ratchetHex = String(card.ratchetPub || '').toLowerCase();
+  const ratchetPub = /^[0-9a-f]{64}$/.test(ratchetHex) ? hexToBytes(ratchetHex) : null;
+  const mem = {
+    hash: destHash, identityHash: toHex(identity.hash),
+    publicKey: pubBytes, destHash: hexToBytes(destHash), nameHash: lxmfNameHash,
+    ratchetPub, displayName: card.displayName || destHash.slice(0, 8),
+    userLabel: existing?.userLabel || null,
+    placeholder: false, pinned: !!existing?.pinned, favorite: true,
+    lastSeen: Date.now(), rssi: null, identity,
+  };
+  contacts.set(destHash, mem);
+  await saveContact(serializeContact(mem));
+  renderContactList();
+  renderNodesList();
+  return { ok: true, msg: `Added contact "${mem.displayName}"` };
+}
+
+// Add a bare destination hash (key-less stub awaiting announce).
+async function addManualHash(str) {
+  const cleaned = String(str).toLowerCase().replace(/[\s:-]/g, '');
+  if (!/^[0-9a-f]{32}$/.test(cleaned)) {
+    return { ok: false, msg: 'Enter a 32-hex destination hash, or paste a full contact card' };
+  }
+  if (contacts.has(cleaned)) return { ok: true, msg: 'Already in your list' };
+  const mem = {
+    hash: cleaned, identityHash: null, publicKey: [], destHash: hexToBytes(cleaned),
+    nameHash: lxmfNameHash, ratchetPub: null, displayName: cleaned.slice(0, 8),
+    userLabel: null, placeholder: true, pinned: false, favorite: true,
+    lastSeen: Date.now(), rssi: null, identity: null,
+  };
+  contacts.set(cleaned, mem);
+  await saveContact(serializeContact(mem));
+  renderContactList();
+  renderNodesList();
+  return { ok: true, msg: 'Added — messaging unlocks when their announce arrives' };
+}
+
+// Route pasted/scanned text: JSON card vs bare hash.
+async function importDestinationText(text) {
+  const t = String(text || '').trim();
+  if (!t) return { ok: false, msg: 'Nothing to add' };
+  if (t.startsWith('{')) {
+    let card;
+    try { card = JSON.parse(t); } catch { return { ok: false, msg: 'Invalid contact-card JSON' }; }
+    return importContactCard(card);
+  }
+  return addManualHash(t);
+}
+
+// ---- Add/share modal + QR scanning -----------------------------------
+
+let qrStream = null;
+let qrRaf = null;
+
+function openAddModal() {
+  const m = $('add-modal');
+  if (!m) return;
+  if ($('add-input')) $('add-input').value = '';
+  setAddStatus('');
+  if ($('my-card')) $('my-card').textContent = myContactCardString();
+  m.classList.remove('hidden');
+}
+
+function hideAddModal() { stopQrScan(); $('add-modal')?.classList.add('hidden'); }
+
+function setAddStatus(msg, ok) {
+  const el = $('add-status');
+  if (el) { el.textContent = msg || ''; el.className = 'modal-hint' + (msg ? (ok ? ' ok' : ' err') : ''); }
+}
+
+async function submitAddDest() {
+  const r = await importDestinationText($('add-input')?.value || '');
+  setAddStatus(r.msg, r.ok);
+  if (r.ok) setTimeout(hideAddModal, 900);
+}
+
+function stopQrScan() {
+  if (qrRaf) { cancelAnimationFrame(qrRaf); qrRaf = null; }
+  if (qrStream) { qrStream.getTracks().forEach((t) => t.stop()); qrStream = null; }
+  $('add-video')?.classList.add('hidden');
+}
+
+async function startQrScan() {
+  const video = $('add-video');
+  if (!('BarcodeDetector' in window)) {
+    setAddStatus('QR scanning needs Chrome/Edge. Paste the card text instead.', false);
+    return;
+  }
+  try {
+    qrStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+    video.srcObject = qrStream;
+    video.classList.remove('hidden');
+    await video.play();
+    const detector = new BarcodeDetector({ formats: ['qr_code'] });
+    setAddStatus('Point the camera at a contact QR…', true);
+    const tick = async () => {
+      if (!qrStream) return;
+      try {
+        const codes = await detector.detect(video);
+        if (codes.length) {
+          const text = codes[0].rawValue;
+          stopQrScan();
+          if ($('add-input')) $('add-input').value = text;
+          const r = await importDestinationText(text);
+          setAddStatus(r.msg, r.ok);
+          if (r.ok) setTimeout(hideAddModal, 900);
+          return;
+        }
+      } catch { /* transient detect error — keep scanning */ }
+      qrRaf = requestAnimationFrame(tick);
+    };
+    qrRaf = requestAnimationFrame(tick);
+  } catch (e) {
+    setAddStatus(`Camera unavailable: ${e.message}`, false);
+  }
 }
 
 async function removeContact(hash) {
@@ -3207,6 +3386,19 @@ document.querySelectorAll('[data-nodefilter]').forEach((b) => b.addEventListener
 
 // Destination detail sheet: click the dimmed backdrop (not the card) to close.
 $('dest-modal')?.addEventListener('click', (e) => { if (e.target === $('dest-modal')) hideDestModal(); });
+
+// Add / share contact modal.
+$('btn-add-dest')?.addEventListener('click', openAddModal);
+$('add-cancel')?.addEventListener('click', hideAddModal);
+$('add-submit')?.addEventListener('click', submitAddDest);
+$('add-scan')?.addEventListener('click', startQrScan);
+$('add-modal')?.addEventListener('click', (e) => { if (e.target === $('add-modal')) hideAddModal(); });
+$('my-card-copy')?.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(myContactCardString());
+    const b = $('my-card-copy'); b.textContent = 'Copied'; setTimeout(() => { b.textContent = 'Copy'; }, 1200);
+  } catch { /* clipboard blocked */ }
+});
 
 // TCP connect dialog (opened from the main-screen "Connect via TCP" buttons).
 document.querySelectorAll('.js-tcp-connect').forEach(b => b.addEventListener('click', openTcpModal));
