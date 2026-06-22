@@ -3369,6 +3369,31 @@ function checkWsSecurityWarning(url) {
 // cannot launch the binary from the browser — no web API can — so running
 // the downloaded file is the one unavoidable manual step.)
 
+// Curated rotation of public Reticulum TCP transport entrypoints, mirrored
+// from the mobile app's KnownTcpNodes (verified reachable 2026-05-07). A
+// fresh install picks one at random so new-user attach load spreads across
+// hubs instead of concentrating on one; the pick is persisted so it stays
+// put across reloads. Users can re-roll (↻) or type their own host:port.
+// Re-verify reachability and bump the date when editing this list.
+const RNS_HUBS = [
+  { host: 'RNS.MichMesh.net',         port: 7822, note: 'Mich, US' },
+  { host: 'dfw.us.g00n.cloud',        port: 6969, note: 'g00n.cloud, US East' },
+  { host: 'rns.beleth.net',           port: 4242, note: 'Beleth RNS Hub' },
+  { host: 'phantom.mobilefabrik.com', port: 4242, note: 'mobilefabrik' },
+  { host: 'istanbul.reserve.network', port: 9034, note: 'R-Net, Turkey' },
+];
+const hubTarget = (h) => `${h.host}:${h.port}`;
+function pickRandomHubTarget() {
+  return hubTarget(RNS_HUBS[Math.floor(Math.random() * RNS_HUBS.length)]);
+}
+// Pick a hub other than `current` (falls back to any when `current` is a
+// custom/unknown target or the list has one entry).
+function pickDifferentHubTarget(current) {
+  const pool = RNS_HUBS.map(hubTarget).filter(t => t !== current);
+  const from = pool.length ? pool : RNS_HUBS.map(hubTarget);
+  return from[Math.floor(Math.random() * from.length)];
+}
+
 const BRIDGE = {
   version: '0.6.0',
   releaseUrl: 'https://github.com/thatSFguy/reticulum-lora-webclient/releases/tag/bridge-v0.6.0',
@@ -3896,14 +3921,45 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   if ((localStorage.getItem(THEME_KEY) || 'system') === 'system') applyTheme('system');
 });
 
-// Restore the WS bridge URL and the rnsd target from the previous
-// session. Plain text fields, no validation here — connect() validates.
+// Populate the public-hub datalist (shared by the Settings + TCP-modal
+// rnsd inputs) and wire the shuffle buttons.
+(function initRnsHubs() {
+  const dl = $('rns-hubs');
+  if (dl && !dl.children.length) {
+    for (const h of RNS_HUBS) {
+      const opt = document.createElement('option');
+      opt.value = hubTarget(h);
+      opt.label = `${hubTarget(h)} — ${h.note}`;
+      dl.appendChild(opt);
+    }
+  }
+  document.querySelectorAll('.js-hub-shuffle').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const input = $(btn.dataset.target);
+      if (!input) return;
+      input.value = pickDifferentHubTarget(input.value.trim());
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+  });
+})();
+
+// Restore the WS bridge URL and the rnsd target from the previous session.
+// Plain text fields, no validation here — connect() validates. On a fresh
+// install (no saved target) seed one public hub at random so a new user can
+// connect immediately, and persist it so the pick is stable across reloads.
 try {
   const savedWsUrl = localStorage.getItem('rlw.wsUrl');
   if (savedWsUrl && $('ws-url')) $('ws-url').value = savedWsUrl;
-  const savedRnsd = localStorage.getItem('rlw.wsRnsd');
-  if (savedRnsd && $('ws-rnsd')) $('ws-rnsd').value = savedRnsd;
 } catch (_) { /* private mode — non-fatal */ }
+{
+  let savedRnsd = null;
+  try { savedRnsd = localStorage.getItem('rlw.wsRnsd'); } catch (_) { /* private mode */ }
+  if (!savedRnsd) {
+    savedRnsd = pickRandomHubTarget();
+    try { localStorage.setItem('rlw.wsRnsd', savedRnsd); } catch (_) { /* private mode */ }
+  }
+  if ($('ws-rnsd')) $('ws-rnsd').value = savedRnsd;
+}
 
 // ---- Init ------------------------------------------------------------
 updateAvatars();

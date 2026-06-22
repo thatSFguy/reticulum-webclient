@@ -1191,6 +1191,22 @@ details.settings-card > .help-content { padding-top: 6px; }
 .field.narrow { flex: 0 0 110px; }
 .field.wide { flex: 2 1 280px; }
 
+/* rnsd target input + "pick another public hub" shuffle button. */
+.hub-row { display: flex; gap: 6px; align-items: stretch; }
+.hub-row input { flex: 1 1 auto; min-width: 0; }
+.hub-shuffle {
+  flex: 0 0 auto;
+  width: 38px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+.hub-shuffle:hover { background: var(--surface-hover); }
+
 label {
   display: block;
   color: var(--text-muted);

@@ -237,7 +237,11 @@
           </div>
           <div class="field wide">
             <label>Reticulum daemon (host:port)</label>
-            <input id="ws-rnsd" type="text" placeholder="e.g. rns.michmesh.net:7822">
+            <div class="hub-row">
+              <input id="ws-rnsd" type="text" list="rns-hubs" placeholder="pick a public hub or enter host:port"
+                     autocomplete="off" autocapitalize="off" spellcheck="false">
+              <button type="button" class="hub-shuffle js-hub-shuffle" data-target="ws-rnsd" title="Pick another public hub" aria-label="Pick another public hub">↻</button>
+            </div>
           </div>
         </div>
       </div>
@@ -592,7 +596,9 @@
     <h2 class="modal-title">Connect via TCP</h2>
     <p class="modal-text">
       Reach a Reticulum daemon (<code>rnsd</code>) through a local WebSocket
-      bridge. Leave the bridge URL as-is for a bridge on this machine.
+      bridge. Leave the bridge URL as-is for a bridge on this machine. The
+      daemon is prefilled with a public hub at random — tap ↻ for another,
+      or type your own.
     </p>
     <div class="field wide">
       <label>WebSocket bridge URL</label>
@@ -601,8 +607,11 @@
     </div>
     <div class="field wide">
       <label>Reticulum daemon (host:port)</label>
-      <input id="tcp-rnsd" type="text" placeholder="e.g. rns.michmesh.net:7822"
-             autocomplete="off" autocapitalize="off" spellcheck="false">
+      <div class="hub-row">
+        <input id="tcp-rnsd" type="text" list="rns-hubs" placeholder="pick a public hub or enter host:port"
+               autocomplete="off" autocapitalize="off" spellcheck="false">
+        <button type="button" class="hub-shuffle js-hub-shuffle" data-target="tcp-rnsd" title="Pick another public hub" aria-label="Pick another public hub">↻</button>
+      </div>
     </div>
     <div class="modal-actions">
       <span class="modal-hint">No bridge running? You'll get a one-click download next.</span>
@@ -613,6 +622,11 @@
     </div>
   </div>
 </div>
+
+<!-- Curated public Reticulum hubs, shared by the Settings + TCP-modal
+     rnsd-target inputs. Options are populated from RNS_HUBS in app.js so
+     the list lives in one place. -->
+<datalist id="rns-hubs"></datalist>
 
 <!-- Bridge-not-detected helper (shown when a local WebSocket/TCP
      connection fails because the ws_bridge isn't running). -->

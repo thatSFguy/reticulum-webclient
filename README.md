@@ -166,7 +166,7 @@ You'll see `ws_bridge listening on ws://localhost:7878` (Go) or the equivalent t
 **4. Open the web client** — either the live GitHub Pages URL or a local `python -m http.server 8000` copy — and hit **Connect (WebSocket)**. Two fields in the connect card:
 
 - **WebSocket bridge URL** — defaults to `ws://localhost:7878`. Change only if your bridge runs elsewhere.
-- **Reticulum daemon (host:port)** — the rnsd you want to reach (e.g. `rns.michmesh.net:7822` for the public mesh, or `localhost:4242` for a local daemon). Required by the Go bridge; ignored by the Python bridge but harmless to fill in.
+- **Reticulum daemon (host:port)** — the rnsd you want to reach. On a fresh install this is **prefilled with a public Reticulum hub picked at random** (the ↻ button rerolls to another, spreading new-user load across hubs instead of concentrating it on one), so you can just click Connect. Override it with your own daemon (e.g. `localhost:4242`) any time — a custom value sticks. Required by the Go bridge; ignored by the Python bridge but harmless to fill in.
 
 Both fields persist across reloads (localStorage). The log panel will print `WebSocket connected` and `Connected to Reticulum network via WebSocket`; the messaging panel appears without any radio-config step.
 
