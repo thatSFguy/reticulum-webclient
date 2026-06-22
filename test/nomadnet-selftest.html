@@ -37,6 +37,8 @@ import { encode as mp } from '@msgpack/msgpack';
 import { buildRequest, parseResponse, parseLinkTarget, stripPageHeaders, requestPathHash } from '../js/nomadnet.js';
 import { parseAdvertisement, ResourceSender, ResourceReceiver, CTX_RESOURCE, CTX_RESOURCE_ADV, CTX_RESOURCE_REQ, CTX_RESOURCE_HMU, CTX_RESOURCE_PRF } from '../js/resource.js';
 import { tokenEncrypt, tokenDecrypt } from '../js/crypto.js';
+import { packMessage, unpackMessage } from '../js/lxmf.js';
+import { Identity } from '../js/identity.js';
 import { decode as mpDecode } from '@msgpack/msgpack';
 
 const results = document.getElementById('results');
@@ -110,6 +112,26 @@ try {
   check('micron: link with data-target', html.includes('data-target="/page/next.mu"') && html.includes('mu-link'));
   check('micron: divider', html.includes('mu-hr'));
   check('micron: escapes html', renderMicron('a <script> b').includes('&lt;script&gt;'));
+
+  // ---- LXMF attachment fields round-trip (integer keys!) ----
+  // Guards the bug where a Map/object encoded an EMPTY fields map, silently
+  // dropping image/file attachments.
+  {
+    const id = new Identity();
+    await id.generate();
+    const dest = new Uint8Array(16).fill(0xAB);
+    const src = new Uint8Array(16).fill(0xCD);
+    const img = new Uint8Array(2000); crypto.getRandomValues(img);
+    const fields = new Map();
+    fields.set(0x06, ['jpg', img]);
+    const packed = await packMessage(id, dest, src, '', '', fields);
+    // packed = source(16)+sig(64)+payload; unpackMessage takes (inner, dest)
+    const msg = await unpackMessage(packed, dest);
+    const f = msg.fields;
+    const v = f instanceof Map ? f.get(6) : (f[6] ?? f['6']);
+    const ok = Array.isArray(v) && v[1] && eqBytes(v[1] instanceof Uint8Array ? v[1] : new Uint8Array(v[1]), img);
+    check('LXMF image field round-trips (integer key 0x06)', ok === true, JSON.stringify(Object.keys(f || {})));
+  }
 
   // ---- Resource sender <-> receiver round-trip ----
   // Loopback the two halves over a mock link (real Token crypto) and confirm

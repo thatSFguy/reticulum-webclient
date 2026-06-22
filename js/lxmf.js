@@ -165,6 +165,33 @@ function encodeFloat64(value) {
   return buf;
 }
 
+// Encode an LXMF field key as a msgpack INTEGER (§5.9 — field keys are
+// 1-byte ints, e.g. 0x06 FIELD_IMAGE). The bundled encoder can't do this:
+// its encodeMap calls Object.keys() (empty for a Map) and writes keys as
+// strings, so it would silently drop fields or use string keys. Hence we
+// hand-build the fields map.
+function encodeIntKey(k) {
+  if (k >= 0 && k <= 127) return new Uint8Array([k]);          // positive fixint
+  if (k >= 128 && k <= 255) return new Uint8Array([0xcc, k]);  // uint8
+  throw new Error(`LXMF field key out of range: ${k}`);
+}
+
+// Hand-encode the fields map with integer keys. Accepts a Map or a plain
+// object; values are msgpack-encoded normally (arrays/bytes/strings work).
+function encodeFieldsMap(fields) {
+  const entries = fields instanceof Map
+    ? [...fields.entries()]
+    : Object.entries(fields || {}).map(([k, v]) => [Number(k), v]);
+  if (entries.length === 0) return new Uint8Array([0x80]);     // empty fixmap
+  if (entries.length > 15) throw new Error('too many LXMF fields');
+  const parts = [new Uint8Array([0x80 | entries.length])];     // fixmap header
+  for (const [k, v] of entries) {
+    parts.push(encodeIntKey(k));
+    parts.push(new Uint8Array(msgpackEncode(v)));
+  }
+  return concatBytes(parts);
+}
+
 export async function packMessage(sourceIdentity, destHash, sourceHash, title, content, fields = {}) {
   const titleBytes   = new TextEncoder().encode(title || '');
   const contentBytes = new TextEncoder().encode(content || '');
@@ -181,7 +208,7 @@ export async function packMessage(sourceIdentity, destHash, sourceHash, title, c
     encodeFloat64(timestamp),                     // [0] timestamp (float64)
     new Uint8Array(msgpackEncode(titleBytes)),    // [1] title (bin)
     new Uint8Array(msgpackEncode(contentBytes)),  // [2] content (bin)
-    new Uint8Array(msgpackEncode(fields)),        // [3] fields (map)
+    encodeFieldsMap(fields),                       // [3] fields (map, integer keys)
   ]);
 
   // Compute message hash
