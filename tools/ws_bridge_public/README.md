@@ -1,9 +1,9 @@
 # ws_bridge_public — hardened public WebSocket→TCP bridge
 
 A locked-down variant of `tools/ws_bridge.go` meant to be hosted on a
-public server (e.g. michmesh.net) so browser clients that can't run a
-local bridge (Safari/iOS/Firefox users, or anyone without a local rnsd)
-can reach a Reticulum network.
+public server so browser clients that can't run a local bridge
+(Safari/iOS/Firefox users, or anyone without a local rnsd) can reach a
+Reticulum network.
 
 It is a **separate program** from `ws_bridge.go`. The plain bridge dials
 whatever host:port the client asks for — convenient on localhost, but an
@@ -41,7 +41,7 @@ go build -trimpath -ldflags="-s -w" -o ws_bridge_public ./ws_bridge_public
 No cgo, no extra modules (reuses `tools/go.mod`'s `gorilla/websocket`).
 Cross-compiles like the other bridge (`GOOS=linux/darwin/windows`).
 
-## Recommended deployment (michmesh.net)
+## Recommended deployment
 
 rnsd running locally with a `TCPServerInterface` on `127.0.0.1:4242`, the
 bridge bound to localhost, and Caddy terminating TLS in front:
@@ -63,7 +63,7 @@ localhost. Open **443 only** in the firewall.
 ### Caddy (automatic TLS → wss://)
 
 ```caddy
-bridge.michmesh.net {
+bridge.example.org {
     reverse_proxy 127.0.0.1:7878
 }
 ```
@@ -72,7 +72,7 @@ Caddy provisions a certificate automatically and forwards the WebSocket
 upgrade. It also sets `X-Forwarded-For`, which is why the bridge is run
 with `-trust-proxy` (so per-IP caps and the blocklist see the real client
 IP, not `127.0.0.1`). Web client users then put
-`wss://bridge.michmesh.net` in the **WebSocket bridge URL** field. Because
+`wss://bridge.example.org` in the **WebSocket bridge URL** field. Because
 the target is pinned, the **Reticulum daemon (host:port)** field is
 ignored — any value (e.g. the prefilled public hub) is fine.
 
