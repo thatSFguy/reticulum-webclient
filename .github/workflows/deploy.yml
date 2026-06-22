@@ -141,6 +141,35 @@ jobs:
           # files with underscores and other Jekyll-hostile names.
           touch _site/.nojekyll
 
+      - name: Mirror bridge binaries to Pages (stable download URLs)
+        # GitHub release assets are served from a shared host behind
+        # rotating SAS-token URLs, so the download URL changes every time
+        # — which means a SmartScreen "report as safe" can't attach to a
+        # fixed URL, and per-URL reputation never accrues. Mirror the
+        # latest bridge release into the Pages site under /bridge/ at a
+        # stable, version-independent path so the in-app download (and the
+        # URL users report to SmartScreen) never changes.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p _site/bridge
+          TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt \
+                -q 'map(select(.tagName|startswith("bridge-v"))) | sort_by(.createdAt) | last | .tagName')
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "::warning::no bridge-v* release found; /bridge/ download links will 404"
+          else
+            echo "Mirroring bridge release $TAG"
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir _site/bridge \
+              --pattern 'ws_bridge-*' --pattern 'SHA256SUMS.txt'
+            # Version-independent aliases so the in-app download URL is fixed
+            # across bridge releases (the versioned files stay too).
+            cd _site/bridge
+            for f in ws_bridge-*-windows-amd64.exe; do cp -f "$f" ws_bridge-windows-amd64.exe; done
+            for f in ws_bridge-*-linux-amd64;        do cp -f "$f" ws_bridge-linux-amd64;        done
+            for f in ws_bridge-*-darwin-arm64;       do cp -f "$f" ws_bridge-darwin-arm64;       done
+            ls -la
+          fi
+
       - uses: actions/configure-pages@v6
 
       - uses: actions/upload-pages-artifact@v5

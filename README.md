@@ -124,11 +124,13 @@ Leave it running. You should see a line like `Listening for TCP connections on 0
 
 **2. Get the bridge.** Pick one of the two paths.
 
-**2a. Prebuilt Go binary (recommended).** Grab the latest from the [bridge releases page](https://github.com/thatSFguy/reticulum-lora-webclient/releases?q=bridge-v) and save it next to your other tools. Pick by platform:
+**2a. Prebuilt Go binary (recommended).** Easiest is the in-app **Connect via TCP → Download the bridge** button, which links to a fixed, version-independent URL on this site. You can also grab those directly:
 
-- `ws_bridge-*-windows-amd64.exe` — Windows 10/11 64-bit
-- `ws_bridge-*-linux-amd64` — Linux 64-bit
-- `ws_bridge-*-darwin-arm64` — macOS Apple Silicon
+- `https://thatsfguy.github.io/reticulum-lora-webclient/bridge/ws_bridge-windows-amd64.exe` — Windows 10/11 64-bit
+- `https://thatsfguy.github.io/reticulum-lora-webclient/bridge/ws_bridge-linux-amd64` — Linux 64-bit
+- `https://thatsfguy.github.io/reticulum-lora-webclient/bridge/ws_bridge-darwin-arm64` — macOS Apple Silicon
+
+These are mirrored on every deploy from the [bridge releases page](https://github.com/thatSFguy/reticulum-lora-webclient/releases?q=bridge-v) (which also has the per-version filenames and `SHA256SUMS.txt`). The stable Pages URLs exist specifically so the download link doesn't change across versions — GitHub's own release-asset URLs rotate a signed token on every request, which breaks Windows SmartScreen "report as safe" (it can't attach to a URL that never recurs). If you report the Windows binary to <https://www.microsoft.com/wdsi/filesubmission>, use the fixed `…/bridge/ws_bridge-windows-amd64.exe` URL above, not the `release-assets.githubusercontent.com/…?sig=…` URL the browser redirects to. (The durable fix for the unsigned-binary warning is code signing; the stable URL just makes the report and per-URL reputation actually stick.)
 
 Then verify the download against the published `SHA256SUMS.txt`:
 

@@ -3405,11 +3405,15 @@ function isValidHub(h) {
 const BRIDGE = {
   version: '0.6.0',
   releaseUrl: 'https://github.com/thatSFguy/reticulum-lora-webclient/releases/tag/bridge-v0.6.0',
-  base: 'https://github.com/thatSFguy/reticulum-lora-webclient/releases/download/bridge-v0.6.0',
+  // Binaries are mirrored to the Pages site (deploy.yml) under /bridge/ at a
+  // stable, version-independent path. Downloading from a fixed URL — instead
+  // of GitHub's rotating release-asset SAS URLs — is what lets a SmartScreen
+  // "report as safe" attach to a URL that actually recurs.
+  base: 'https://thatsfguy.github.io/reticulum-lora-webclient/bridge',
   assets: {
-    windows: 'ws_bridge-0.6.0-windows-amd64.exe',
-    mac: 'ws_bridge-0.6.0-darwin-arm64',
-    linux: 'ws_bridge-0.6.0-linux-amd64',
+    windows: 'ws_bridge-windows-amd64.exe',
+    mac: 'ws_bridge-darwin-arm64',
+    linux: 'ws_bridge-linux-amd64',
   },
   osLabel: { windows: 'Windows (64-bit)', mac: 'macOS (Apple Silicon)', linux: 'Linux (64-bit)' },
 };
@@ -3504,6 +3508,8 @@ function showBridgeModal(baseUrl, probeUrl) {
     dl.setAttribute('target', '_blank');
     note.textContent = 'choose your platform';
   }
+  const all = $('bridge-all');
+  if (all) all.href = BRIDGE.releaseUrl;   // keep in sync with the version
 
   modal.classList.remove('hidden');
   // Auto-reconnect the moment the bridge starts listening.
