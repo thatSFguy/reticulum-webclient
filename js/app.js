@@ -2303,9 +2303,13 @@ async function attachmentFromFields(fields) {
 // the key we store on the outgoing row and match on.
 async function computeOutboundPacketHashTruncated(packet) {
   const flagsLow = packet[0] & 0x0F;
-  // HEADER_1: skip flags + hops (2 bytes). HEADER_2 skips 18, but
-  // every packet we originate is HEADER_1.
-  const tail = packet.subarray(2);
+  // get_hashable_part (RNS/Packet.py): the high nibble of flags, the
+  // hops byte, and — for HEADER_2 — the 16-byte transport_id are all
+  // stripped before hashing, so the hash is stable across any
+  // HEADER_1↔HEADER_2 conversion in transit (SPEC §6.5.1). HEADER_1
+  // drops the first 2 bytes; HEADER_2 drops 18 (2 + transport_id).
+  const headerType = (packet[0] >> 6) & 0x03;   // 0 = HEADER_1, 1 = HEADER_2
+  const tail = packet.subarray(headerType === 1 ? 18 : 2);
   const hp = new Uint8Array(1 + tail.length);
   hp[0] = flagsLow;
   hp.set(tail, 1);
@@ -2339,21 +2343,40 @@ async function doOutboundSend(id) {
     await rnode.sendPacket(packet);
     log('ok', `Sent ${packet.length}B to "${label}"`);
 
-    // Transition to SENT and stop retrying. Opportunistic LXMF
-    // destinations (Sideband, MeshChat, NomadNet) do NOT send
-    // Packet-level delivery proofs — upstream Reticulum only
-    // auto-proves destinations configured with PROVE_ALL, which
-    // LXMF does not set. Retrying based on missing proofs would
-    // endlessly resend a message that was actually delivered.
-    // If a proof DOES arrive (rare, destination-specific), the
-    // handleDeliveryProof path upgrades state to DELIVERED.
+    // Transition to SENT and await a delivery PROOF. Upstream LXMF's
+    // LXMRouter.delivery_packet calls packet.prove() unconditionally on
+    // receipt (before it even parses the LXMF body), regardless of the
+    // destination's proof_strategy — so a reachable peer (Sideband,
+    // MeshChat, NomadNet) WILL return a PROOF, which handleDeliveryProof
+    // matches on packetHash and upgrades to DELIVERED (the double check).
+    // Retransmit on a slow channel until that proof lands or the attempt
+    // budget is spent; the receiver dedups by message hash
+    // (locally_delivered_transient_ids) so retransmits never surface as
+    // duplicates. Once attempts are exhausted the row stays SENT — one
+    // check meaning "transmitted, delivery unconfirmed" — rather than
+    // FAILED, since on a bridged/multi-hop mesh the reverse-path proof
+    // can be lost even when the message did arrive.
+    // The PROOF can arrive on the inbound path *during* this send (it
+    // matches on packetHash, which is identical across retransmits), so
+    // handleDeliveryProof may have already flipped the row to DELIVERED.
+    // Re-read and don't downgrade it back to SENT.
+    if ((await getMessageById(id))?.state === MSG_STATE_DELIVERED) return;
+    const moreAttempts = attemptNumber < MSG_MAX_ATTEMPTS;
+    const sentBackoffIndex = Math.min(attemptNumber - 1, MSG_BACKOFF_MS.length - 1);
     await updateMessage(id, {
       state: MSG_STATE_SENT,
-      nextRetryAt: 0,
+      nextRetryAt: moreAttempts ? Date.now() + MSG_BACKOFF_MS[sentBackoffIndex] : 0,
       lastError: null,
     });
+    if (!moreAttempts) {
+      const preview = (row.content || '').substring(0, 24);
+      log('info', `  No delivery proof after ${attemptNumber} attempt(s) — leaving "${preview}" at sent (delivery unconfirmed)`);
+    }
   } catch (e) {
     log('err', `Send failed: ${e.message}`);
+    // A proof for an earlier identical-bytes retransmit may have landed
+    // while this attempt was failing — don't bury DELIVERED under FAILED.
+    if ((await getMessageById(id))?.state === MSG_STATE_DELIVERED) return;
     const isFinal = attemptNumber >= MSG_MAX_ATTEMPTS;
     const backoffIndex = Math.min(attemptNumber - 1, MSG_BACKOFF_MS.length - 1);
     await updateMessage(id, {
@@ -2388,11 +2411,20 @@ async function outboundRetryTick() {
       continue;
     }
 
-    // Previously we would retransmit SENT rows whose proof timeout
-    // fired. That produced endless duplicates for LXMF destinations
-    // that never send opportunistic proofs (Sideband et al). SENT is
-    // now a terminal state unless the retry path fails — only PENDING
-    // rows are retried here.
+    // SENT but no delivery PROOF yet: retransmit until the proof lands
+    // (handleDeliveryProof flips the row to DELIVERED and the guard at
+    // the top of this loop then skips it) or the attempt budget is
+    // spent. Only opportunistic rows carry a rawPacket to resend;
+    // link/Resource rows (no rawPacket, their own proof path) are left
+    // untouched. Bounded by MSG_MAX_ATTEMPTS and deduped receiver-side,
+    // so this can't spam the recipient the way the old unbounded retry
+    // on missing proofs did.
+    if (row.state === MSG_STATE_SENT && row.rawPacket
+        && row.nextRetryAt && now >= row.nextRetryAt
+        && (row.attempts || 0) < MSG_MAX_ATTEMPTS) {
+      await doOutboundSend(row.id);
+      continue;
+    }
   }
 }
 
