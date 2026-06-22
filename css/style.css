@@ -1691,6 +1691,24 @@ textarea:focus {
 }
 .mu-checkbox input, .mu-radio input { cursor: pointer; margin: 0; accent-color: var(--accent); }
 
+/* NomadNet micron tables. */
+.mu-table {
+  border-collapse: collapse;
+  margin: 6px 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+.mu-table-center { margin-left: auto; margin-right: auto; }
+.mu-table-right { margin-left: auto; }
+.mu-table th, .mu-table td {
+  border: 1px solid var(--border-strong);
+  padding: 3px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+.mu-table th { background: var(--surface-2); font-weight: 600; }
+.mu-table tbody tr:nth-child(even) td { background: rgba(255, 255, 255, 0.02); }
+
 @media (max-width: 720px) {
   .nn-sidebar { display: none; }
 }

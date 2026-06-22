@@ -214,6 +214,9 @@ export function renderMicron(text) {
   let html = '';
   let literal = false;
   let depth = 0;
+  let tableMode = false;
+  let tableBuf = [];
+  let tableAlign = null;
 
   for (const raw of lines) {
     const line = raw;
@@ -225,6 +228,22 @@ export function renderMicron(text) {
       html += `<div class="mu-literal">${escapeHtml(unescaped) || '&nbsp;'}</div>`;
       continue;
     }
+
+    // Table toggle (`t[align][maxwidth]). The first marker opens table
+    // mode and buffers following lines; the second renders the buffered
+    // markdown-style rows and closes it (nomadnet MicronParser).
+    if (line.startsWith('`t')) {
+      if (tableMode) {
+        html += renderTable(tableBuf, tableAlign);
+        tableMode = false; tableBuf = []; tableAlign = null;
+      } else {
+        tableMode = true; tableBuf = [];
+        const a = line[2];
+        tableAlign = (a === 'l' || a === 'c' || a === 'r') ? a : null;
+      }
+      continue;
+    }
+    if (tableMode) { tableBuf.push(line); continue; }
 
     if (line.length === 0) { html += '<div class="mu-line">&nbsp;</div>'; continue; }
     if (line[0] === '#') continue;  // comment
@@ -253,7 +272,69 @@ export function renderMicron(text) {
     html += `<div class="mu-line${alignClass}">${h || '&nbsp;'}</div>`;
   }
 
+  // Unterminated table (no closing `t) — render what we buffered.
+  if (tableMode && tableBuf.length) html += renderTable(tableBuf, tableAlign);
+
   return html;
+}
+
+// Split a markdown table row into trimmed cells, honoring backslash-
+// escaped pipes and stripping the outer pipes (RNS MarkdownToMicron
+// _parse_table_row).
+function parseTableRow(line) {
+  let s = line.trim();
+  if (s.startsWith('|')) s = s.slice(1);
+  if (s.endsWith('|')) s = s.slice(0, -1);
+  const cells = [];
+  let cur = '', esc = false;
+  for (const ch of s) {
+    if (esc) { cur += ch; esc = false; }
+    else if (ch === '\\') { esc = true; }
+    else if (ch === '|') { cells.push(cur.trim()); cur = ''; }
+    else cur += ch;
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+
+// True if every cell is a markdown alignment marker (---, :--, :-:, --:).
+function isSeparatorRow(cells) {
+  return cells.length > 0 && cells.every(c => /^:?-+:?$/.test(c.replace(/\s/g, '')));
+}
+
+function cellAlign(c) {
+  const t = c.replace(/\s/g, '');
+  const l = t.startsWith(':'), r = t.endsWith(':');
+  return (l && r) ? 'center' : r ? 'right' : 'left';
+}
+
+// Render buffered markdown table rows to an HTML <table>. Row 0 is the
+// header; if row 1 is an alignment separator it sets per-column alignment
+// and is skipped; remaining rows are data. Cell text is rendered through
+// the inline pass so links/styling inside cells work.
+function renderTable(rows, tableAlign) {
+  if (!rows.length) return '';
+  const header = parseTableRow(rows[0]);
+  let aligns = [];
+  let dataStart = 1;
+  if (rows.length >= 2 && isSeparatorRow(parseTableRow(rows[1]))) {
+    aligns = parseTableRow(rows[1]).map(cellAlign);
+    dataStart = 2;
+  }
+  const cols = header.length;
+  const alignAttr = (i) => aligns[i] ? ` style="text-align:${aligns[i]}"` : '';
+  const tableCls = tableAlign === 'c' ? ' mu-table-center' : tableAlign === 'r' ? ' mu-table-right' : '';
+
+  let h = `<table class="mu-table${tableCls}"><thead><tr>`;
+  for (let i = 0; i < cols; i++) h += `<th${alignAttr(i)}>${renderInline(header[i]).html}</th>`;
+  h += '</tr></thead><tbody>';
+  for (let r = dataStart; r < rows.length; r++) {
+    const cells = parseTableRow(rows[r]);
+    h += '<tr>';
+    for (let i = 0; i < cols; i++) h += `<td${alignAttr(i)}>${renderInline(cells[i] || '').html}</td>`;
+    h += '</tr>';
+  }
+  return h + '</tbody></table>';
 }
 
 export default renderMicron;

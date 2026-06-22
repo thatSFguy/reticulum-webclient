@@ -1828,10 +1828,50 @@ async function handleNomadNetResponse(link, requestId, response) {
     return;
   }
   link._nnRequest = null;
+  // /file/ paths are static downloads, not micron — the response is a
+  // [filename_bytes, file_bytes] pair (§11.6.5). Save it instead of
+  // rendering, and don't record it in page history.
+  if (pending.path.startsWith('/file/')) {
+    nnSaveFileResponse(pending.path, response);
+    return;
+  }
   const text = responseToText(response);
   nnRenderPage(text, nnState.destHashHex, pending.path);
   nnSetStatus(`loaded ${pending.path}`, 'ok');
   await addHistory({ url: `${nnState.destHashHex}:${pending.path}`, title: pending.path, visited: Date.now() }).catch(() => {});
+}
+
+// Turn a /file/ response into a browser download. The response is
+// [filename_bytes, file_bytes] after Resource assembly (§11.6.5); fall
+// back to the path basename if the server didn't include a name, and to
+// raw bytes if some server sends them without the filename wrapper.
+function nnSaveFileResponse(path, response) {
+  try {
+    let filename = path.split('/').pop() || 'download';
+    let bytes = null;
+    if (Array.isArray(response) && response.length >= 2) {
+      const fn = response[0];
+      if (fn instanceof Uint8Array) filename = new TextDecoder('utf-8', { fatal: false }).decode(fn) || filename;
+      else if (typeof fn === 'string' && fn) filename = fn;
+      bytes = response[1] instanceof Uint8Array ? response[1] : new Uint8Array(response[1] || []);
+    } else if (response instanceof Uint8Array) {
+      bytes = response;
+    }
+    if (!bytes) { nnSetStatus('file response was empty or malformed', 'err'); return; }
+    filename = sanitizeFilename(filename);
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    nnSetStatus(`downloaded ${filename} (${bytes.length} bytes)`, 'ok');
+    log('ok', `  NomadNet file downloaded: ${filename} (${bytes.length} B)`);
+  } catch (e) {
+    nnSetStatus(`file download failed: ${e.message}`, 'err');
+  }
 }
 
 // Send a NomadNet page request over an active link. `data` is null for a
@@ -1877,10 +1917,6 @@ function nnRenderPage(rawText, destHashHex, path) {
   const { headers, body } = stripPageHeaders(rawText);
   const pageEl = $('nn-page');
   if (!pageEl) return;
-  if (path.startsWith('/file/')) {
-    pageEl.innerHTML = '<div class="mu-line">[file downloads not supported yet]</div>';
-    return;
-  }
   pageEl.innerHTML = renderMicron(body);
   if (headers.bg) pageEl.style.background = headers.bg.startsWith('#') ? headers.bg : `#${headers.bg}`;
   else pageEl.style.background = '';
