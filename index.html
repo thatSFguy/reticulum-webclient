@@ -25,6 +25,22 @@
 
 <div class="app-shell">
 
+  <!-- Destruct / panic button — fixed top-right, visible on every view.
+       Confirms intent, then wipes ALL locally stored data (identity,
+       contacts, messages, nodes, bookmarks, settings) and reloads. -->
+  <button id="btn-destruct" class="destruct-btn" title="Destruct — wipe all local data from this device" aria-label="Destruct: wipe all local data">
+    <svg viewBox="0 0 24 24" class="destruct-flame" aria-hidden="true">
+      <defs>
+        <linearGradient id="destructFlameGrad" x1="0" y1="1" x2="0" y2="0">
+          <stop offset="0%" stop-color="#ff2d00"/>
+          <stop offset="55%" stop-color="#ff7a00"/>
+          <stop offset="100%" stop-color="#ffd000"/>
+        </linearGradient>
+      </defs>
+      <path class="flame-path" fill="url(#destructFlameGrad)" d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>
+    </svg>
+  </button>
+
   <!-- Sidebar (desktop only) -->
   <aside class="sidebar">
     <div class="sidebar-header">
@@ -588,6 +604,26 @@
     <code id="my-card" class="add-mycard"></code>
     <div class="modal-actions"><span class="modal-hint">QR image export is coming next; for now copy &amp; share the text.</span>
       <button id="my-card-copy" class="btn-secondary">Copy</button></div>
+  </div>
+</div>
+
+<!-- Destruct confirmation. Reuses the modal-overlay pattern. -->
+<div id="destruct-modal" class="modal-overlay hidden">
+  <div class="modal destruct-modal">
+    <div class="destruct-modal-icon">🔥</div>
+    <h2 class="modal-title">Burn it all?</h2>
+    <p class="modal-text">
+      This permanently erases <strong>everything stored on this device</strong> —
+      your identity keys, all contacts, conversations, discovered nodes,
+      bookmarks, and settings. It cannot be undone, and anyone who messaged
+      this identity will no longer be able to reach you.
+    </p>
+    <div class="modal-actions">
+      <div class="modal-buttons">
+        <button id="destruct-cancel" class="btn-secondary">Cancel</button>
+        <button id="destruct-confirm" class="btn-danger">Burn everything</button>
+      </div>
+    </div>
   </div>
 </div>
 

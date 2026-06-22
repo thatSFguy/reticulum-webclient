@@ -433,7 +433,7 @@ a { color: var(--accent); }
 .view.active { display: flex; }
 
 .view-header {
-  padding: 18px 24px 14px;
+  padding: 18px 64px 14px 24px;  /* extra right pad clears the fixed destruct button */
   border-bottom: 0.5px solid var(--border);
   display: flex;
   align-items: flex-end;
@@ -1622,7 +1622,7 @@ textarea:focus {
   .view-messages:has(#compose-area:not(.hidden)) .list-panel { display: none; }
   .view-messages:has(#compose-area.hidden) .chat-area { display: none; }
 
-  .view-header { padding: 16px 18px 10px; }
+  .view-header { padding: 16px 58px 10px 18px; }
   .view-settings > .settings-card,
   .view-settings > .notice { margin: 8px 16px; }
 
@@ -1655,7 +1655,7 @@ textarea:focus {
   display: flex;
   gap: 6px;
   align-items: center;
-  padding: 10px 12px;
+  padding: 10px 58px 10px 12px;  /* extra right pad clears the fixed destruct button */
   border-bottom: 1px solid var(--border);
   background: var(--surface);
 }
@@ -2009,3 +2009,112 @@ textarea:focus {
   color: var(--text-muted); font-size: 16px; line-height: 1; padding: 0 4px;
 }
 .staged-remove:hover { color: var(--err); }
+
+/* ---- Destruct (panic wipe) ----------------------------------------- */
+
+/* Fixed top-right "fire" button, visible on every view. */
+.destruct-btn {
+  position: fixed;
+  top: 10px;
+  right: 12px;
+  z-index: 900;
+  width: 40px;
+  height: 40px;
+  padding: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0.5px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface);
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
+}
+.destruct-btn:hover {
+  transform: scale(1.08);
+  background: var(--surface-2);
+  box-shadow: 0 4px 14px rgba(255, 90, 0, 0.35);
+}
+.destruct-btn:active { transform: scale(0.96); }
+.destruct-flame {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  filter: drop-shadow(0 0 2px rgba(255, 120, 0, 0.7));
+}
+/* Idle flicker — DuckDuckGo-style living flame. */
+.destruct-flame .flame-path {
+  transform-origin: 50% 95%;
+  animation: destruct-flicker 1.4s ease-in-out infinite;
+}
+.destruct-btn:hover .flame-path { animation-duration: 0.55s; }
+@keyframes destruct-flicker {
+  0%, 100% { transform: scaleY(1) scaleX(1) rotate(0deg); opacity: 1; }
+  25%      { transform: scaleY(1.1) scaleX(0.94) rotate(-1.5deg); opacity: 0.92; }
+  55%      { transform: scaleY(0.95) scaleX(1.05) rotate(1.5deg); opacity: 1; }
+  80%      { transform: scaleY(1.07) scaleX(0.97) rotate(-0.5deg); opacity: 0.96; }
+}
+
+/* Danger button (used in the confirm dialog). */
+.btn-danger {
+  padding: 9px 16px;
+  border: none;
+  border-radius: 8px;
+  background: #c0392b;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.btn-danger:hover { background: #a93226; }
+
+/* Confirm dialog. */
+.destruct-modal { text-align: center; }
+.destruct-modal-icon { font-size: 40px; line-height: 1; margin-bottom: 6px; }
+.destruct-modal .modal-text { text-align: left; }
+
+/* Full-screen flame sweep played during the wipe. Pointer-events off so it
+   never blocks the reload; it lives above everything (modals included). */
+.destruct-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 99999;
+  pointer-events: none;
+  overflow: hidden;
+  animation: destruct-scorch 1.3s ease-in forwards;
+}
+@keyframes destruct-scorch {
+  0%   { background: rgba(20, 0, 0, 0); }
+  70%  { background: rgba(20, 0, 0, 0.35); }
+  100% { background: rgba(10, 0, 0, 0.97); }
+}
+.destruct-flames {
+  position: absolute;
+  left: -10%;
+  right: -10%;
+  bottom: 0;
+  top: 100%;
+  background:
+    radial-gradient(55% 80% at 18% 100%, #ffe070 0%, #ff8a00 32%, #ff2d00 58%, transparent 76%),
+    radial-gradient(60% 95% at 50% 100%, #fff3a0 0%, #ffb300 28%, #ff4d00 54%, transparent 74%),
+    radial-gradient(55% 80% at 82% 100%, #ffe070 0%, #ff8a00 32%, #ff2d00 58%, transparent 76%);
+  filter: blur(6px) saturate(1.35);
+  animation:
+    destruct-rise 1.2s cubic-bezier(0.4, 0.75, 0.4, 1) forwards,
+    destruct-lick 0.13s steps(2, end) infinite;
+}
+@keyframes destruct-rise {
+  0%   { top: 100%; }
+  62%  { top: -12%; }
+  100% { top: -45%; opacity: 1; }
+}
+@keyframes destruct-lick {
+  0%   { transform: scaleX(1)    translateY(0); }
+  100% { transform: scaleX(1.05) translateY(-3px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .destruct-flame .flame-path { animation: none; }
+  .destruct-flames { animation: destruct-rise 0.6s ease-out forwards; }
+}

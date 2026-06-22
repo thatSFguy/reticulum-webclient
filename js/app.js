@@ -45,7 +45,7 @@ const MSG_RETRY_TICK_MS = 5000;
 // Tap-back reaction palette — same six emoji, in the same order, as
 // reticulum-mobile-app's REACTION_PALETTE for cross-client consistency.
 const REACTION_PALETTE = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
-import { openDatabase, saveIdentity, loadIdentity, saveContact, getContact, getAllContacts, deleteContact, deleteMessagesForContact, saveMessage, getMessages, getAllMessages, getMessageById, updateMessage, saveNode, getNode, getAllNodes, deleteNode, deleteAllNodes, saveBookmark, getAllBookmarks, deleteBookmark, addHistory } from './store.js';
+import { openDatabase, saveIdentity, loadIdentity, saveContact, getContact, getAllContacts, deleteContact, deleteMessagesForContact, saveMessage, getMessages, getAllMessages, getMessageById, updateMessage, saveNode, getNode, getAllNodes, deleteNode, deleteAllNodes, saveBookmark, getAllBookmarks, deleteBookmark, addHistory, deleteDatabase } from './store.js';
 
 const $ = id => document.getElementById(id);
 
@@ -4173,6 +4173,51 @@ $('add-cancel')?.addEventListener('click', hideAddModal);
 $('add-submit')?.addEventListener('click', submitAddDest);
 $('add-scan')?.addEventListener('click', startQrScan);
 $('add-modal')?.addEventListener('click', (e) => { if (e.target === $('add-modal')) hideAddModal(); });
+
+// ---- Destruct (panic wipe) -------------------------------------------
+
+function showDestructModal() { $('destruct-modal')?.classList.remove('hidden'); }
+function hideDestructModal() { $('destruct-modal')?.classList.add('hidden'); }
+
+// Wipe everything stored on this device and reload to a clean slate, with a
+// full-screen flame sweep over the wipe. Stops inbound traffic first so an
+// arriving message can't re-open and re-seed the database mid-wipe.
+async function runDestruct() {
+  hideDestructModal();
+
+  // Kick off the flame sweep (purely cosmetic — never let it gate the wipe).
+  const overlay = document.createElement('div');
+  overlay.className = 'destruct-overlay';
+  overlay.innerHTML = '<div class="destruct-flames"></div>';
+  document.body.appendChild(overlay);
+
+  // Silence anything that writes to storage.
+  try { if (announceTimer) { clearInterval(announceTimer); announceTimer = null; } } catch (_) {}
+  try { if (outboundRetryTimer) { clearInterval(outboundRetryTimer); outboundRetryTimer = null; } } catch (_) {}
+  try { if (rnode && radioOn) await rnode.disconnect(); } catch (_) {}
+  radioOn = false;
+
+  // Wipe IndexedDB + web storage + any PWA caches. Each guarded so one
+  // failure can't abort the rest.
+  try { await deleteDatabase(); } catch (_) {}
+  try { localStorage.clear(); } catch (_) {}
+  try { sessionStorage.clear(); } catch (_) {}
+  try {
+    if (window.caches) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+    }
+  } catch (_) {}
+
+  // Let the flames finish their sweep, then reload into a fresh identity.
+  await new Promise(r => setTimeout(r, 1300));
+  location.reload();
+}
+
+$('btn-destruct')?.addEventListener('click', showDestructModal);
+$('destruct-cancel')?.addEventListener('click', hideDestructModal);
+$('destruct-confirm')?.addEventListener('click', runDestruct);
+$('destruct-modal')?.addEventListener('click', (e) => { if (e.target === $('destruct-modal')) hideDestructModal(); });
 $('my-card-copy')?.addEventListener('click', async () => {
   try {
     await navigator.clipboard.writeText(myContactCardString());

@@ -66,6 +66,21 @@ export async function openDatabase() {
   });
 }
 
+// Close the active connection and delete the entire IndexedDB database.
+// Used by the destruct / panic action to wipe all locally stored data.
+// Resolves on success; also resolves (rather than hanging) if another tab
+// holds the database open and blocks the delete — the OS completes the
+// deletion once those connections close.
+export async function deleteDatabase() {
+  if (db) { try { db.close(); } catch (_) { /* already closed */ } db = null; }
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.deleteDatabase(DB_NAME);
+    req.onsuccess = () => resolve();
+    req.onerror   = () => reject(req.error);
+    req.onblocked = () => resolve();
+  });
+}
+
 // ---- Identity --------------------------------------------------------
 
 export async function saveIdentity(identityData) {
