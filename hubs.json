@@ -1,0 +1,11 @@
+{
+  "_about": "Curated rotation of public Reticulum TCP transport entrypoints, fetched by the web client at startup to prefill the TCP-connection daemon field. Mirrors the mobile app's KnownTcpNodes. Edit this file (no code change / deploy of app.js needed) — re-verify reachability and bump 'verified' when you do. The web client keeps a baked-in copy as an offline fallback, so a 404/parse error here is non-fatal.",
+  "verified": "2026-05-07",
+  "hubs": [
+    { "host": "RNS.MichMesh.net",         "port": 7822, "note": "Mich, US" },
+    { "host": "dfw.us.g00n.cloud",         "port": 6969, "note": "g00n.cloud, US East" },
+    { "host": "rns.beleth.net",            "port": 4242, "note": "Beleth RNS Hub" },
+    { "host": "phantom.mobilefabrik.com",  "port": 4242, "note": "mobilefabrik" },
+    { "host": "istanbul.reserve.network",  "port": 9034, "note": "R-Net, Turkey" }
+  ]
+}

@@ -3369,29 +3369,37 @@ function checkWsSecurityWarning(url) {
 // cannot launch the binary from the browser — no web API can — so running
 // the downloaded file is the one unavoidable manual step.)
 
-// Curated rotation of public Reticulum TCP transport entrypoints, mirrored
-// from the mobile app's KnownTcpNodes (verified reachable 2026-05-07). A
-// fresh install picks one at random so new-user attach load spreads across
-// hubs instead of concentrating on one; the pick is persisted so it stays
-// put across reloads. Users can re-roll (↻) or type their own host:port.
-// Re-verify reachability and bump the date when editing this list.
-const RNS_HUBS = [
+// Curated rotation of public Reticulum TCP transport entrypoints. The live
+// list is fetched from hubs.json at startup (so it can be edited without an
+// app.js change/deploy, and shared with the mobile app's KnownTcpNodes);
+// this baked-in copy is the offline fallback used until/unless that fetch
+// succeeds. A fresh install picks one at random so new-user attach load
+// spreads across hubs instead of concentrating on one; the pick is
+// persisted so it stays put across reloads. Users can re-roll (↻) or type
+// their own host:port. Keep this in sync with hubs.json when editing.
+const RNS_HUBS_FALLBACK = [
   { host: 'RNS.MichMesh.net',         port: 7822, note: 'Mich, US' },
   { host: 'dfw.us.g00n.cloud',        port: 6969, note: 'g00n.cloud, US East' },
   { host: 'rns.beleth.net',           port: 4242, note: 'Beleth RNS Hub' },
   { host: 'phantom.mobilefabrik.com', port: 4242, note: 'mobilefabrik' },
   { host: 'istanbul.reserve.network', port: 9034, note: 'R-Net, Turkey' },
 ];
+// Active list — replaced by the hubs.json fetch if it returns valid data.
+let rnsHubs = RNS_HUBS_FALLBACK.slice();
 const hubTarget = (h) => `${h.host}:${h.port}`;
 function pickRandomHubTarget() {
-  return hubTarget(RNS_HUBS[Math.floor(Math.random() * RNS_HUBS.length)]);
+  return hubTarget(rnsHubs[Math.floor(Math.random() * rnsHubs.length)]);
 }
 // Pick a hub other than `current` (falls back to any when `current` is a
 // custom/unknown target or the list has one entry).
 function pickDifferentHubTarget(current) {
-  const pool = RNS_HUBS.map(hubTarget).filter(t => t !== current);
-  const from = pool.length ? pool : RNS_HUBS.map(hubTarget);
+  const pool = rnsHubs.map(hubTarget).filter(t => t !== current);
+  const from = pool.length ? pool : rnsHubs.map(hubTarget);
   return from[Math.floor(Math.random() * from.length)];
+}
+// Validate one fetched hub entry before trusting it.
+function isValidHub(h) {
+  return h && typeof h.host === 'string' && h.host.length > 0 && Number.isFinite(Number(h.port));
 }
 
 const BRIDGE = {
@@ -3921,18 +3929,26 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   if ((localStorage.getItem(THEME_KEY) || 'system') === 'system') applyTheme('system');
 });
 
-// Populate the public-hub datalist (shared by the Settings + TCP-modal
-// rnsd inputs) and wire the shuffle buttons.
-(function initRnsHubs() {
+// (Re)fill the public-hub datalist (shared by the Settings + TCP-modal
+// rnsd inputs) from the current `rnsHubs`.
+function populateHubDatalist() {
   const dl = $('rns-hubs');
-  if (dl && !dl.children.length) {
-    for (const h of RNS_HUBS) {
-      const opt = document.createElement('option');
-      opt.value = hubTarget(h);
-      opt.label = `${hubTarget(h)} — ${h.note}`;
-      dl.appendChild(opt);
-    }
+  if (!dl) return;
+  dl.replaceChildren();
+  for (const h of rnsHubs) {
+    const opt = document.createElement('option');
+    opt.value = hubTarget(h);
+    opt.label = `${hubTarget(h)} — ${h.note}`;
+    dl.appendChild(opt);
   }
+}
+
+// Wire the shuffle buttons, render the fallback list immediately, then
+// refresh from hubs.json in the background. The fetch only updates the
+// dropdown/reroll pool — the already-seeded field value is left alone — and
+// a 404/parse error is non-fatal (we keep the baked-in fallback).
+(function initRnsHubs() {
+  populateHubDatalist();
   document.querySelectorAll('.js-hub-shuffle').forEach(btn => {
     btn.addEventListener('click', () => {
       const input = $(btn.dataset.target);
@@ -3941,6 +3957,16 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
       input.dispatchEvent(new Event('input', { bubbles: true }));
     });
   });
+  fetch('hubs.json', { cache: 'no-cache' })
+    .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then(data => {
+      const list = Array.isArray(data) ? data : (data && Array.isArray(data.hubs) ? data.hubs : []);
+      const valid = list.filter(isValidHub).map(h => ({
+        host: String(h.host), port: Number(h.port), note: h.note ? String(h.note) : '',
+      }));
+      if (valid.length) { rnsHubs = valid; populateHubDatalist(); }
+    })
+    .catch(() => { /* offline / 404 / bad JSON — keep the baked-in fallback */ });
 })();
 
 // Restore the WS bridge URL and the rnsd target from the previous session.

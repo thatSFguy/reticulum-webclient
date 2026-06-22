@@ -135,6 +135,7 @@ jobs:
           mkdir -p _site
           cp index.html _site/
           cp flasher.html _site/
+          cp hubs.json _site/
           cp -r css js lib test _site/
           # .nojekyll disables Jekyll processing so GitHub Pages serves
           # files with underscores and other Jekyll-hostile names.
