@@ -15,7 +15,7 @@ No build step, no framework, no bundler. Plain ES modules, loaded directly in th
 - Configures the radio (frequency, bandwidth, spreading factor, coding rate, TX power) and turns it on — when talking to an RNode. When talking to `rnsd` over WebSocket there is no radio to configure; the network config lives on the daemon side.
 - Generates and persists an Ed25519 / X25519 Reticulum identity in IndexedDB. Export, import, or regenerate it from the Settings panel.
 - Sends and receives Reticulum announces, with **ratchet emission and rotation** — a fresh ratchet keypair is advertised and rotated on every announce (auto-announce fires once at connect and every five minutes thereafter, so relay identity caches stay warm).
-- Encrypts and decrypts LXMF messages using the standard Reticulum ECDH + HKDF + AES-256-CBC + HMAC-SHA256 scheme. Outbound text goes out as **opportunistic single packets**, retried until a delivery PROOF returns; the conversation view shows per-message state (sending → sent ✓ → delivered ✓✓ / failed).
+- Encrypts and decrypts LXMF messages using the standard Reticulum ECDH + HKDF + AES-256-CBC + HMAC-SHA256 scheme. Short text goes out as an **opportunistic single packet**, retried until a delivery PROOF returns; a message too large for one packet is **automatically upgraded to a Link** (single link packet, or a Resource if larger). The conversation view shows per-message state (sending → sent ✓ → delivered ✓✓ / failed).
 - Initiates **Reticulum Links** and transfers **Resources** — file and image attachments (with optional captions) are sent to a contact over an initiator Link as a Resource.
 - Acts as link **responder** too: validates LINKREQUESTs, emits LRPROOFs signed with our long-term Ed25519 key, handles LRRTT, decrypts inbound link traffic, and sends per-packet PROOF receipts back so senders do not retry forever. Sideband and MeshChat round-trip cleanly both ways.
 - **Browses NomadNet pages** over initiator Links + the REQUEST/RESPONSE protocol: renders micron markup (headings, colors, links, tables), interactive form fields (text, checkbox, radio) with submit, file downloads, plus a node sidebar with bookmarks and history.
@@ -25,7 +25,6 @@ No build step, no framework, no bundler. Plain ES modules, loaded directly in th
 
 ## What it does not do (yet)
 
-- **Auto-upgrade long text to a Link.** Outbound *text* is opportunistic single-packet only (≈250–300 bytes of content); a longer message is rejected with a "shorten it" notice rather than transparently sent over a Link. Attachments already use Links/Resources, so the plumbing exists — text just isn't wired to it.
 - **Propagation node / store-and-forward.** No offline delivery; both parties must be on the air at the same time.
 - **Multi-hop transport routing.** We are a leaf node, not a transport/router — no routing tables.
 - **NomadNet partials / server-side includes** (rendered as a placeholder) and **identify-on-connect** for `ALLOW_LIST` (auth-gated) pages.

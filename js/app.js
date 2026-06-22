@@ -2196,9 +2196,34 @@ async function sendMessage() {
       }
     }
 
-    // Check size
+    // Too big for a single opportunistic packet — deliver it over a Link
+    // instead of rejecting it: sendLxmfOverLink sends a single link packet
+    // if it fits post-handshake, else a Resource, exactly like attachments.
+    // The row carries no rawPacket, so the opportunistic retry tick skips
+    // it (link/Resource has its own proof path). Requires an active link.
     if (packet.length > 500) {
-      log('err', `Packet too large (${packet.length} bytes, max 500). Shorten your message.`);
+      if (!radioOn) {
+        log('err', `Message too large for one packet (${packet.length}B) and the radio is off — connect first, or shorten it.`);
+        return;
+      }
+      const row = {
+        contactHash: activeContactHash, direction: 'outgoing',
+        content, title: '', timestamp: Date.now(),
+        state: MSG_STATE_SENDING, attempts: 0, nextRetryAt: 0,
+      };
+      const id = await saveMessage(row);
+      conversedHashes.add(activeContactHash);
+      $('msg-content').value = '';
+      await renderMessages(activeContactHash);
+      log('info', `Message too large for one packet (${packet.length}B) — sending over a Link…`);
+      try {
+        const delivered = await sendLxmfOverLink(contact, content, '', new Map());
+        await updateMessage(id, { state: delivered ? MSG_STATE_DELIVERED : MSG_STATE_SENT });
+      } catch (e) {
+        await updateMessage(id, { state: MSG_STATE_FAILED, lastError: e.message });
+        log('err', `Link send failed: ${e.message}`);
+      }
+      if (activeContactHash === row.contactHash) await renderMessages(activeContactHash);
       return;
     }
 
