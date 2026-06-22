@@ -1783,6 +1783,12 @@ function makeResourceSend(link) {
   };
 }
 
+// Cap for NomadNet page/file Resource transfers. Pages are tiny; the
+// headroom is for /file/ (and executable-page) downloads, which the 4 MB
+// LXMF default would refuse. Bounded so a hostile node can't force an
+// unbounded browser allocation.
+const NN_MAX_RESOURCE = 64 * 1024 * 1024;
+
 // Create and start a Resource receiver for an inbound advertisement.
 function startResourceReceive(link, adv) {
   if (link._resource) { link._resource.cancel('superseded'); }
@@ -1794,6 +1800,7 @@ function startResourceReceive(link, adv) {
   else log('info', `  Receiving LXMF resource (${adv.parts} parts) on link ${toHex(link.linkId).substring(0,12)}...`);
 
   link._resource = new ResourceReceiver(link, adv, {
+    maxSize: isPage ? NN_MAX_RESOURCE : undefined,
     send: makeResourceSend(link),
     onProgress: (frac) => { if (isPage) nnSetStatus(`receiving page… ${Math.round(frac * 100)}%`); },
     onError: (reason) => { link._resource = null; if (isPage) nnSetStatus(reason, 'err'); else log('err', `  LXMF resource failed: ${reason}`); },
@@ -1828,10 +1835,13 @@ async function handleNomadNetResponse(link, requestId, response) {
     return;
   }
   link._nnRequest = null;
-  // /file/ paths are static downloads, not micron — the response is a
-  // [filename_bytes, file_bytes] pair (§11.6.5). Save it instead of
+  // A file download is identified by the RESPONSE SHAPE — a
+  // [filename_bytes, file_bytes] pair (§11.6.5) — not just the path:
+  // executable pages (e.g. /page/download.mu) return files from a /page/
+  // path too. A micron page response is always a string or bytes, never a
+  // 2-element array, so this never false-positives. Save instead of
   // rendering, and don't record it in page history.
-  if (pending.path.startsWith('/file/')) {
+  if (pending.path.startsWith('/file/') || nnResponseIsFile(response)) {
     nnSaveFileResponse(pending.path, response);
     return;
   }
@@ -1839,6 +1849,13 @@ async function handleNomadNetResponse(link, requestId, response) {
   nnRenderPage(text, nnState.destHashHex, pending.path);
   nnSetStatus(`loaded ${pending.path}`, 'ok');
   await addHistory({ url: `${nnState.destHashHex}:${pending.path}`, title: pending.path, visited: Date.now() }).catch(() => {});
+}
+
+// A request response is a file download when it is a [filename, bytes]
+// pair. Page responses are a string or a single Uint8Array, never a
+// 2-element array, so this distinguishes the two unambiguously.
+function nnResponseIsFile(response) {
+  return Array.isArray(response) && response.length >= 2;
 }
 
 // Turn a /file/ response into a browser download. The response is

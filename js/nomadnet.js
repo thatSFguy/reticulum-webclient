@@ -115,6 +115,14 @@ export function parseLinkTarget(target) {
   // Same-node path.
   if (t.startsWith('/')) return { kind: 'page', path: t };
 
+  // Leading colon = empty destination hash = "the current node" (NomadNet
+  // Browser.retrieve_url empty-hash branch). ":/page/x.mu" is a same-node
+  // nav relative to whatever node we're already viewing.
+  if (t.startsWith(':')) {
+    const path = t.slice(1) || NN_DEFAULT_PATH;
+    return path.startsWith('/') ? { kind: 'page', path } : { kind: 'unknown', raw: target };
+  }
+
   // Bare cross-node hash, optionally with `:/path`.
   return parseNodeTarget(t);
 }
