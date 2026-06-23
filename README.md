@@ -1,5 +1,5 @@
 > [!NOTE]
-> **🙋 Seeking a co-maintainer / partner.** I'm stepping back from active development and looking for someone to help maintain this project (or take it over). Bug reports with a clear repro are welcome; feature requests are PR-welcome but not promised. Interested in partnering? See **[#5](https://github.com/thatSFguy/reticulum-lora-webclient/issues/5)**.
+> **🙋 Seeking a co-maintainer / partner.** I'm stepping back from active development of this repo and looking for someone to help maintain this project (or take it over). Bug reports with a clear repro are welcome; feature requests are PR-welcome but not promised. Interested in partnering? See **[#5](https://github.com/thatSFguy/reticulum-lora-webclient/issues/5)**.
 
 # reticulum-lora-webclient
 
