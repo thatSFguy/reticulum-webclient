@@ -132,15 +132,19 @@ let activeTransport = null;  // 'ble' | 'serial' | 'ws' — set on connect; pick
 
 // Periodic announce cadence, configurable per transport class in Settings.
 // LoRa (BLE/Serial via RNode) is bandwidth-starved but must outpace transit-
-// node path-table TTLs, so it defaults faster; TCP (rnsd) peers keep cached
-// paths fresh between announces, so it can be sparser. Stored in minutes under
-// these keys. Spec guidance (reticulum-specifications SPEC.md §9.7): 5–10 min
-// for low-MTU LoRa, 15–30 min for an always-on rnsd-on-IP relay; avoid < 60s
-// (triggers ingress rate-limiting) and > 30 min on lossy links.
-const ANNOUNCE_INTERVAL_DEFAULTS = { lora: 5, tcp: 15 };  // minutes
+// node path-table TTLs on a direct link, so it defaults faster. TCP (rnsd)
+// rides the wider transport network, where the upstream manual's announce
+// rate control commonly caps re-propagation at announce_rate_target = 3600
+// (once/hour) — so announcing faster than hourly just gets dropped by relays.
+// The manual: "it should generally not be necessary to announce any kind of
+// destination more often than once every few hours... If you think you need to
+// announce more often than once an hour, you're most likely doing something
+// wrong." (reticulum.network/manual/interfaces.html#announce-rate-control)
+// Stored in minutes under these keys.
+const ANNOUNCE_INTERVAL_DEFAULTS = { lora: 5, tcp: 60 };  // minutes
 const ANNOUNCE_INTERVAL_KEYS = { lora: 'rlw.announceMinsLora', tcp: 'rlw.announceMinsTcp' };
 const ANNOUNCE_INTERVAL_MIN = 1;    // minutes — floor (keeps us above the 60s rate-limit cliff)
-const ANNOUNCE_INTERVAL_MAX = 120;  // minutes — ceiling
+const ANNOUNCE_INTERVAL_MAX = 720;  // minutes — ceiling (12 h; covers the manual's ~6 h guidance)
 
 // Which announce-interval class a transport id falls into.
 function announceClass(transport) {
