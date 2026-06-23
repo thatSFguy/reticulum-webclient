@@ -1,11 +1,18 @@
 {
-  "_about": "Curated rotation of public Reticulum TCP transport entrypoints, fetched by the web client at startup to prefill the TCP-connection daemon field. Mirrors the mobile app's KnownTcpNodes. Edit this file (no code change / deploy of app.js needed) — re-verify reachability and bump 'verified' when you do. The web client keeps a baked-in copy as an offline fallback, so a 404/parse error here is non-fatal.",
-  "verified": "2026-05-07",
+  "_about": "Curated rotation of public Reticulum TCP transport entrypoints, fetched by the web client at startup to prefill the TCP-connection daemon field. Mirrors the mobile app's KnownTcpNodes. Edit this file (no code change / deploy of app.js needed) — re-verify reachability and bump 'verified' when you do. The web client keeps a baked-in copy as an offline fallback, so a 404/parse error here is non-fatal. Only TCPClientInterface endpoints belong here — BackboneInterface uses a different wire protocol the WS-bridge can't speak. Many entries sourced from directory.rns.recipes.",
+  "verified": "2026-06-23",
   "hubs": [
     { "host": "RNS.MichMesh.net",         "port": 7822, "note": "Mich, US" },
     { "host": "dfw.us.g00n.cloud",         "port": 6969, "note": "g00n.cloud, US East" },
+    { "host": "use.inertia.chat",          "port": 4242, "note": "Inertia.Chat, US" },
+    { "host": "rns.wisco.network",         "port": 4242, "note": "wisco.network, US" },
     { "host": "rns.beleth.net",            "port": 4242, "note": "Beleth RNS Hub" },
+    { "host": "rns.dismail.de",            "port": 7822, "note": "dismail, DE" },
+    { "host": "vps001.vanheusden.com",     "port": 4242, "note": "vanheusden, NL" },
     { "host": "phantom.mobilefabrik.com",  "port": 4242, "note": "mobilefabrik" },
-    { "host": "istanbul.reserve.network",  "port": 9034, "note": "R-Net, Turkey" }
+    { "host": "reticulum.hardenedbsd.org", "port": 4242, "note": "HardenedBSD" },
+    { "host": "istanbul.reserve.network",  "port": 9034, "note": "R-Net, Turkey" },
+    { "host": "sydney.reticulum.au",       "port": 4242, "note": "Sydney, AU" },
+    { "host": "103.195.4.226",             "port": 4242, "note": "ZHULONG1, Hong Kong" }
   ]
 }

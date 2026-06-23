@@ -3709,9 +3709,16 @@ function checkWsSecurityWarning(url) {
 const RNS_HUBS_FALLBACK = [
   { host: 'RNS.MichMesh.net',         port: 7822, note: 'Mich, US' },
   { host: 'dfw.us.g00n.cloud',        port: 6969, note: 'g00n.cloud, US East' },
+  { host: 'use.inertia.chat',         port: 4242, note: 'Inertia.Chat, US' },
+  { host: 'rns.wisco.network',        port: 4242, note: 'wisco.network, US' },
   { host: 'rns.beleth.net',           port: 4242, note: 'Beleth RNS Hub' },
+  { host: 'rns.dismail.de',           port: 7822, note: 'dismail, DE' },
+  { host: 'vps001.vanheusden.com',    port: 4242, note: 'vanheusden, NL' },
   { host: 'phantom.mobilefabrik.com', port: 4242, note: 'mobilefabrik' },
+  { host: 'reticulum.hardenedbsd.org', port: 4242, note: 'HardenedBSD' },
   { host: 'istanbul.reserve.network', port: 9034, note: 'R-Net, Turkey' },
+  { host: 'sydney.reticulum.au',      port: 4242, note: 'Sydney, AU' },
+  { host: '103.195.4.226',            port: 4242, note: 'ZHULONG1, Hong Kong' },
 ];
 // Active list — replaced by the hubs.json fetch if it returns valid data.
 let rnsHubs = RNS_HUBS_FALLBACK.slice();
