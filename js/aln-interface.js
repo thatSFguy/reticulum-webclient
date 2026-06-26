@@ -3,24 +3,24 @@
 // Tunnels raw Reticulum packets across an agnostic-LoRa-Net ("ALN") mesh by
 // talking to an ALN node over Web Bluetooth. The node runs the mesh (routing,
 // per-hop ARQ, SAR fragmentation); we hand it opaque RNS packets and it carries
-// them to a destination node, exactly like the project's Python
-// AgnosticLoraInterface — NOT RNode emulation (which would bypass ALN routing).
+// them to the node serving each destination — NOT RNode emulation.
 //
-// Same shape as rnsd-interface.js so app.js drives it without branching:
-//   {connect, disconnect, sendPacket, _onPacket, _onLog, _onDisconnect,
-//    connected, capabilities, + RNode command stubs}.
+// This is a faithful port of the mobile app's AgnosticLoraBleTransport wiring
+// (identity-addressed mode): on connect we `register` our 16-byte RNS
+// destination hash with the mesh's distributed directory and `dirdump` to
+// enumerate peers; the AlnRouter then routes each outbound packet to the node
+// currently serving its destination, fans announces out to every known peer,
+// buffers until destinations resolve, and pins link/proof reverse-routes. The
+// optional fallback peer node id is just a static gateway pin.
 //
-// Wire contract (see ../platformIO/agnostic-lora-net/docs/tcp-bridge.md and
-// src/main.cpp tunnel_rx_frame/tunnel_emit). Each HDLC frame carries a typed,
-// length-prefixed address envelope, then the opaque RNS packet:
-//
-//   TX (host → node):  [0x01][16][dst-locator(16)][rns_packet]  → node routes to dst
-//   RX (node → host):  [0x01][16][src-locator(16)][rns_packet]  ← arrived from src
+// Same {connect/sendPacket/_onPacket/capabilities/…} shape as rnsd-interface.js
+// so app.js drives it without branching.
 //
 // Notes:
 //   * BLE auto-enters tunnel mode on connect — no "tunnel\n" (that's USB only).
-//   * The firmware requires addr_len == 16 (v2 self-certifying node ids); a
-//     4-byte v1 id is rejected. We always send a 16-byte locator.
+//   * The node multiplexes HDLC tunnel frames AND text console lines on one
+//     stream; NusDemux splits them. Frames carry the typed locator envelope
+//     [0x01][16][node][packet]; text lines drive the directory router.
 //   * No radio to configure and no RSSI in tunnel frames — capabilities report
 //     no RNode control, and we pass rssi=0/snr=0 into _onPacket like rnsd.
 //   * The BLE link is PIN-paired on ALN nodes; the OS handles the pairing
@@ -29,47 +29,37 @@
 'use strict';
 
 import { BleTransport } from './ble-transport.js';
-import { HdlcParser, encodeFrame } from './hdlc.js';
+import { encodeFrame } from './hdlc.js';
+import { NusDemux } from './nus-demux.js';
+import { AlnRouter } from './aln-router.js';
+import {
+  encodeLocatorFrame, decodeFrame, sourceFromFrame, locatorFromHex,
+} from './aln-tunnel.js';
 
-const ADDR_LOCATOR = 0x01;          // typed-envelope address type (the only live one)
-const NODE_ID_LEN  = 16;            // v2 self-certifying node id width (bytes)
-const BROADCAST    = new Uint8Array(NODE_ID_LEN).fill(0xFF);  // NODE_ID_BROADCAST → flood
-
-// Parse a peer node id from user config. Accepts 32 hex chars (16-byte v2 id),
-// with optional whitespace/0x. Blank / "broadcast" → flood to all mesh nodes.
-// Returns { locator: Uint8Array(16), broadcast: bool } or throws on bad input.
-function parsePeer(peerHex) {
-  const s = (peerHex || '').trim().replace(/^0x/i, '').replace(/\s+/g, '');
-  if (s === '' || /^broadcast$/i.test(s)) return { locator: BROADCAST, broadcast: true };
-  if (!/^[0-9a-fA-F]+$/.test(s) || s.length !== NODE_ID_LEN * 2) {
-    throw new Error(`ALN peer id must be ${NODE_ID_LEN * 2} hex chars (a v2 node id), or blank for broadcast`);
-  }
-  const locator = new Uint8Array(NODE_ID_LEN);
-  for (let i = 0; i < NODE_ID_LEN; i++) locator[i] = parseInt(s.substr(i * 2, 2), 16);
-  return { locator, broadcast: false };
-}
-
-function hex(bytes) {
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('').toUpperCase();
-}
+const POLL_TICK_MS       = 5_000;     // resolve retries while sends are buffered
+const DIRDUMP_INTERVAL_MS = 600_000;  // slow re-enumeration safety net
 
 export class AlnInterface {
-  // peerHex: optional 32-hex node id; blank/"broadcast" floods to the whole mesh.
-  constructor(peerHex) {
-    const { locator, broadcast } = parsePeer(peerHex);
-    this.peer = locator;
-    this.broadcast = broadcast;
-
+  // selfIdHex: our 16-byte LXMF destination hash (32 hex) — the directory id.
+  // fallbackPeerHex: optional static gateway node id (blank = directory only).
+  constructor(selfIdHex, fallbackPeerHex) {
     this.transport = new BleTransport();
+    this.router = new AlnRouter(selfIdHex, fallbackPeerHex);
     this._onPacket = null;
     this._onDisconnect = null;
     this._onLog = null;
 
-    // Each HDLC frame is one typed-envelope tunnel frame. The firmware
-    // deframes byte-by-byte across BLE notifications, so chunked writes are
-    // fine; the HdlcParser does the same on our side for inbound chunks.
-    this._parser = new HdlcParser((frame) => this._handleFrame(frame));
-    this.transport._onReceive = (bytes) => this._parser.feed(bytes);
+    this._pollTimer = null;
+    this._sinceDirdump = 0;
+    this._writeChain = Promise.resolve();   // serialize all writes (frames + text)
+    this._inboundQueue = [];                // ordered inbound items
+    this._draining = false;
+
+    this._demux = new NusDemux(
+      (frame) => this._onDemuxFrame(frame),
+      (line)  => this._enqueue({ kind: 'text', line }),
+    );
+    this.transport._onReceive = (bytes) => this._demux.feed(bytes);
   }
 
   get connected() { return this.transport.connected; }
@@ -85,22 +75,32 @@ export class AlnInterface {
   async connect() {
     this.transport._onLog = (msg) => this._log(msg);
     this.transport._onDisconnect = () => {
-      this._parser.reset();
+      this._stopPoll();
+      this._demux.reset();
       if (this._onDisconnect) this._onDisconnect();
     };
     await this.transport.connect();
-    this._log(this.broadcast
-      ? 'ALN tunnel ready — broadcasting to neighbor (1-hop) nodes; set a peer node id in Settings for multi-hop routed delivery'
-      : `ALN tunnel ready — directed to node ${hex(this.peer)} (multi-hop routed)`);
+    this._demux.reset();
+    this._inboundQueue = [];
+
+    // Directory bring-up: register once per BLE session (the serving node
+    // re-floods every ~240s), enumerate peers, then poll. Use the router's
+    // normalized (uppercase) id — directory lookups are case-sensitive, so
+    // registration and resolves must agree.
+    await this._writeText(`register ${this.router.selfIdHex}`);
+    await this._writeText('dirdump');
+    this._startPoll();
+    this._log(`ALN tunnel ready (id ${this.router.selfIdHex}${
+      this.router.fallbackUplinkHex ? `, fallback ${this.router.fallbackUplinkHex}` : ', directory addressing'})`);
   }
 
   async disconnect() {
+    this._stopPoll();
     await this.transport.disconnect();
   }
 
   // RNode command stubs so any un-gated app.js caller still works without
-  // branching. All benign; app.js gates the real RNode sequence on
-  // capabilities.rnodeControl === false (see rnsd-interface.js).
+  // branching (same as rnsd-interface.js).
   async detect()             { return true; }
   async getFirmwareVersion() { return { major: 0, minor: 0 }; }
   async getPlatform()        { return 0; }
@@ -115,32 +115,133 @@ export class AlnInterface {
   async configureAndStart()  { return true; }
   async blink()              { }
 
-  // Send a raw Reticulum packet. Wrap it in the typed-address envelope
-  // [0x01][16][dst-locator][packet], HDLC-frame it, and write it to the node.
-  // The node routes (and SAR-fragments if needed) to the locator. The broadcast
-  // locator is DELIVER-only at each receiver (the forwarder doesn't reflood it),
-  // so it reaches 1-hop neighbors; a real node id gets multi-hop routing.
+  // Send a raw Reticulum packet. The router decides which mesh node(s) it goes
+  // to; we write a typed-locator tunnel frame to each.
   async sendPacket(data) {
     if (!this.transport.connected) throw new Error('ALN not connected');
     const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-    const frame = new Uint8Array(2 + NODE_ID_LEN + bytes.length);
-    frame[0] = ADDR_LOCATOR;
-    frame[1] = NODE_ID_LEN;
-    frame.set(this.peer, 2);
-    frame.set(bytes, 2 + NODE_ID_LEN);
-    await this.transport.write(encodeFrame(frame));
+    const d = await this.router.routeOutbound(bytes, Date.now());
+    if (d.kind === 'send') {
+      for (const node of d.targets) await this._writeTunnelFrame(node, bytes);
+    } else if (d.kind === 'buffered') {
+      const wanted = this.router.resolveWanted();
+      this._log(`ALN: buffered ${bytes.length}B until destination resolves (${wanted.length} wanted)`);
+      for (const id of wanted.slice(0, 4)) await this._writeText(`resolve ${id}`);
+    } else {
+      this._log(`ALN: deferred ${bytes.length}B — ${d.reason}`);
+    }
   }
 
-  // One decoded HDLC frame from the node: [addr_type][addr_len][src][payload].
-  // Strip the envelope and hand the raw RNS packet up. RSSI/SNR aren't carried
-  // in tunnel frames, so pass zeros (existing log lines still render).
-  _handleFrame(buf) {
-    if (buf.length < 2) return;
-    const addrType = buf[0];
-    const addrLen  = buf[1];
-    if (addrType !== ADDR_LOCATOR || buf.length < 2 + addrLen) return;
-    const payload = buf.subarray(2 + addrLen);
-    if (payload.length === 0) return;
-    if (this._onPacket) this._onPacket(payload, 0, 0);
+  // ---- inbound -------------------------------------------------------
+
+  _onDemuxFrame(frame) {
+    const payload = decodeFrame(frame);
+    if (!payload) { this._log(`ALN rx: drop ${frame.length}B (not LOCATOR / truncated)`); return; }
+    const src = sourceFromFrame(frame);
+    if (!src) return;
+    // fw 0.4.5 loops self-addressed frames back to the sender. Seeing one means
+    // WE misaddressed a frame to our own node — drop before the engine (BR-5).
+    if (src === this.router.attachedNodeHex) {
+      this._log(`ALN rx: loopback ${payload.length}B from ${src} — we addressed our own node (BR-5); dropped`);
+      return;
+    }
+    this._enqueue({ kind: 'frame', src, payload });
+  }
+
+  _enqueue(item) {
+    this._inboundQueue.push(item);
+    if (!this._draining) this._drainInbound();
+  }
+
+  // Single ordered consumer: the router learns from a packet (link pins above
+  // all) BEFORE the engine can react to it, and one failing item never kills
+  // the pump (BR-10).
+  async _drainInbound() {
+    this._draining = true;
+    try {
+      while (this._inboundQueue.length > 0) {
+        const item = this._inboundQueue.shift();
+        try {
+          if (item.kind === 'frame') {
+            const ev = await this.router.onInbound(item.src, item.payload, Date.now());
+            if (this._onPacket) this._onPacket(item.payload, 0, 0);
+            if (ev) await this._handleDirectoryEvent(ev);
+          } else {
+            const ev = this.router.onTextLine(item.line, Date.now());
+            if (ev) await this._handleDirectoryEvent(ev);
+          }
+        } catch (e) {
+          this._log(`ALN: inbound item failed (pump continues): ${e.message}`);
+        }
+      }
+    } finally {
+      this._draining = false;
+    }
+  }
+
+  // React to directory changes: greet new peer nodes with our cached announce,
+  // and flush sends that just became routable.
+  async _handleDirectoryEvent(ev) {
+    if (ev.summary) this._log(`ALN: ${ev.summary}`);
+    for (const node of ev.newPeerNodes) {
+      const announce = this.router.cachedAnnounceFor(node);
+      if (!announce) continue;
+      this._log(`ALN: sending cached announce to new peer node ${node}`);
+      try { await this._writeTunnelFrame(node, announce); }
+      catch (e) { this._log(`ALN: announce to ${node} failed: ${e.message}`); }
+    }
+    if (ev.routesChanged) {
+      const flushed = await this.router.drainRoutable(Date.now());
+      for (const [raw, node] of flushed) {
+        this._log(`ALN: flushing buffered ${raw.length}B -> ${node}`);
+        try { await this._writeTunnelFrame(node, raw); }
+        catch (e) { this._log(`ALN: flush to ${node} failed: ${e.message}`); }
+      }
+    }
+  }
+
+  // ---- directory poll ------------------------------------------------
+
+  _startPoll() {
+    this._stopPoll();
+    this._sinceDirdump = 0;
+    this._pollTimer = setInterval(async () => {
+      try {
+        if (this.router.hasPending()) {
+          for (const id of this.router.resolveWanted().slice(0, 4)) await this._writeText(`resolve ${id}`);
+        }
+        this._sinceDirdump += POLL_TICK_MS;
+        if (this._sinceDirdump >= DIRDUMP_INTERVAL_MS) {
+          this._sinceDirdump = 0;
+          await this._writeText('dirdump');
+        }
+      } catch (e) { this._log(`ALN: directory poll error: ${e.message}`); }
+    }, POLL_TICK_MS);
+  }
+
+  _stopPoll() {
+    if (this._pollTimer) { clearInterval(this._pollTimer); this._pollTimer = null; }
+  }
+
+  // ---- writes (serialized) -------------------------------------------
+
+  _writeTunnelFrame(nodeHex, packet) {
+    const locator = locatorFromHex(nodeHex);
+    if (!locator) return Promise.reject(new Error(`unroutable node id '${nodeHex}'`));
+    return this._enqueueWrite(encodeFrame(encodeLocatorFrame(locator, packet)));
+  }
+
+  _writeText(line) {
+    const bytes = new Uint8Array((line + '\n').length);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = (line + '\n').charCodeAt(i) & 0xFF;
+    return this._enqueueWrite(bytes);
+  }
+
+  // Serialize every write (frames AND text commands) so a command never
+  // interleaves mid-frame on the BLE link. The transport chunks each write to
+  // its negotiated size and the node reassembles byte-by-byte.
+  _enqueueWrite(bytes) {
+    this._writeChain = this._writeChain.then(() => this.transport.write(bytes), () => this.transport.write(bytes));
+    return this._writeChain;
   }
 }

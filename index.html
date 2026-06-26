@@ -375,17 +375,18 @@
         <h3 class="settings-card-title">ALN mesh bearer</h3>
         <p class="settings-card-desc">
           For the "Connect via ALN mesh" option: tunnel Reticulum over an
-          agnostic-LoRa-Net node via Bluetooth. Leave the peer node id blank to
-          broadcast to neighbor (1-hop) nodes — simplest, good for a node right
-          next to you. Set the 32-hex id of the far node to deliver to it
-          directly (less airtime, multi-hop routed across the mesh). The node's
-          BLE link is PIN-paired — pair it once in your OS first.
+          agnostic-LoRa-Net node via Bluetooth. The client registers your
+          address with the mesh's directory and routes by destination
+          automatically — leave the peer node id blank for normal use. Set the
+          32-hex id of a node only to pin a static fallback gateway (e.g. an
+          RNS bridge). The node's BLE link is PIN-paired — pair it once in your
+          OS first.
         </p>
         <div class="row">
           <div class="field wide">
-            <label>Peer node id (hex, optional)</label>
+            <label>Fallback gateway node id (hex, optional)</label>
             <input id="cfg-aln-peer" type="text" inputmode="latin" autocomplete="off"
-                   spellcheck="false" placeholder="blank = broadcast to all nodes"
+                   spellcheck="false" placeholder="blank = directory addressing"
                    pattern="[0-9A-Fa-f]{32}">
           </div>
         </div>

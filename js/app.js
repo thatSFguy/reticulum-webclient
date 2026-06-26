@@ -3901,10 +3901,13 @@ async function connect(transportType) {
     //   'aln'            → agnostic-LoRa-Net tunnel over BLE (mesh carries RNS)
     if (transportType === 'aln') {
       // Tunnel raw RNS packets over an ALN mesh node via Web Bluetooth. The
-      // optional peer node id (Settings) directs delivery; blank = broadcast.
+      // router registers our LXMF destination hash with the mesh's distributed
+      // directory and routes each packet to the node serving its destination;
+      // the optional peer node id (Settings) is just a static fallback gateway.
+      if (!myDestHash) { log('err', 'ALN: identity not ready yet — try again in a moment'); return; }
       let peer = '';
       try { peer = (localStorage.getItem('rlw.alnPeer') || '').trim(); } catch (_) {}
-      rnode = new AlnInterface(peer);
+      rnode = new AlnInterface(toHex(myDestHash), peer);
     } else if (transportType === 'ws') {
       // The Go bridge takes the rnsd target per-connection via query params
       // (?host=X&port=Y) and REJECTS a WS with no target (HTTP 400). The
@@ -4495,7 +4498,7 @@ try {
     }
     el.value = v;
     try { localStorage.setItem('rlw.alnPeer', v); } catch (_) { /* private mode */ }
-    log('info', v ? `ALN peer set to ${v.toUpperCase()}` : 'ALN peer cleared — broadcasting to all mesh nodes');
+    log('info', v ? `ALN fallback gateway set to ${v.toUpperCase()}` : 'ALN fallback cleared — using directory addressing');
   });
 })();
 
