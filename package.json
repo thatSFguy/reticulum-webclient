@@ -1,6 +1,6 @@
 {
   "name": "reticulum-lora-webclient",
-  "version": "0.26.2",
+  "version": "0.26.3",
   "description": "Browser-based Reticulum messaging client for RNode LoRa modems.",
   "type": "module",
   "private": true,

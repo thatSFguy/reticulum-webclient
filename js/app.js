@@ -64,6 +64,28 @@ function debounce(fn, wait) {
   };
 }
 
+// Coalesced re-renders. Mesh announces arrive in bursts (a repeater
+// dual-announces its lxmf + telemetry destinations back-to-back), and
+// each one otherwise triggers a full list rebuild — renderNodesList
+// also reads every node from IndexedDB. Left un-batched, that churns
+// the main thread and blocks whatever interaction is in flight, which
+// is what drives INP on unrelated targets (a nav tap or a click into
+// the search box stalls behind an announce-driven render). Collapse a
+// burst into a single render on the next animation frame. Names/refs
+// are re-read from live state at render time, so nothing is lost.
+let _nodesRenderQueued = false;
+function scheduleRenderNodesList() {
+  if (_nodesRenderQueued) return;
+  _nodesRenderQueued = true;
+  requestAnimationFrame(() => { _nodesRenderQueued = false; renderNodesList(); });
+}
+let _contactRenderQueued = false;
+function scheduleRenderContactList() {
+  if (_contactRenderQueued) return;
+  _contactRenderQueued = true;
+  requestAnimationFrame(() => { _contactRenderQueued = false; renderContactList(); });
+}
+
 function hexToBytes(hex) {
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
@@ -490,12 +512,12 @@ async function handleAnnounce(pkt, rssi) {
   contacts.set(destHashHex, { ...contact, identity, destHash: destHashBytes, ratchetPub: ratchetPubBytes });
 
   await saveContact(contact);
-  renderContactList();
+  scheduleRenderContactList();
   // Repeaters typically dual-announce an lxmf.delivery presence
   // AND a telemetry destination from the same identity. Re-render
   // the Nodes list so any matching telemetry beacon inherits this
   // contact's display name immediately.
-  renderNodesList();
+  scheduleRenderNodesList();
 }
 
 // ---- Non-LXMF announce handling (Nodes panel) ------------------------
@@ -575,7 +597,7 @@ async function handleNonLxmfAnnounce(announce, pkt, rssi) {
   const serviceLabel = known ? ` (${known.name})` : '';
   const coordsLabel = node.lat != null ? ` (lat=${node.lat.toFixed(4)}, lon=${node.lon.toFixed(4)})` : '';
   log('info', `  Non-LXMF announce from ${idHash.substring(0, 12)}...${serviceLabel} → Nodes panel${coordsLabel}`);
-  renderNodesList();
+  scheduleRenderNodesList();
 }
 
 // Parse a `key=value;key=value;...` telemetry string into an object.
@@ -3046,8 +3068,8 @@ async function toggleFavorite(hash) {
   if (!c) return;
   c.favorite = !c.favorite;
   await saveContact(serializeContact(c));
-  renderContactList();
-  renderNodesList();
+  scheduleRenderContactList();
+  scheduleRenderNodesList();
 }
 
 // Open a conversation with a contact hash: switch to Messages and select it.
@@ -3155,15 +3177,15 @@ async function openDestDetail(entry) {
       entry.node.userLabel = label;
       await saveNode(entry.node);
     }
-    renderContactList();
-    renderNodesList();
+    scheduleRenderContactList();
+    scheduleRenderNodesList();
     openDestDetail(entry);  // refresh the sheet with the new name
   });
 
   $('dest-delete')?.addEventListener('click', async () => {
     hideDestModal();
     if (entry.kind === 'contact') removeContact(entry.hash);
-    else { await deleteNode(entry.node.hash); renderNodesList(); }
+    else { await deleteNode(entry.node.hash); scheduleRenderNodesList(); }
   });
 }
 
@@ -3216,8 +3238,8 @@ async function importContactCard(card) {
   };
   contacts.set(destHash, mem);
   await saveContact(serializeContact(mem));
-  renderContactList();
-  renderNodesList();
+  scheduleRenderContactList();
+  scheduleRenderNodesList();
   return { ok: true, msg: `Added contact "${mem.displayName}"` };
 }
 
@@ -3236,8 +3258,8 @@ async function addManualHash(str) {
   };
   contacts.set(cleaned, mem);
   await saveContact(serializeContact(mem));
-  renderContactList();
-  renderNodesList();
+  scheduleRenderContactList();
+  scheduleRenderNodesList();
   return { ok: true, msg: 'Added — messaging unlocks when their announce arrives' };
 }
 
