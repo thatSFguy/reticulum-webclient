@@ -2306,6 +2306,28 @@ async function sendMessage() {
     return;
   }
 
+  // Optimistic UI: persist + paint the outgoing bubble and clear the input
+  // BEFORE the path-request wait and the crypto (sign + ECDH + AES). That
+  // work is ~hundreds of ms and used to block the Send/Enter interaction
+  // until the bubble appeared; painting first makes it feel instant. The
+  // row is filled in with its packet/hash/id below and only then
+  // transmitted — the retry tick and proof matcher both no-op until
+  // rawPacket lands (doOutboundSend returns early without it).
+  const row = {
+    contactHash: activeContactHash,
+    direction: 'outgoing',
+    content,
+    title: '',
+    timestamp: Date.now(),
+    state: radioOn ? MSG_STATE_SENDING : MSG_STATE_PENDING,
+    attempts: 0,
+    nextRetryAt: 0,
+  };
+  const id = await saveMessage(row);
+  conversedHashes.add(activeContactHash);   // keep this thread in Messages
+  $('msg-content').value = '';
+  await renderMessages(activeContactHash);
+
   try {
     // Path-request preamble (SPEC §7.1, flows/send-opportunistic-lxmf.md
     // step 4). Upstream LXMF issues a path? request before sending if the
@@ -2395,18 +2417,11 @@ async function sendMessage() {
     // it (link/Resource has its own proof path). Requires an active link.
     if (packet.length > 500) {
       if (!radioOn) {
+        await updateMessage(id, { state: MSG_STATE_FAILED, lastError: `Too large for one packet (${packet.length}B) and the radio is off` });
+        if (activeContactHash === row.contactHash) await renderMessages(activeContactHash);
         log('err', `Message too large for one packet (${packet.length}B) and the radio is off — connect first, or shorten it.`);
         return;
       }
-      const row = {
-        contactHash: activeContactHash, direction: 'outgoing',
-        content, title: '', timestamp: Date.now(),
-        state: MSG_STATE_SENDING, attempts: 0, nextRetryAt: 0,
-      };
-      const id = await saveMessage(row);
-      conversedHashes.add(activeContactHash);
-      $('msg-content').value = '';
-      await renderMessages(activeContactHash);
       log('info', `Message too large for one packet (${packet.length}B) — sending over a Link…`);
       try {
         const delivered = await sendLxmfOverLink(contact, content, '', new Map(), id);
@@ -2425,27 +2440,15 @@ async function sendMessage() {
     // the key we look up on.
     const packetHashHex = toHex(await computeOutboundPacketHashTruncated(packet));
 
-    // Save a pending row before touching the radio so the message
-    // is durable even if the send call throws or the user
-    // reloads mid-transmission.
-    const row = {
-      contactHash: activeContactHash,
-      direction: 'outgoing',
-      content,
-      title: '',
-      timestamp: Date.now(),
-      state: radioOn ? MSG_STATE_SENDING : MSG_STATE_PENDING,
+    // Fill the already-painted optimistic row with its packet so it's
+    // durable (survives a reload mid-transmission) and the retry tick /
+    // proof matcher can act on it, then transmit. State stays SENDING /
+    // PENDING as set at optimistic-save time, so no re-render is needed.
+    await updateMessage(id, {
       packetHash: packetHashHex,
       rawPacket: Array.from(packet),
       messageId: toHex(outMessageId),  // canonical id, for matching inbound reactions
-      attempts: 0,
-      nextRetryAt: 0,
-    };
-    const id = await saveMessage(row);
-    conversedHashes.add(activeContactHash);  // keep this thread in Messages
-
-    $('msg-content').value = '';
-    await renderMessages(activeContactHash);
+    });
 
     if (radioOn) {
       await doOutboundSend(id);
@@ -2453,6 +2456,10 @@ async function sendMessage() {
       log('info', `Queued message to "${contact.displayName}" (radio off)`);
     }
   } catch (e) {
+    // Crypto/build/path failed after the bubble was painted — mark the
+    // row failed so it doesn't sit forever as "sending".
+    await updateMessage(id, { state: MSG_STATE_FAILED, lastError: e.message });
+    if (activeContactHash === row.contactHash) await renderMessages(activeContactHash);
     log('err', `Send failed: ${e.message}`);
   }
 }
