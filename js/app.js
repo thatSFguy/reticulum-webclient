@@ -3884,12 +3884,12 @@ function isValidHub(h) {
 
 const BRIDGE = {
   version: '0.6.0',
-  releaseUrl: 'https://github.com/thatSFguy/reticulum-lora-webclient/releases/tag/bridge-v0.6.0',
+  releaseUrl: 'https://github.com/thatSFguy/reticulum-webclient/releases/tag/bridge-v0.6.0',
   // Binaries are mirrored to the Pages site (deploy.yml) under /bridge/ at a
   // stable, version-independent path. Downloading from a fixed URL — instead
   // of GitHub's rotating release-asset SAS URLs — is what lets a SmartScreen
   // "report as safe" attach to a URL that actually recurs.
-  base: 'https://thatsfguy.github.io/reticulum-lora-webclient/bridge',
+  base: 'https://thatsfguy.github.io/reticulum-webclient/bridge',
   assets: {
     windows: 'ws_bridge-windows-amd64.exe',
     mac: 'ws_bridge-darwin-arm64',

@@ -6,7 +6,7 @@ references** (fetched June 2026 — see §16). Byte layouts that were guesses in
 the first draft have been replaced with confirmed values; the few items that
 remain genuinely unverifiable from docs are called out explicitly in §13.
 
-Target client: this repo (`reticulum-lora-webclient`), baseline `v0.24.2`.
+Target client: this repo (`reticulum-webclient`), baseline `v0.24.2`.
 
 ---
 

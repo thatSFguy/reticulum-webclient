@@ -4,7 +4,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## Scope Rule
 
-**Never create, modify, or delete files outside this project directory (`reticulum-lora-webclient/`).** Exception: may read files from the sibling `reticulum-rnode/` project for reference.
+**Never create, modify, or delete files outside this project directory (`reticulum-webclient/`).** Exception: may read files from the sibling `reticulum-rnode/` project for reference.
 
 ## Version Bump Rule
 
@@ -33,7 +33,7 @@ The webapp implements enough of the Reticulum protocol to interoperate with the 
 ### Module Layout
 
 ```
-reticulum-lora-webclient/
+reticulum-webclient/
   index.html              — Single-page app UI
   css/style.css           — Dark theme (matches rnode flasher aesthetic)
   js/

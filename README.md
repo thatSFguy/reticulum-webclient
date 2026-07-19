@@ -1,11 +1,11 @@
 > [!NOTE]
-> **🙋 Seeking a co-maintainer / partner.** I'm stepping back from active development of this repo and looking for someone to help maintain this project (or take it over). Bug reports with a clear repro are welcome; feature requests are PR-welcome but not promised. Interested in partnering? See **[#5](https://github.com/thatSFguy/reticulum-lora-webclient/issues/5)**.
+> **🙋 Seeking a co-maintainer / partner.** I'm stepping back from active development of this repo and looking for someone to help maintain this project (or take it over). Bug reports with a clear repro are welcome; feature requests are PR-welcome but not promised. Interested in partnering? See **[#5](https://github.com/thatSFguy/reticulum-webclient/issues/5)**.
 
-# reticulum-lora-webclient
+# reticulum-webclient
 
 A browser-based Reticulum messaging client. Connects either directly to an [RNode](https://unsigned.io/rnode) LoRa modem over Web Bluetooth or Web Serial, or to any running Reticulum daemon (`rnsd`) over a WebSocket bridge, and exchanges encrypted LXMF messages — including file and image attachments — with Sideband, NomadNet, MeshChat, and other Reticulum nodes anywhere on the network. It also browses NomadNet pages (micron markup, interactive forms, tables, file downloads).
 
-**Live app:** <https://thatsfguy.github.io/reticulum-lora-webclient/>
+**Live app:** <https://thatsfguy.github.io/reticulum-webclient/>
 
 No build step, no framework, no bundler. Plain ES modules, loaded directly in the browser. The LoRa path runs entirely in the browser with no server. The TCP-via-WebSocket path needs a small bridge process to sit between the browser and an existing `rnsd` — pick either the prebuilt Go binary (no runtime to install; shows a live connection-status screen) or the Python script (`tools/ws_bridge.py`).
 
@@ -128,11 +128,11 @@ Leave it running. You should see a line like `Listening for TCP connections on 0
 
 **2a. Prebuilt Go binary (recommended).** Easiest is the in-app **Connect via TCP → Download the bridge** button, which links to a fixed, version-independent URL on this site. You can also grab those directly:
 
-- `https://thatsfguy.github.io/reticulum-lora-webclient/bridge/ws_bridge-windows-amd64.exe` — Windows 10/11 64-bit
-- `https://thatsfguy.github.io/reticulum-lora-webclient/bridge/ws_bridge-linux-amd64` — Linux 64-bit
-- `https://thatsfguy.github.io/reticulum-lora-webclient/bridge/ws_bridge-darwin-arm64` — macOS Apple Silicon
+- `https://thatsfguy.github.io/reticulum-webclient/bridge/ws_bridge-windows-amd64.exe` — Windows 10/11 64-bit
+- `https://thatsfguy.github.io/reticulum-webclient/bridge/ws_bridge-linux-amd64` — Linux 64-bit
+- `https://thatsfguy.github.io/reticulum-webclient/bridge/ws_bridge-darwin-arm64` — macOS Apple Silicon
 
-These are mirrored on every deploy from the [bridge releases page](https://github.com/thatSFguy/reticulum-lora-webclient/releases?q=bridge-v) (which also has the per-version filenames and `SHA256SUMS.txt`). The stable Pages URLs exist specifically so the download link doesn't change across versions — GitHub's own release-asset URLs rotate a signed token on every request, which breaks Windows SmartScreen "report as safe" (it can't attach to a URL that never recurs). If you report the Windows binary to <https://www.microsoft.com/wdsi/filesubmission>, use the fixed `…/bridge/ws_bridge-windows-amd64.exe` URL above, not the `release-assets.githubusercontent.com/…?sig=…` URL the browser redirects to. (The durable fix for the unsigned-binary warning is code signing; the stable URL just makes the report and per-URL reputation actually stick.)
+These are mirrored on every deploy from the [bridge releases page](https://github.com/thatSFguy/reticulum-webclient/releases?q=bridge-v) (which also has the per-version filenames and `SHA256SUMS.txt`). The stable Pages URLs exist specifically so the download link doesn't change across versions — GitHub's own release-asset URLs rotate a signed token on every request, which breaks Windows SmartScreen "report as safe" (it can't attach to a URL that never recurs). If you report the Windows binary to <https://www.microsoft.com/wdsi/filesubmission>, use the fixed `…/bridge/ws_bridge-windows-amd64.exe` URL above, not the `release-assets.githubusercontent.com/…?sig=…` URL the browser redirects to. (The durable fix for the unsigned-binary warning is code signing; the stable URL just makes the report and per-URL reputation actually stick.)
 
 Then verify the download against the published `SHA256SUMS.txt`:
 
@@ -181,7 +181,7 @@ Both fields persist across reloads (localStorage). The log panel will print `Web
 
 ### Mixed-content caveat
 
-If you load the web client from `https://thatsfguy.github.io/reticulum-lora-webclient/` and try to connect to `ws://localhost:7878`, the browser will refuse. Modern browsers block plain `ws://` connections from HTTPS pages as a mixed-content policy. Three ways around it:
+If you load the web client from `https://thatsfguy.github.io/reticulum-webclient/` and try to connect to `ws://localhost:7878`, the browser will refuse. Modern browsers block plain `ws://` connections from HTTPS pages as a mixed-content policy. Three ways around it:
 
 1. **Load the web client locally, not from GitHub Pages.** `python -m http.server 8000` from the repo root and open `http://localhost:8000/`. Now `ws://localhost:7878` is same-origin in terms of scheme compatibility and the browser allows it. This is the fastest way to try the TCP path.
 
@@ -222,7 +222,7 @@ The BLE / Serial path needs an RNode and gives you direct-to-LoRa messaging with
 ## Module layout
 
 ```
-reticulum-lora-webclient/
+reticulum-webclient/
   index.html              Single-page app shell
   css/style.css           Dark theme
 

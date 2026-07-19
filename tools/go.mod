@@ -1,4 +1,4 @@
-module github.com/thatSFguy/reticulum-lora-webclient/tools
+module github.com/thatSFguy/reticulum-webclient/tools
 
 go 1.21
 
