@@ -709,7 +709,10 @@ function nodeDisplayLabel(n) {
 // DOM rows (each with an Intl date format) on every announce/keystroke
 // is what drove Nodes-view INP to ~2s. We render the most-recent CAP
 // matches and note the remainder — the search box reaches the rest.
-const NODE_RENDER_CAP = 200;
+// 100 is well beyond what fits a sidebar viewport, and keeps the
+// worst-case repaint (a keystroke that still matches everything) small
+// enough to stay under the INP "good" threshold.
+const NODE_RENDER_CAP = 100;
 
 // Cached, enriched, pre-sorted entry list from the last data refresh.
 // The search box re-paints from this without touching IndexedDB.
