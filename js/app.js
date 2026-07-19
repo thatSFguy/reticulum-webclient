@@ -875,6 +875,20 @@ let nodeMarkers = new Map();     // hash_hex → L.Marker
 // that so the list still works and the map stays as the placeholder.
 async function ensureLeaflet() {
   if (leafletLib) return leafletLib;
+  // Leaflet's stylesheet is only needed once the map is actually shown.
+  // Loading it here (instead of a render-blocking <link> in <head>) keeps
+  // it off the initial critical path — it was delaying first paint / LCP
+  // for a view most sessions never open. Inject once, before map layout.
+  if (!document.getElementById('leaflet-css')) {
+    await new Promise((resolve) => {
+      const link = document.createElement('link');
+      link.id = 'leaflet-css';
+      link.rel = 'stylesheet';
+      link.href = 'lib/leaflet.css';
+      link.onload = link.onerror = resolve;   // proceed either way
+      document.head.appendChild(link);
+    });
+  }
   const mod = await import('../lib/leaflet.js');
   leafletLib = mod.default || mod;
   return leafletLib;

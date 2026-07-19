@@ -17,9 +17,15 @@
   } catch (e) {}
 </script>
 <link rel="stylesheet" href="css/style.css">
-<!-- Leaflet CSS for the Nodes view map. Self-hosted alongside the
-     JS bundle in lib/ so no CDN request is made. -->
-<link rel="stylesheet" href="lib/leaflet.css">
+<!-- Leaflet CSS is injected lazily by ensureLeaflet() when the Nodes-view
+     map is first opened, so it never blocks the initial paint. -->
+<!-- Parallelize the ES-module graph: without these the browser can't
+     discover noble-curves/msgpack until it has fetched and parsed app.js
+     (a fetch waterfall that delayed first contentful paint). -->
+<link rel="modulepreload" href="js/app.js">
+<link rel="modulepreload" href="js/store.js">
+<link rel="modulepreload" href="lib/noble-curves-ed25519.js">
+<link rel="modulepreload" href="lib/msgpack.js">
 </head>
 <body>
 
