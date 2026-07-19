@@ -73,8 +73,16 @@ function debounce(fn, wait) {
 // the search box stalls behind an announce-driven render). Collapse a
 // burst into a single render on the next animation frame. Names/refs
 // are re-read from live state at render time, so nothing is lost.
+let _activeView = null;        // set by switchView; gates background node renders
+let _nodesDirty = false;       // announce arrived while Nodes view was hidden
 let _nodesRenderQueued = false;
 function scheduleRenderNodesList() {
+  // The Nodes list (and its map) is only visible on the Nodes view.
+  // While the user is elsewhere (composing a message, browsing NomadNet),
+  // rebuilding it on every announce is pure background churn that steals
+  // main-thread time from whatever they're doing. Defer it: mark dirty
+  // and let switchView('nodes') refresh on entry.
+  if (_activeView !== 'nodes') { _nodesDirty = true; return; }
   if (_nodesRenderQueued) return;
   _nodesRenderQueued = true;
   requestAnimationFrame(() => { _nodesRenderQueued = false; renderNodesList(); });
@@ -696,15 +704,33 @@ function nodeDisplayLabel(n) {
   return n.displayName || '(unknown)';
 }
 
-async function renderNodesList() {
-  const list = $('nodes-list');
-  if (!list) return;
+// Cap on rows painted into the Nodes list at once. A busy mesh
+// accumulates hundreds of announcing destinations; building that many
+// DOM rows (each with an Intl date format) on every announce/keystroke
+// is what drove Nodes-view INP to ~2s. We render the most-recent CAP
+// matches and note the remainder — the search box reaches the rest.
+const NODE_RENDER_CAP = 200;
 
+// Cached, enriched, pre-sorted entry list from the last data refresh.
+// The search box re-paints from this without touching IndexedDB.
+let _nodeEntries = null;              // null = load failed / not yet loaded
+let _nodeEntriesError = '';
+// hash → ref for the currently painted rows (click delegation lookup).
+let _nodeRefByHash = new Map();
+let _nodesListDelegated = false;
+
+// Data refresh: read every node from IndexedDB, enrich, refresh the map,
+// and rebuild the cached entry list. Expensive (IDB + Leaflet markers),
+// so this runs only on real data changes (announces, add/remove/rename),
+// never on a keystroke. Does NOT touch the list DOM — call paintNodesList
+// for that.
+async function refreshNodesData() {
   let nodes;
   try {
     nodes = await getAllNodes();
   } catch (e) {
-    list.innerHTML = `<div class="err">Could not load nodes: ${escapeHtml(e.message)}</div>`;
+    _nodeEntries = null;
+    _nodeEntriesError = e.message;
     return;
   }
   nodes.forEach(enrichNode);
@@ -735,29 +761,20 @@ async function renderNodesList() {
     }
   }
   entries.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+  // Precompute a lowercased search haystack once per entry so filtering
+  // on each keystroke is a plain string scan (no textContent / toLowerCase).
+  for (const e of entries) e.hay = `${e.name} ${e.hash} ${e.service}`.toLowerCase();
+  _nodeEntries = entries;
+  _nodeEntriesError = '';
+}
 
-  if (entries.length === 0) {
-    const labels = {
-      messagable: 'No messagable peers seen yet.',
-      contacts: 'No Contacts yet — tap a peer and choose Add Contact.',
-      nodes: 'No non-LXMF nodes seen yet.',
-      all: 'Nothing seen on the mesh yet. Announces will appear here.',
-    };
-    list.innerHTML = `<div class="nodes-empty">${labels[nodeFilter] || labels.all}</div>`;
-    return;
-  }
-
-  list.innerHTML = '';
-  for (const e of entries) {
-    const row = document.createElement('div');
-    row.className = 'node-row';
-    row.dataset.hash = e.hash;
-    const ts = e.lastSeen ? new Date(e.lastSeen).toLocaleString() : '(unknown)';
-    const rssi = (typeof e.rssi === 'number') ? `${e.rssi} dBm` : 'n/a';
-    const geo = e.located ? ' <span class="node-geo-dot" title="Has coordinates">●</span>' : '';
-    const fav = e.favorite ? ' <span class="contact-star" title="Contact">★</span>' : '';
-    row.innerHTML =
-      `<div class="node-row-top">
+function nodeRowHtml(e) {
+  const ts = e.lastSeen ? new Date(e.lastSeen).toLocaleString() : '(unknown)';
+  const rssi = (typeof e.rssi === 'number') ? `${e.rssi} dBm` : 'n/a';
+  const geo = e.located ? ' <span class="node-geo-dot" title="Has coordinates">●</span>' : '';
+  const fav = e.favorite ? ' <span class="contact-star" title="Contact">★</span>' : '';
+  return `<div class="node-row" data-hash="${e.hash}">
+       <div class="node-row-top">
          <div class="node-row-id">
            <span class="node-avatar" style="background:${avatarColor(e.hash)}">${escapeHtml(initialsFor(e.name))}</span>
            <span class="node-name">${escapeHtml(e.name)}${fav}${geo}</span>
@@ -769,11 +786,68 @@ async function renderNodesList() {
          <span><code>${shortFingerprint(e.hash)}</code></span>
          <span>RSSI ${rssi}</span>
          <span>${ts}</span>
-       </div>`;
-    row.addEventListener('click', () => openDestDetail(e.ref));
-    list.appendChild(row);
+       </div>
+     </div>`;
+}
+
+// Paint the cached entries into the DOM: filter by the search term, cap
+// the row count, and write in a single innerHTML assignment. Cheap enough
+// to run on every (debounced) keystroke — no IDB, no map, no per-row
+// listeners (one delegated click handler on the container).
+function paintNodesList() {
+  const list = $('nodes-list');
+  if (!list) return;
+
+  if (_nodeEntries === null) {
+    list.innerHTML = `<div class="err">Could not load nodes: ${escapeHtml(_nodeEntriesError)}</div>`;
+    return;
   }
-  applyListFilter('nodes-list', '.node-row', 'nodes-search');
+
+  if (!_nodesListDelegated) {
+    list.addEventListener('click', (ev) => {
+      const row = ev.target.closest('.node-row');
+      if (!row) return;
+      const ref = _nodeRefByHash.get(row.dataset.hash);
+      if (ref) openDestDetail(ref);
+    });
+    _nodesListDelegated = true;
+  }
+
+  const term = ($('nodes-search')?.value || '').trim().toLowerCase();
+  const matches = term ? _nodeEntries.filter((e) => e.hay.includes(term)) : _nodeEntries;
+
+  if (matches.length === 0) {
+    const labels = {
+      messagable: 'No messagable peers seen yet.',
+      contacts: 'No Contacts yet — tap a peer and choose Add Contact.',
+      nodes: 'No non-LXMF nodes seen yet.',
+      all: 'Nothing seen on the mesh yet. Announces will appear here.',
+    };
+    const msg = term ? `No nodes match "${escapeHtml(term)}"` : (labels[nodeFilter] || labels.all);
+    list.innerHTML = `<div class="nodes-empty">${msg}</div>`;
+    _nodeRefByHash = new Map();
+    return;
+  }
+
+  const shown = matches.length > NODE_RENDER_CAP ? matches.slice(0, NODE_RENDER_CAP) : matches;
+  const refs = new Map();
+  let html = '';
+  for (const e of shown) {
+    refs.set(e.hash, e.ref);
+    html += nodeRowHtml(e);
+  }
+  if (matches.length > shown.length) {
+    html += `<div class="nodes-more">Showing ${shown.length} of ${matches.length} — search to narrow the list.</div>`;
+  }
+  list.innerHTML = html;
+  _nodeRefByHash = refs;
+}
+
+// Full refresh + paint. Existing callers (announces, add/remove/rename,
+// filter chips) keep calling this and get up-to-date data.
+async function renderNodesList() {
+  await refreshNodesData();
+  paintNodesList();
 }
 
 // Client-side filter for a sidebar list: hide rows whose text / hash /
@@ -3649,6 +3723,7 @@ function updateAvatars() {
 // ---- View switching --------------------------------------------------
 
 function switchView(name) {
+  _activeView = name;
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
   const target = document.querySelector(`.view-${name}`);
   if (target) target.classList.add('active');
@@ -3661,6 +3736,10 @@ function switchView(name) {
   // the CSS flex layout has handed it (important after a resize or
   // an orientation change).
   if (name === 'nodes') {
+    // Catch up on any announces that arrived while this view was hidden
+    // (scheduleRenderNodesList deferred them). Paints the cached list
+    // instantly if data is already loaded.
+    if (_nodesDirty || _nodeEntries === null) { _nodesDirty = false; renderNodesList(); }
     initNodesMap().then((map) => {
       if (map) setTimeout(() => map.invalidateSize(), 50);
     }).catch(() => { /* handled inside initNodesMap */ });
@@ -4257,7 +4336,7 @@ $('btn-clear-nodes').addEventListener('click', async () => {
 });
 
 // Sidebar list filters (Nodes view + NomadNet browser).
-$('nodes-search')?.addEventListener('input', debounce(() => applyListFilter('nodes-list', '.node-row', 'nodes-search'), 120));
+$('nodes-search')?.addEventListener('input', debounce(paintNodesList, 120));
 $('nn-search')?.addEventListener('input', debounce(() => applyListFilter('nn-nodes', '.nn-side-row', 'nn-search'), 120));
 
 // Nodes-view filter chips (All / Peers / Contacts / Nodes).

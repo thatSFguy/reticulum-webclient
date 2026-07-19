@@ -1042,6 +1042,14 @@ a { color: var(--accent); }
   line-height: 1.6;
 }
 
+/* Footer note when the Nodes list is capped (see NODE_RENDER_CAP). */
+.nodes-more {
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: center;
+  padding: 12px 20px;
+}
+
 /* Leaflet popup theming — match the app's card look in both modes. */
 .leaflet-popup-content-wrapper {
   background: var(--surface-2) !important;
