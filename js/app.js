@@ -50,6 +50,20 @@ import { openDatabase, saveIdentity, loadIdentity, saveContact, getContact, getA
 
 const $ = id => document.getElementById(id);
 
+// Debounce: coalesce rapid calls into one, `wait` ms after the last.
+// Used to keep per-keystroke search/filter handlers off the critical
+// interaction→paint path — each keystroke just (re)arms the timer and
+// returns immediately, so the browser paints without waiting for the
+// (potentially heavy) list rebuild. Cuts keyboard INP on the search
+// boxes. The heavy work runs once, in a later timer task.
+function debounce(fn, wait) {
+  let t = null;
+  return function (...args) {
+    if (t) clearTimeout(t);
+    t = setTimeout(() => { t = null; fn.apply(this, args); }, wait);
+  };
+}
+
 function hexToBytes(hex) {
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
@@ -4094,9 +4108,10 @@ document.querySelectorAll('.js-announce-btn').forEach(b => {
 // last filter choice survives reloads.
 const _contactSearchEl = $('contact-search');
 if (_contactSearchEl) {
+  const renderContactListDebounced = debounce(renderContactList, 120);
   _contactSearchEl.addEventListener('input', (e) => {
     contactSearchTerm = e.target.value || '';
-    renderContactList();
+    renderContactListDebounced();
   });
 }
 const _contactFilterPinnedEl = $('contact-filter-pinned');
@@ -4220,8 +4235,8 @@ $('btn-clear-nodes').addEventListener('click', async () => {
 });
 
 // Sidebar list filters (Nodes view + NomadNet browser).
-$('nodes-search')?.addEventListener('input', () => applyListFilter('nodes-list', '.node-row', 'nodes-search'));
-$('nn-search')?.addEventListener('input', () => applyListFilter('nn-nodes', '.nn-side-row', 'nn-search'));
+$('nodes-search')?.addEventListener('input', debounce(() => applyListFilter('nodes-list', '.node-row', 'nodes-search'), 120));
+$('nn-search')?.addEventListener('input', debounce(() => applyListFilter('nn-nodes', '.nn-side-row', 'nn-search'), 120));
 
 // Nodes-view filter chips (All / Peers / Contacts / Nodes).
 document.querySelectorAll('[data-nodefilter]').forEach((b) => b.addEventListener('click', () => {
