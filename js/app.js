@@ -163,6 +163,7 @@ let activeContactHash = null;
 const conversedHashes = new Set();
 let nodeFilter = 'all';  // Nodes-view filter: all | messagable | contacts | nodes
 let stagedAttachment = null;  // { fields, descriptor } pending until Send (allows a caption)
+let replyingToMsg = null;  // stored message row the composer is replying to (SPEC §5.9.9)
 let radioOn = false;
 let links = new Map();     // hex link_id → Link instance (responder / incoming)
 let initiatorLinks = new Map();  // hex link_id → { link, contact, resolve, reject, timer }
@@ -1408,6 +1409,14 @@ async function dispatchIncomingMessage(msg, rxInfo) {
   const via = rxInfo.hops === 0 ? 'direct' : `${rxInfo.hops} hop${rxInfo.hops > 1 ? 's' : ''}`;
   log('ok', `  Message from "${senderName}" (${via}, RSSI=${rxInfo.rssi}, SNR=${rxInfo.snr}): ${msg.content}`);
 
+  // Reply threading (FIELD_REPLY_TO 0x30 + optional quote 0x31, SPEC
+  // §5.9.9). Unlike a reaction, a reply is a normal message — it renders
+  // as its own bubble with a quote preview of its target on top.
+  const reply = parseReplyTo(msg.fields);
+  if (reply) {
+    log('info', `  Reply to message ${reply.replyToHex.substring(0, 16)}...${reply.quote ? ' (with quote fallback)' : ''}`);
+  }
+
   const senderTs = normalizeLxmfTimestamp(msg.timestamp);
   const savedMsg = {
     contactHash: contactHash || sourceHashHex,
@@ -1415,6 +1424,15 @@ async function dispatchIncomingMessage(msg, rxInfo) {
     content: msg.content,
     title: msg.title,
     messageId: msg.messageId ? toHex(msg.messageId) : undefined,  // for matching inbound reactions
+    replyToMessageId: reply ? reply.replyToHex : undefined,
+    replyQuote: reply && reply.quote ? reply.quote : undefined,
+    // Which destination delivered this message — the group-chat routing
+    // key (SPEC §5.9.8/§5.9.9 relay rule). Uniform rule from the mobile
+    // app: the LINKIDENTIFY peer when one is known (we don't implement
+    // §6.7.6 yet), else the LXMF source — which equals the conversation
+    // peer for direct 1:1 chats AND for re-originating relays (fwdsvc
+    // re-signs the fanout as itself), so today this is the source.
+    arrivedViaDest: sourceHashHex,
     timestamp: senderTs != null ? senderTs : Date.now(),
     senderTimeMissing: senderTs == null,
     rssi: rxInfo.rssi,
@@ -2271,25 +2289,40 @@ async function sendMessage() {
   const contact = contacts.get(activeContactHash);
   if (!contact) { log('err', 'Contact not found'); return; }
 
+  // Reply state (SPEC §5.9.9) — captured up front so clearing the banner
+  // can't race the async send. Only honored for this conversation (it is
+  // cleared on contact switch; this is belt and braces). The wire form is
+  // fields[0x30] = raw 32-byte target message_id; the optional 0x31 quote
+  // is deliberately omitted (LoRa airtime — §5.9.9 SHOULD-omit; receivers
+  // resolve the quote locally by hash), matching the mobile app.
+  const replyTarget = (replyingToMsg && replyingToMsg.contactHash === activeContactHash
+    && replyingToMsg.messageId) ? replyingToMsg : null;
+  // Group-chat relay rule (§5.9.9): a reply to a relayed message egresses
+  // via the relay's destination so it fans out to the whole group.
+  const sendContact = replyTarget ? effectiveRecipientFor(replyTarget, contact) : contact;
+
   // Attachment (with optional caption) — delivered over a Link as a Resource.
   if (stagedAttachment) {
     const warn = (m) => { try { alert(m); } catch (_) { /* no-op */ } log('err', m); };
-    if (!contact.identity) { warn('Recipient public key unknown — wait for their announce.'); return; }
+    if (!sendContact.identity) { warn('Recipient public key unknown — wait for their announce.'); return; }
     if (!radioOn) { warn('Connect to a transport first to send attachments.'); return; }
     const { fields, descriptor } = stagedAttachment;
+    if (replyTarget) fields.set(0x30, hexToBytes(replyTarget.messageId));  // FIELD_REPLY_TO
     const row = {
       contactHash: activeContactHash, direction: 'outgoing',
       content, title: '', timestamp: Date.now(),
+      replyToMessageId: replyTarget ? replyTarget.messageId : undefined,
       state: MSG_STATE_SENDING, attachment: descriptor, attempts: 0, nextRetryAt: 0,
     };
     const id = await saveMessage(row);
     conversedHashes.add(activeContactHash);
     clearStagedAttachment();
+    clearReplyState();
     $('msg-content').value = '';
     await renderMessages(activeContactHash);
-    log('info', `Sending ${descriptor.kind} "${descriptor.name}"${content ? ' + caption' : ''} to "${contact.displayName}"…`);
+    log('info', `Sending ${descriptor.kind} "${descriptor.name}"${content ? ' + caption' : ''} to "${sendContact.displayName}"…`);
     try {
-      const delivered = await sendLxmfOverLink(contact, content, '', fields, id);
+      const delivered = await sendLxmfOverLink(sendContact, content, '', fields, id);
       await updateMessage(id, { state: delivered ? MSG_STATE_DELIVERED : MSG_STATE_SENT });
     } catch (e) {
       await updateMessage(id, { state: MSG_STATE_FAILED, lastError: e.message });
@@ -2301,7 +2334,7 @@ async function sendMessage() {
 
   // Plain text (opportunistic single packet).
   if (!content) return;
-  if (!contact.identity) {
+  if (!sendContact.identity) {
     log('err', 'Cannot reply yet — peer has not announced; their public key is unknown. Wait for their next announce, then try again.');
     return;
   }
@@ -2319,12 +2352,14 @@ async function sendMessage() {
     content,
     title: '',
     timestamp: Date.now(),
+    replyToMessageId: replyTarget ? replyTarget.messageId : undefined,
     state: radioOn ? MSG_STATE_SENDING : MSG_STATE_PENDING,
     attempts: 0,
     nextRetryAt: 0,
   };
   const id = await saveMessage(row);
   conversedHashes.add(activeContactHash);   // keep this thread in Messages
+  clearReplyState();
   $('msg-content').value = '';
   await renderMessages(activeContactHash);
 
@@ -2335,9 +2370,9 @@ async function sendMessage() {
     // destinations missing from our pathTable: without it, michmesh has
     // no cached path so our DATA gets dropped — and we can't tell from
     // the WS path whether a peer is reachable until we try.
-    if (radioOn && !pathTable.has(toHex(contact.destHash))) {
-      log('info', `  No path known to ${toHex(contact.destHash).substring(0,16)}... — issuing path? preamble`);
-      const got = await requestPath(contact.destHash);
+    if (radioOn && !pathTable.has(toHex(sendContact.destHash))) {
+      log('info', `  No path known to ${toHex(sendContact.destHash).substring(0,16)}... — issuing path? preamble`);
+      const got = await requestPath(sendContact.destHash);
       if (got) {
         log('ok', `  Path response received in ${PATH_REQUEST_WAIT_MS}ms window`);
       } else {
@@ -2345,20 +2380,26 @@ async function sendMessage() {
       }
     }
 
+    // Reply threading on the wire: fields[0x30] = raw 32-byte target
+    // message_id (SPEC §5.9.9). A Map so lxmf.js encodes the int key.
+    const outFields = replyTarget
+      ? new Map([[0x30, hexToBytes(replyTarget.messageId)]])
+      : new Map();
+
     // Pack LXMF message. LXMF's source_hash field is the sender's
     // LXMF delivery *destination* hash, not the identity hash —
     // receivers key their contact table on destination hashes.
     const { payload: lxmfPayload, messageId: outMessageId } = await packMessage(
-      myIdentity, contact.destHash, myDestHash,
-      '', content, {}
+      myIdentity, sendContact.destHash, myDestHash,
+      '', content, outFields
     );
 
     // Encrypt for recipient. Prefer their current ratchet pubkey
     // (learned from a ratchet-bearing announce) so the recipient's
     // forward-secrecy story benefits from our side too. Fall back
     // to the identity X25519 key if no ratchet is known.
-    const recipientPub = contact.ratchetPub || contact.identity.encPubKey;
-    const encrypted = await encrypt(lxmfPayload, recipientPub, contact.identity.hash);
+    const recipientPub = sendContact.ratchetPub || sendContact.identity.encPubKey;
+    const encrypted = await encrypt(lxmfPayload, recipientPub, sendContact.identity.hash);
 
     // SPEC §2.3 originator HEADER_1 → HEADER_2 conversion. The spec
     // says an originator MAY stay HEADER_1 only when the destination
@@ -2382,7 +2423,7 @@ async function sendMessage() {
     // For BLE/serial via RNode, upstreamTransportId stays null, so we
     // fall through to HEADER_1 — correct for a 1-hop LoRa mesh where
     // we ARE the originator on a single-hop link.
-    const pathInfo = pathTable.get(toHex(contact.destHash));
+    const pathInfo = pathTable.get(toHex(sendContact.destHash));
     let packet;
     if (pathInfo && pathInfo.hops >= 1 && upstreamTransportId) {
       packet = buildPacket({
@@ -2390,7 +2431,7 @@ async function sendMessage() {
         transportType: TRANSPORT_TRANSPORT,
         destType: DEST_SINGLE,
         packetType: PACKET_DATA,
-        destHash: contact.destHash,
+        destHash: sendContact.destHash,
         transportId: upstreamTransportId,
         context: 0x00,
         payload: encrypted,
@@ -2401,7 +2442,7 @@ async function sendMessage() {
         headerType: HEADER_1,
         destType: DEST_SINGLE,
         packetType: PACKET_DATA,
-        destHash: contact.destHash,
+        destHash: sendContact.destHash,
         context: 0x00,
         payload: encrypted,
       });
@@ -2424,7 +2465,7 @@ async function sendMessage() {
       }
       log('info', `Message too large for one packet (${packet.length}B) — sending over a Link…`);
       try {
-        const delivered = await sendLxmfOverLink(contact, content, '', new Map(), id);
+        const delivered = await sendLxmfOverLink(sendContact, content, '', outFields, id);
         await updateMessage(id, { state: delivered ? MSG_STATE_DELIVERED : MSG_STATE_SENT });
       } catch (e) {
         await updateMessage(id, { state: MSG_STATE_FAILED, lastError: e.message });
@@ -2453,7 +2494,7 @@ async function sendMessage() {
     if (radioOn) {
       await doOutboundSend(id);
     } else {
-      log('info', `Queued message to "${contact.displayName}" (radio off)`);
+      log('info', `Queued message to "${sendContact.displayName}" (radio off)`);
     }
   } catch (e) {
     // Crypto/build/path failed after the bubble was painted — mark the
@@ -2486,27 +2527,58 @@ function getField(fields, key) {
 function parseReaction(fields) {
   const reactionMap = getField(fields, 0x40);
   if (reactionMap == null || typeof reactionMap !== 'object') return null;
-  const reactionToHex = reactionHashHex(getField(reactionMap, 0x00));  // REACTION_TO
-  const emoji         = reactionString(getField(reactionMap, 0x01));   // REACTION_CONTENT
+  const reactionToHex = fieldHashHex(getField(reactionMap, 0x00));  // REACTION_TO
+  const emoji         = fieldText(getField(reactionMap, 0x01));     // REACTION_CONTENT
   if (!reactionToHex || !emoji) return null;
   return { reactionToHex, emoji };
 }
 
+// Parse FIELD_REPLY_TO (0x30) + optional FIELD_REPLY_QUOTE (0x31), SPEC
+// §5.9.9. Unlike a reaction, a reply is a NORMAL message (its content is
+// the reply text) that additionally references its target by canonical
+// message_id. Returns {replyToHex, quote} or null when not a reply.
+function parseReplyTo(fields) {
+  const replyToHex = fieldHashHex(getField(fields, 0x30));
+  if (!replyToHex) return null;
+  return { replyToHex, quote: fieldText(getField(fields, 0x31)) };
+}
+
 // A raw 32-byte message_id as hex; also tolerate an already-hex string in
-// case an encoder shipped it hex-encoded (SPEC §5.9.8 bytes/str tolerance).
-function reactionHashHex(v) {
+// case an encoder shipped it hex-encoded (SPEC §5.9.8/§5.9.9 bytes/str
+// tolerance).
+function fieldHashHex(v) {
   if (v instanceof Uint8Array) return v.length ? toHex(v) : null;
   if (typeof v === 'string' && v.length) return v.toLowerCase();
   return null;
 }
 
-// Reaction content as a string — msgpack may surface it as str or bin.
-function reactionString(v) {
+// Field content as a string — msgpack may surface it as str or bin.
+function fieldText(v) {
   if (typeof v === 'string') return v || null;
   if (v instanceof Uint8Array) {
     try { return new TextDecoder().decode(v) || null; } catch (_) { return null; }
   }
   return null;
+}
+
+// Group-chat relay routing (SPEC §5.9.8/§5.9.9): a reaction or reply whose
+// target message arrived via a relay MUST egress to the relay's destination
+// — so it fans out to the whole group — not direct to the original sender.
+// Inbound rows are tagged `arrivedViaDest` at receive time; when it names a
+// different, known-and-keyed destination, route there instead. For direct
+// 1:1 chats and re-originating relays (fwdsvc) arrivedViaDest equals the
+// conversation peer, making this a no-op; it goes live for passthrough
+// relays. Mirrors the mobile app's uniform routing rule (v1.1.39).
+function effectiveRecipientFor(targetMsg, contact) {
+  const relayHex = targetMsg?.arrivedViaDest;
+  if (!relayHex || relayHex === toHex(contact.destHash)) return contact;
+  const relay = contacts.get(relayHex);
+  if (relay && relay.identity) {
+    log('info', `  Target arrived via relay ${relayHex.substring(0, 16)}... — routing through the relay (original peer ${toHex(contact.destHash).substring(0, 16)}...)`);
+    return relay;
+  }
+  log('info', `  Target tagged arrivedViaDest=${relayHex.substring(0, 16)}... but that destination is unknown or keyless — falling back to direct send`);
+  return contact;
 }
 
 // Send a tap-back reaction (SPEC §5.9.8) to the conversation peer and apply
@@ -2521,8 +2593,11 @@ async function sendReaction(targetMsg, emoji) {
     log('err', 'Cannot react — message has no id (it predates reaction support).');
     return;
   }
-  const contact = contacts.get(targetMsg.contactHash);
+  let contact = contacts.get(targetMsg.contactHash);
   if (!contact) { log('err', 'Reaction: conversation not found'); return; }
+  // Group-chat relay rule (§5.9.8): egress via the delivering relay when
+  // the target arrived through one, so the reaction reaches the group.
+  contact = effectiveRecipientFor(targetMsg, contact);
   if (!contact.identity) {
     log('err', 'Cannot react yet — peer has not announced; their public key is unknown.');
     return;
@@ -3464,6 +3539,7 @@ async function removeContact(hash) {
 async function selectContact(hash) {
   activeContactHash = hash;
   clearStagedAttachment();  // don't carry a staged file into a different conversation
+  clearReplyState();        // …nor a pending reply target (§5.9.9)
   const c = contacts.get(hash);
   if (c) c.unreadCount = 0;
   $('conv-title').textContent = c ? c.displayName : hash.substring(0, 16);
@@ -3489,6 +3565,11 @@ async function renderMessages(contactHash) {
   // resolve to Jan 1, 1970.
   const ordered = msgs.slice().sort((a, b) => (a.id || 0) - (b.id || 0));
 
+  // Conversation-local lookup for reply-quote previews (SPEC §5.9.9) —
+  // same scope as the mobile app's byMessageId map.
+  const byMessageId = new Map();
+  for (const m of ordered) if (m.messageId) byMessageId.set(m.messageId, m);
+
   list.innerHTML = '';
   for (const msg of ordered) {
     // Reaction shadow rows are delivery bookkeeping only (SPEC §5.9.8 —
@@ -3500,9 +3581,10 @@ async function renderMessages(contactHash) {
     const time = ts != null ? formatMessageTime(ts) : '(no time)';
     const stateIcon = renderOutgoingStateIcon(msg);
     const rxMeta = renderIncomingRxMeta(msg);
+    const quote = renderReplyPreview(msg, byMessageId);
     const body = msg.content ? `<div class="message-text">${escapeHtml(msg.content)}</div>` : '';
     const reactions = renderReactions(msg.reactions);
-    div.innerHTML = `${renderAttachment(msg.attachment)}${body}${reactions}<div class="meta">${time}${stateIcon}${rxMeta}</div>`;
+    div.innerHTML = `${quote}${renderAttachment(msg.attachment)}${body}${reactions}<div class="meta">${time}${stateIcon}${rxMeta}</div>`;
     // Tap-back affordance — only on incoming messages that carry a
     // canonical id to target (mirrors the mobile app: no self-reactions,
     // and rows received before reaction support have no messageId).
@@ -3518,9 +3600,70 @@ async function renderMessages(contactHash) {
       });
       div.appendChild(rb);
     }
+    // Reply affordance (SPEC §5.9.9) — any bubble with a canonical id can
+    // be replied to, both directions, like the mobile app's swipe gesture
+    // (rows saved before message_id support can't be targeted).
+    if (msg.messageId) {
+      const pb = document.createElement('button');
+      pb.type = 'button';
+      pb.className = 'reply-btn';
+      pb.title = 'Reply';
+      pb.textContent = '↩';
+      pb.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        setReplyingTo(msg);
+      });
+      div.appendChild(pb);
+    }
     list.appendChild(div);
   }
   list.scrollTop = list.scrollHeight;
+}
+
+// Reply-quote preview at the top of a reply bubble (SPEC §5.9.9). Resolve
+// the target locally by message_id; fall back to the wire quote
+// (FIELD_REPLY_QUOTE) when the target row isn't stored, then to a generic
+// placeholder — the bubble must still read as a reply (mobile app pattern).
+function renderReplyPreview(msg, byMessageId) {
+  if (!msg.replyToMessageId) return '';
+  const target = byMessageId.get(msg.replyToMessageId);
+  let label = '';
+  let text;
+  if (target) {
+    label = target.direction === 'outgoing'
+      ? 'You'
+      : (contacts.get(target.contactHash)?.displayName || target.contactHash.substring(0, 8));
+    text = target.content
+      || (target.attachment ? `📎 ${target.attachment.name || 'attachment'}` : '(empty message)');
+  } else if (msg.replyQuote) {
+    text = msg.replyQuote;
+  } else {
+    text = 'Replying to a message…';
+  }
+  if (text.length > 90) text = text.slice(0, 90) + '…';
+  const head = label ? `<span class="reply-quote-name">${escapeHtml(label)}</span>` : '';
+  return `<div class="reply-quote">${head}<span class="reply-quote-text">${escapeHtml(text)}</span></div>`;
+}
+
+// Enter "replying to" mode: remember the target and show the composer
+// banner. The next Send packages FIELD_REPLY_TO (0x30) — see sendMessage.
+function setReplyingTo(msg) {
+  if (!msg.messageId) return;
+  replyingToMsg = msg;
+  const who = msg.direction === 'outgoing'
+    ? 'You'
+    : (contacts.get(msg.contactHash)?.displayName || msg.contactHash.substring(0, 8));
+  let preview = msg.content || (msg.attachment ? `📎 ${msg.attachment.name || 'attachment'}` : '');
+  if (preview.length > 80) preview = preview.slice(0, 80) + '…';
+  const banner = $('reply-banner');
+  banner.querySelector('.reply-banner-text').textContent = `Replying to ${who}: ${preview}`;
+  banner.classList.remove('hidden');
+  $('msg-content')?.focus();
+}
+
+function clearReplyState() {
+  replyingToMsg = null;
+  $('reply-banner')?.classList.add('hidden');
 }
 
 // Floating tap-back emoji picker. Anchored to the clicked react button and
@@ -4339,6 +4482,7 @@ $('btn-send').addEventListener('click', sendMessage);
 $('msg-content').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
+$('reply-cancel')?.addEventListener('click', clearReplyState);
 // Attachments: file/image picker → send over a Link as a Resource.
 $('btn-attach')?.addEventListener('click', () => $('attach-input')?.click());
 $('attach-input')?.addEventListener('change', (e) => {

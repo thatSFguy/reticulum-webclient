@@ -1,11 +1,11 @@
 {
   "name": "reticulum-webclient",
-  "version": "0.26.8",
+  "version": "0.27.0",
   "description": "Browser-based Reticulum messaging client for RNode LoRa modems.",
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "node tests/aln.mjs && node tests/roundtrip.mjs && python tests/run_tests.py"
+    "test": "node tests/aln.mjs && node tests/reply.mjs && node tests/roundtrip.mjs && python tests/run_tests.py"
   },
   "devDependencies": {
     "@msgpack/msgpack": "3.0.0-beta2",

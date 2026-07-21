@@ -802,9 +802,10 @@ a { color: var(--accent); }
   color: rgba(255, 255, 255, 0.95);
 }
 
-/* Tap-back "react" affordance — sits just outside the bubble's right edge.
-   Hover-revealed on pointer devices; always faintly visible on touch. */
-.react-btn {
+/* Tap-back "react" and "reply" affordances — sit just outside the bubble's
+   edge. Hover-revealed on pointer devices; always faintly visible on touch. */
+.react-btn,
+.reply-btn {
   position: absolute;
   top: 50%;
   right: -30px;
@@ -825,11 +826,71 @@ a { color: var(--accent); }
   opacity: 0;
   transition: opacity 0.12s ease, background 0.12s ease;
 }
-.message:hover .react-btn { opacity: 1; }
-.react-btn:hover { background: var(--surface-hover); color: var(--text); }
+.message:hover .react-btn,
+.message:hover .reply-btn { opacity: 1; }
+.react-btn:hover,
+.reply-btn:hover { background: var(--surface-hover); color: var(--text); }
 @media (hover: none) {
-  .react-btn { opacity: 0.55; }
+  .react-btn, .reply-btn { opacity: 0.55; }
 }
+/* Incoming bubbles show both buttons off the right edge (react then reply);
+   outgoing bubbles are right-aligned, so reply hangs off the LEFT edge. */
+.message.incoming .reply-btn { right: -58px; }
+.message.outgoing .reply-btn { right: auto; left: -30px; }
+
+/* Reply-quote preview at the top of a reply bubble (SPEC §5.9.9). */
+.reply-quote {
+  display: block;
+  padding: 3px 8px;
+  margin-bottom: 5px;
+  border-left: 2px solid var(--accent);
+  border-radius: 4px;
+  background: rgba(127, 127, 127, 0.12);
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-muted);
+  overflow: hidden;
+}
+.reply-quote-name {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+}
+.message.outgoing .reply-quote {
+  border-left-color: rgba(255, 255, 255, 0.6);
+  background: rgba(0, 0, 0, 0.18);
+  color: rgba(255, 255, 255, 0.8);
+}
+.message.outgoing .reply-quote-name { color: rgba(255, 255, 255, 0.95); }
+
+/* "Replying to …" banner between the message list and the composer. */
+.reply-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 18px;
+  border-top: 0.5px solid var(--border);
+  background: var(--surface-2);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.reply-banner-text {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.reply-cancel {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+.reply-cancel:hover { color: var(--text); }
 
 /* Floating emoji picker (one row, iMessage-style). */
 .reaction-picker {
