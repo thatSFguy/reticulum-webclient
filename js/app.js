@@ -43,9 +43,43 @@ const MSG_MAX_ATTEMPTS = 3;
 const MSG_BACKOFF_MS = [5000, 15000, 60000];
 const MSG_RETRY_TICK_MS = 5000;
 
-// Tap-back reaction palette — same six emoji, in the same order, as
+// Tap-back reaction quick palette — same six emoji, in the same order, as
 // reticulum-mobile-app's REACTION_PALETTE for cross-client consistency.
+// This seeds the picker's top row until the user builds up their own
+// recently-used set (which then takes precedence, most-recent first).
 const REACTION_PALETTE = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
+
+// Extended reaction grid — the web stand-in for the mobile app's "＋"
+// overflow into the full system emoji picker (no such thing in a browser).
+// REACTION_CONTENT (SPEC §5.9.8) is arbitrary UTF-8, so nothing downstream
+// cares which emoji is picked; this is purely a UI breadth choice.
+const REACTION_PALETTE_FULL = [
+  '👍', '👎', '❤️', '😂', '🤣', '😊', '😍', '😮',
+  '😢', '😭', '😅', '😉', '🤔', '😡', '😴', '🤷',
+  '🙏', '👏', '🤝', '💪', '🫡', '👀', '💯', '✅',
+  '❌', '⭐', '🔥', '🎉', '🚀', '⚡', '🍻', '☠️',
+];
+
+// Recently used reactions, most-recent first (drives the picker's top
+// row). Persisted in localStorage; a corrupt or missing value degrades to
+// the default palette.
+const RECENT_REACTIONS_KEY = 'rlw.recentReactions';
+const RECENT_REACTIONS_MAX = 6;
+function recentReactions() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(RECENT_REACTIONS_KEY) || '[]');
+    return Array.isArray(arr)
+      ? arr.filter((e) => typeof e === 'string' && e.length).slice(0, RECENT_REACTIONS_MAX)
+      : [];
+  } catch (_) { return []; }
+}
+function recordRecentReaction(emoji) {
+  try {
+    const arr = [emoji, ...recentReactions().filter((e) => e !== emoji)]
+      .slice(0, RECENT_REACTIONS_MAX);
+    localStorage.setItem(RECENT_REACTIONS_KEY, JSON.stringify(arr));
+  } catch (_) { /* private mode etc. — recents just don't persist */ }
+}
 import { openDatabase, saveIdentity, loadIdentity, saveContact, getContact, getAllContacts, deleteContact, deleteMessagesForContact, saveMessage, getMessages, getAllMessages, getMessageById, updateMessage, saveNode, getNode, getAllNodes, deleteNode, deleteAllNodes, saveBookmark, getAllBookmarks, deleteBookmark, addHistory, deleteDatabase } from './store.js';
 
 const $ = id => document.getElementById(id);
@@ -3679,7 +3713,8 @@ function openReactionPicker(anchorEl, targetMsg) {
   const picker = document.createElement('div');
   picker.id = 'reaction-picker';
   picker.className = 'reaction-picker';
-  for (const emoji of REACTION_PALETTE) {
+
+  const pick = (emoji) => {
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'reaction-pick';
@@ -3687,10 +3722,28 @@ function openReactionPicker(anchorEl, targetMsg) {
     b.addEventListener('click', async (ev) => {
       ev.stopPropagation();
       closeReactionPicker();
+      recordRecentReaction(emoji);
       await sendReaction(targetMsg, emoji);
     });
-    picker.appendChild(b);
+    return b;
+  };
+
+  // Top row: recently used first, then the default palette to fill out
+  // six slots (deduped) — a new user sees exactly the classic quick row.
+  const quick = [...new Set([...recentReactions(), ...REACTION_PALETTE])].slice(0, 6);
+  const quickRow = document.createElement('div');
+  quickRow.className = 'reaction-quick-row';
+  for (const emoji of quick) quickRow.appendChild(pick(emoji));
+  picker.appendChild(quickRow);
+
+  // Below: the extended grid, minus whatever the quick row already shows.
+  const grid = document.createElement('div');
+  grid.className = 'reaction-grid';
+  for (const emoji of REACTION_PALETTE_FULL) {
+    if (quick.includes(emoji)) continue;
+    grid.appendChild(pick(emoji));
   }
+  picker.appendChild(grid);
   document.body.appendChild(picker);
 
   // Position above the anchor (flip below if there's no room), clamped to

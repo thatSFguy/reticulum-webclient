@@ -892,17 +892,33 @@ a { color: var(--accent); }
 }
 .reply-cancel:hover { color: var(--text); }
 
-/* Floating emoji picker (one row, iMessage-style). */
+/* Floating emoji picker: a quick row (recently used first) on top of an
+   extended grid — the web stand-in for the mobile app's "＋" overflow
+   into the full system picker. */
 .reaction-picker {
   position: fixed;
   z-index: 2000;
   display: flex;
-  gap: 2px;
+  flex-direction: column;
   padding: 4px 6px;
   background: var(--surface-2);
   border: 0.5px solid var(--border-strong);
-  border-radius: 20px;
+  border-radius: 14px;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+}
+.reaction-quick-row {
+  display: flex;
+  gap: 2px;
+  padding-bottom: 4px;
+  margin-bottom: 4px;
+  border-bottom: 0.5px solid var(--border);
+}
+.reaction-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 2px;
+  max-height: 176px;
+  overflow-y: auto;
 }
 .reaction-pick {
   border: none;
