@@ -80,7 +80,7 @@ function recordRecentReaction(emoji) {
     localStorage.setItem(RECENT_REACTIONS_KEY, JSON.stringify(arr));
   } catch (_) { /* private mode etc. — recents just don't persist */ }
 }
-import { openDatabase, saveIdentity, loadIdentity, saveContact, getContact, getAllContacts, deleteContact, deleteMessagesForContact, saveMessage, getMessages, getAllMessages, getMessageById, updateMessage, saveNode, getNode, getAllNodes, deleteNode, deleteAllNodes, saveBookmark, getAllBookmarks, deleteBookmark, addHistory, deleteDatabase } from './store.js';
+import { openDatabase, saveIdentity, loadIdentity, saveContact, getContact, getAllContacts, deleteContact, deleteMessagesForContact, saveMessage, getMessages, getAllMessages, getMessageById, updateMessage, saveNode, getNode, getAllNodes, deleteNode, deleteNodes, deleteAllNodes, saveBookmark, getAllBookmarks, deleteBookmark, addHistory, deleteDatabase } from './store.js';
 
 const $ = id => document.getElementById(id);
 
@@ -392,6 +392,9 @@ async function initIdentity() {
   try {
     for (const m of await getAllMessages()) if (m.contactHash) conversedHashes.add(m.contactHash);
   } catch (_) { /* non-fatal */ }
+  // Node-store retention pass — after conversedHashes is seeded (the
+  // protection set derives from it) and before the first Nodes render.
+  await pruneNodeStore();
   renderContactList();
   renderNodesList();
 }
@@ -637,9 +640,61 @@ async function handleNonLxmfAnnounce(announce, pkt, rssi) {
   node.userLabel = existingNode?.userLabel || null;
   await saveNode(node);
 
+  // Retention trigger: startup pruning alone can't bound a long-running
+  // session on a busy mesh, so re-check every 250 genuinely NEW rows
+  // (upserts of known nodes don't count). Fire-and-forget — never block
+  // the announce path on an IDB sweep.
+  if (!existingNode && ++newNodesSincePrune >= 250) {
+    newNodesSincePrune = 0;
+    pruneNodeStore().catch(() => { /* logged inside */ });
+  }
+
   const serviceLabel = known ? ` (${known.name})` : '';
   const coordsLabel = node.lat != null ? ` (lat=${node.lat.toFixed(4)}, lon=${node.lon.toFixed(4)})` : '';
   log('info', `  Non-LXMF announce from ${idHash.substring(0, 12)}...${serviceLabel} → Nodes panel${coordsLabel}`);
+  scheduleRenderNodesList();
+}
+
+// ---- Node-store retention --------------------------------------------
+// The nodes store is otherwise unbounded (one row per unique announced
+// destination, upserted forever), and several code paths full-scan it, so
+// on a busy mesh it becomes a slow-creep storage and performance cost.
+// Policy: cap at NODE_STORE_CAP rows, pruning oldest lastSeen first.
+// Never pruned: nodes tied to a conversation — rows whose destination or
+// identity hash matches a contact we've exchanged messages with (either
+// direction), so a peer's telemetry/nomadnet destinations survive as long
+// as the conversation does. Pruned nodes reappear on their next announce.
+const NODE_STORE_CAP = 5000;
+let newNodesSincePrune = 0;
+
+async function pruneNodeStore() {
+  let all;
+  try { all = await getAllNodes(); } catch (_) { return; }
+  if (all.length <= NODE_STORE_CAP) return;
+
+  // Protection set: dest hashes of conversed contacts plus their identity
+  // hashes (a node row carries the same identityHash when it's another
+  // destination announced by the same peer identity).
+  const protectedHashes = new Set();
+  for (const h of conversedHashes) {
+    protectedHashes.add(h);
+    const idHash = contacts.get(h)?.identityHash;
+    if (idHash) protectedHashes.add(idHash);
+  }
+
+  const candidates = all
+    .filter((n) => !protectedHashes.has(n.hash) && !protectedHashes.has(n.identityHash))
+    .sort((a, b) => (a.lastSeen || 0) - (b.lastSeen || 0));
+  const victims = candidates.slice(0, all.length - NODE_STORE_CAP);
+  if (victims.length === 0) return;
+
+  try {
+    await deleteNodes(victims.map((n) => n.hash));
+  } catch (e) {
+    log('err', `Node retention prune failed: ${e.message}`);
+    return;
+  }
+  log('info', `Node retention: pruned ${victims.length} oldest node${victims.length === 1 ? '' : 's'} (store held ${all.length}, cap ${NODE_STORE_CAP}, ${all.length - candidates.length} conversation-linked rows protected)`);
   scheduleRenderNodesList();
 }
 

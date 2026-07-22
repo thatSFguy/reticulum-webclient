@@ -218,6 +218,19 @@ export async function saveNode(node) {
   });
 }
 
+// Delete a batch of nodes by hash hex in a single transaction (used by
+// the retention policy — one tx for the whole prune, not one per row).
+export async function deleteNodes(hashes) {
+  const d = await openDatabase();
+  const tx = d.transaction('nodes', 'readwrite');
+  const store = tx.objectStore('nodes');
+  for (const h of hashes) store.delete(h);
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 export async function getNode(hash) {
   const d = await openDatabase();
   const tx = d.transaction('nodes', 'readonly');
