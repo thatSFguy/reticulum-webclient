@@ -18,6 +18,11 @@ import { ed25519 } from '@noble/curves/ed25519';
 import { CTX_REQUEST, CTX_RESPONSE, NN_DEFAULT_PATH, buildRequest, parseResponse, responseToText, stripPageHeaders, parseLinkTarget } from './nomadnet.js';
 import { ResourceReceiver, ResourceSender, parseAdvertisement, CTX_RESOURCE, CTX_RESOURCE_ADV, CTX_RESOURCE_REQ, CTX_RESOURCE_HMU, CTX_RESOURCE_PRF, CTX_RESOURCE_ICL, CTX_RESOURCE_RCL } from './resource.js';
 import { renderMicron } from './micron.js';
+import { qrcode } from '../lib/qrcode.js';
+
+// The library's default stringToBytes truncates char codes to one byte;
+// swap in real UTF-8 so non-ASCII display names survive the QR round-trip.
+qrcode.stringToBytes = (s) => Array.from(new TextEncoder().encode(s));
 
 // Reticulum packet context values relevant to link traffic
 const CTX_NONE          = 0x00;
@@ -3594,7 +3599,43 @@ function openAddModal() {
   if ($('add-input')) $('add-input').value = '';
   setAddStatus('');
   if ($('my-card')) $('my-card').textContent = myContactCardString();
+  renderMyCardQr();
   m.classList.remove('hidden');
+}
+
+// Render our contact card as a QR onto the share modal's canvas. Encodes
+// the exact JSON string shown in #my-card (byte mode, UTF-8) — the same
+// payload the mobile app puts in its QR, so either app's scanner imports
+// it. ECC level L matches the mobile app: scans happen at close range
+// from another screen, so capacity beats redundancy.
+function renderMyCardQr() {
+  const canvas = $('my-card-qr');
+  if (!canvas) return;
+  const text = myContactCardString();
+  if (!text) { canvas.classList.add('hidden'); return; }
+  try {
+    const qr = qrcode(0, 'L');  // typeNumber 0 = auto-size to fit
+    qr.addData(text);
+    qr.make();
+    const n = qr.getModuleCount();
+    const scale = 4, quiet = 4;  // 4-module quiet zone per the QR spec
+    const size = (n + quiet * 2) * scale;
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, size, size);
+    ctx.fillStyle = '#000000';
+    for (let r = 0; r < n; r++) {
+      for (let c = 0; c < n; c++) {
+        if (qr.isDark(r, c)) ctx.fillRect((c + quiet) * scale, (r + quiet) * scale, scale, scale);
+      }
+    }
+    canvas.classList.remove('hidden');
+  } catch (e) {
+    canvas.classList.add('hidden');
+    log('err', `QR render failed: ${e.message}`);
+  }
 }
 
 function hideAddModal() { stopQrScan(); $('add-modal')?.classList.add('hidden'); }

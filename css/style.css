@@ -2044,6 +2044,14 @@ textarea:focus {
   padding: 8px 10px; border-radius: 6px; margin: 4px 0 8px;
   max-height: 90px; overflow-y: auto;
 }
+/* Our contact-card QR. The canvas draws its own white background + quiet
+   zone (scanners need the contrast regardless of app theme); pixelated
+   keeps modules crisp when the canvas is CSS-scaled. */
+.add-qr {
+  display: block; width: 220px; max-width: 60%; height: auto;
+  margin: 8px auto; border-radius: 8px;
+  image-rendering: pixelated;
+}
 .modal-hint.ok { color: var(--accent-text); }
 .modal-hint.err { color: var(--err); }
 
