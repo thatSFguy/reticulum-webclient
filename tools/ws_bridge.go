@@ -56,7 +56,7 @@ import (
 )
 
 const (
-	version     = "0.6.0"
+	version     = "0.6.1"
 	urlWebapp   = "https://thatsfguy.github.io/reticulum-webclient/"
 	urlSource   = "https://github.com/thatSFguy/reticulum-webclient/blob/master/tools/ws_bridge.go"
 	urlReleases = "https://github.com/thatSFguy/reticulum-webclient/releases?q=bridge-v"
