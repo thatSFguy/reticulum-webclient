@@ -91,6 +91,16 @@ async function main() {
     throw new Error("self-parse: ratchet round-trip mismatch");
   }
 
+  // SPEC §2.4 hop-count bound: hops 0..127 parse, hops >= 128 are
+  // dropped as malformed (mirrors RNS >= 1.3.8 Packet.unpack).
+  const hopProbe = Uint8Array.from(announcePacket);
+  hopProbe[1] = 127;
+  if (!parsePacket(hopProbe)) throw new Error("hop bound: parsePacket rejected valid hops=127");
+  hopProbe[1] = 128;
+  if (parsePacket(hopProbe)) throw new Error("hop bound: parsePacket accepted malformed hops=128");
+  hopProbe[1] = 255;
+  if (parsePacket(hopProbe)) throw new Error("hop bound: parsePacket accepted malformed hops=255");
+
   // ---- Scenario B: Alice sends an opportunistic LXMF message to Bob --------
   const content = "hello from tests/roundtrip.mjs";
   const { payload: lxmfPayload } = await packMessage(

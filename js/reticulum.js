@@ -30,6 +30,7 @@ export const SIGLENGTH            = 64;  // Ed25519 signature
 export const MTU                  = 500;
 export const HEADER_MINSIZE       = 19;  // flags(1) + hops(1) + dest(16) + context(1)
 export const TOKEN_OVERHEAD       = 48;  // 16 IV + 32 HMAC
+export const MAX_HOPS             = 127; // SPEC §2.4: hops >= 128 (PATHFINDER_M) is malformed
 
 // Parse a Reticulum packet header
 export function parsePacket(data) {
@@ -37,6 +38,11 @@ export function parsePacket(data) {
 
   const flags   = data[0];
   const hops    = data[1];
+
+  // SPEC §2.4: valid wire hops are 0..127 — upstream (RNS >= 1.3.8)
+  // rejects hops >= PATHFINDER_M (128) at unpack, and receivers SHOULD
+  // enforce the same bound.
+  if (hops > MAX_HOPS) return null;
 
   const ifacFlag      = (flags >> 7) & 0x01;
   const headerType    = (flags >> 6) & 0x01;

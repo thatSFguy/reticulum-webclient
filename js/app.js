@@ -282,11 +282,12 @@ let contactSearchTerm = '';
 // directly connected to over the WS bridge. Required by SPEC §2.3:
 // when we send to a destination > 1 hop away, the originator MUST
 // emit HEADER_2 with the next-hop transport_id, otherwise the relay
-// silently drops the packet. Learned from announces that arrive with
-// `pkt.hops == 0` over the WS interface — only the rnsd we are
-// directly connected to originates announces visible to us with
-// hops=0 (other peers' announces get incremented to >=1 by the time
-// they reach us via michmesh).
+// silently drops the packet. Learned from the transport_id field of
+// inbound HEADER_2 packets (see trackPath). Note hop counts are NOT a
+// reliable adjacency signal: SPEC §2.4 local_hops_delta lets an
+// originator emit hops 2-7 instead of 0, so "hops==0 iff direct" only
+// holds in one direction (a 0 still implies direct; direct doesn't
+// imply 0).
 //
 // pendingPathRequests: destHashHex → resolver. The path-request
 // preamble (SPEC §7.1, flows/send-opportunistic-lxmf.md step 4)
@@ -505,10 +506,8 @@ async function handleAnnounce(pkt, rssi) {
 
   // Validated — track in the routing path table. SPEC §2.3 / §12.2:
   // sendMessage uses pathTable to choose HEADER_1 vs HEADER_2 framing;
-  // upstreamTransportId is learned from hops=0 announces over the WS
-  // interface (only the rnsd we're directly connected to originates
-  // announces visible to us with hops=0 — every transit hop bumps
-  // hops by 1).
+  // upstreamTransportId is learned from the transport_id of inbound
+  // HEADER_2 packets (see trackPath).
   trackPath(announce, pkt);
 
   // Store contact. Preserve user-controlled fields (pinned) from any
@@ -590,10 +589,8 @@ async function handleNonLxmfAnnounce(announce, pkt, rssi) {
     return;
   }
 
-  // Track in pathTable. Non-LXMF announces are how we typically learn
-  // the upstream rnsd's identity: rnsd announces a few SINGLE service
-  // destinations (rnstransport.broadcasts etc.) that arrive at us
-  // with hops=0 — only the directly-connected rnsd produces those.
+  // Track in pathTable, which also feeds upstream-identity learning
+  // from the HEADER_2 transport_id channel (see trackPath).
   trackPath(announce, pkt);
 
   const destHashBytes = announce.destHash || pkt.destHash;
@@ -1180,18 +1177,21 @@ async function handleData(pkt, rxInfo) {
 }
 
 // Update pathTable from a received announce, and learn upstream
-// transport_id from hops=0 announces over the WS interface.
+// transport_id from inbound HEADER_2 packets.
 //
 // SPEC §2.3: when sending to a destination > 1 hop away, the
 // originator MUST emit HEADER_2 with the next-hop transport_id.
 // pathTable lets us know hops; upstreamTransportId lets us know
 // which identity to insert.
 //
-// SPEC §2.4: hops is incremented by every transit relay. Only the
-// originator emits hops=0 — so an announce arriving at us with
-// pkt.hops==0 over the WS interface MUST have come from the rnsd
-// we're directly connected to (every other peer's announce gets
-// bumped to >=1 by the time it reaches us through that rnsd).
+// SPEC §2.4: hop counts are informational only. Transit relays
+// increment hops, but the local_hops_delta privacy option (RNS >=
+// 1.3.7) makes originators emit a random 2-7 instead of 0 and rewrite
+// their announces to HEADER_2 — so receivers MUST NOT infer
+// originator-adjacency or exact path length from the hops byte. Our
+// routing rule only branches on hops >= 1, which stays correct under
+// inflation (a delta-enabled direct peer routes via upstream, which
+// still delivers).
 function trackPath(announce, pkt) {
   const destHashHex = toHex(announce.destHash || pkt.destHash);
   pathTable.set(destHashHex, { hops: pkt.hops, lastSeen: Date.now() });
@@ -1289,6 +1289,28 @@ async function requestPath(destHash) {
     }, PATH_REQUEST_WAIT_MS);
     pendingPathRequests.set(destHashHex, { resolve, timer });
   });
+}
+
+// Try to learn a key-less contact's public key on demand. A path? request
+// makes transport nodes replay the peer's cached announce, and
+// handleAnnounce upgrades the placeholder row with the key — the same
+// trick Sideband uses for contacts added by bare hash. Returns the
+// upgraded in-memory contact, or null if nothing on the network had the
+// announce cached (then only the peer's own next announce can unlock it).
+async function recoverContactKey(contact) {
+  if (!radioOn) return null;
+  log('info', `  Public key unknown for ${contact.hash.substring(0, 16)}... — requesting their cached announce (path?)`);
+  const got = await requestPath(contact.destHash);
+  // The path-request promise resolves in trackPath, a few awaits before
+  // handleAnnounce finishes storing the upgraded contact — poll briefly
+  // instead of racing it. On timeout, still check once for a late announce.
+  const deadline = Date.now() + (got ? 2000 : 250);
+  for (;;) {
+    const c = contacts.get(contact.hash);
+    if (c?.identity) return c;
+    if (Date.now() >= deadline) return null;
+    await new Promise((r) => setTimeout(r, 100));
+  }
 }
 
 // Path-request handler. Implements the minimum-leaf responsibility
@@ -2090,7 +2112,7 @@ const NN_MAX_RESOURCE = 64 * 1024 * 1024;
 
 // Create and start a Resource receiver for an inbound advertisement.
 function startResourceReceive(link, adv) {
-  if (link._resource) { link._resource.cancel('superseded'); }
+  if (link._resource) { link._resource.abort('superseded'); }
 
   // Two kinds of inbound Resource: a NomadNet page RESPONSE (we have a
   // pending request on this link) or a large LXMF message delivered to us.
@@ -2388,13 +2410,17 @@ async function sendMessage() {
     && replyingToMsg.messageId) ? replyingToMsg : null;
   // Group-chat relay rule (§5.9.9): a reply to a relayed message egresses
   // via the relay's destination so it fans out to the whole group.
-  const sendContact = replyTarget ? effectiveRecipientFor(replyTarget, contact) : contact;
+  let sendContact = replyTarget ? effectiveRecipientFor(replyTarget, contact) : contact;
 
   // Attachment (with optional caption) — delivered over a Link as a Resource.
   if (stagedAttachment) {
     const warn = (m) => { try { alert(m); } catch (_) { /* no-op */ } log('err', m); };
-    if (!sendContact.identity) { warn('Recipient public key unknown — wait for their announce.'); return; }
     if (!radioOn) { warn('Connect to a transport first to send attachments.'); return; }
+    if (!sendContact.identity) {
+      const recovered = await recoverContactKey(sendContact);
+      if (!recovered) { warn('Recipient public key unknown and no cached announce on the network — wait for their announce, or import their contact card.'); return; }
+      sendContact = recovered;
+    }
     const { fields, descriptor } = stagedAttachment;
     if (replyTarget) fields.set(0x30, hexToBytes(replyTarget.messageId));  // FIELD_REPLY_TO
     const row = {
@@ -2424,8 +2450,16 @@ async function sendMessage() {
   // Plain text (opportunistic single packet).
   if (!content) return;
   if (!sendContact.identity) {
-    log('err', 'Cannot reply yet — peer has not announced; their public key is unknown. Wait for their next announce, then try again.');
-    return;
+    // Manually-added contact (bare hash, no key yet): try to learn the key
+    // on demand instead of refusing outright.
+    const recovered = await recoverContactKey(sendContact);
+    if (!recovered) {
+      log('err', radioOn
+        ? 'Cannot send yet — public key unknown and no cached announce on the network. Wait for the peer to announce, or import their contact card.'
+        : 'Cannot send yet — public key unknown. Connect to a transport to request their cached announce, or import their contact card.');
+      return;
+    }
+    sendContact = recovered;
   }
 
   // Optimistic UI: persist + paint the outgoing bubble and clear the input
@@ -3358,7 +3392,9 @@ async function openDestDetail(entry) {
     identityHash = c.identityHash || null;
     keyKnown = !!(c.publicKey && c.publicKey.length);
     lastSeen = c.lastSeen; rssi = c.rssi; source = 'announce';
-    messagableHash = keyKnown ? c.hash : null;
+    // Key-less placeholders are messagable too: sendMessage recovers the
+    // key on demand via recoverContactKey (path? → cached announce).
+    messagableHash = c.hash;
     isFavorite = !!c.favorite; isPinned = !!c.pinned;
   } else {
     const n = entry.node;
@@ -3522,7 +3558,17 @@ async function addManualHash(str) {
   await saveContact(serializeContact(mem));
   scheduleRenderContactList();
   scheduleRenderNodesList();
-  return { ok: true, msg: 'Added — messaging unlocks when their announce arrives' };
+  // Proactively ask the network for this peer's cached announce (SPEC §7.1)
+  // so the key arrives now rather than at the peer's next periodic announce.
+  // The path-response announce flows through handleAnnounce, which upgrades
+  // this placeholder with the key and unlocks messaging.
+  if (radioOn) {
+    requestPath(hexToBytes(cleaned))
+      .then((got) => { if (got) log('ok', `  Path response for manually-added ${cleaned.substring(0, 16)}...`); })
+      .catch(() => { /* best effort */ });
+    return { ok: true, msg: 'Added — requesting their identity from the network…' };
+  }
+  return { ok: true, msg: 'Added — messaging unlocks when their announce arrives (connect to request it now)' };
 }
 
 // Route pasted/scanned text: JSON card vs bare hash.

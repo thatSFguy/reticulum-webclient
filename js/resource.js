@@ -117,15 +117,15 @@ export class ResourceReceiver {
   // Kick off the transfer (caps check + first request).
   start() {
     if (this.adv.transferSize > this.maxSize || this.adv.dataSize > this.maxSize) {
-      this._fail(`resource too large (t=${this.adv.transferSize}, d=${this.adv.dataSize}, cap=${this.maxSize})`, true);
+      this._fail(`resource too large (t=${this.adv.transferSize}, d=${this.adv.dataSize}, cap=${this.maxSize})`);
       return;
     }
     if (this.adv.split && this.adv.totalSegments > 1) {
       // Multi-segment (>1 MiB) is out of scope — NomadNet pages never hit it.
-      this._fail('multi-segment resources not supported', true);
+      this._fail('multi-segment resources not supported');
       return;
     }
-    if (this.totalParts <= 0) { this._fail('resource has no parts', true); return; }
+    if (this.totalParts <= 0) { this._fail('resource has no parts'); return; }
     this._requestNext();
   }
 
@@ -206,17 +206,34 @@ export class ResourceReceiver {
     if (this.done) return;
     const rh = plaintext.subarray(0, 32);
     if (!arraysEqual(rh, this.adv.hash)) return;  // not ours
+    // §10.7 HMU hardening (RNS >= 1.3.9): ignore HMUs we didn't ask for.
+    if (!this.waitingHMU) return;
     const [, hashmapBytes] = msgpackDecode(plaintext.subarray(32));
-    this._ingestHashmap(u8(hashmapBytes));
+    const seg = u8(hashmapBytes);
+    // §10.7: an HMU carrying zero map hashes cancels the transfer. Without
+    // this we'd re-send the exhausted REQ and loop forever against a sender
+    // that answers it with another empty HMU.
+    if (seg.length < MAPHASH_LEN) {
+      this._fail('empty hashmap update — cancelling (SPEC §10.7)');
+      return;
+    }
+    this._ingestHashmap(seg);
     this.waitingHMU = false;
     this._requestNext();
   }
 
-  // RESOURCE_ICL (0x06): initiator cancelled.
+  // RESOURCE_ICL (0x06): initiator cancelled. No RCL echo — the sender
+  // already knows the transfer is dead.
   cancel(reason = 'cancelled by sender') {
     if (this.done) return;
     this.done = true;
     this.onError(reason);
+  }
+
+  // Local receiver-side abort (e.g. superseded by a newer advertisement).
+  // Unlike cancel(), this puts RESOURCE_RCL on the wire (§10.9).
+  abort(reason = 'aborted') {
+    this._fail(reason);
   }
 
   async _assemble() {
@@ -241,7 +258,7 @@ export class ResourceReceiver {
       // includes any metadata prefix (metadata is stripped AFTER, §10.8 step 6).
       const check = await sha256(concatBytes([plaintext, this.adv.randomHash]));
       if (!arraysEqual(check, this.adv.hash)) {
-        this._fail('resource integrity check failed (CORRUPT)', false);
+        this._fail('resource integrity check failed (CORRUPT)');
         return;
       }
 
@@ -262,17 +279,18 @@ export class ResourceReceiver {
 
       this.onComplete({ data, metadata, requestId: this.adv.requestId });
     } catch (e) {
-      this._fail(`resource assembly failed: ${e.message}`, false);
+      this._fail(`resource assembly failed: ${e.message}`);
     }
   }
 
-  _fail(reason, reject) {
+  _fail(reason) {
     if (this.done) return;
     this.done = true;
-    if (reject) {
-      // Tell the sender we're rejecting (§10.9 RESOURCE_RCL).
-      try { this.send(CTX_RESOURCE_RCL, this.adv.hash, false); } catch { /* best effort */ }
-    }
+    // §10.9: RESOURCE_RCL on ANY receiver-side abort, not just advertisement
+    // reject (matches RNS >= 1.3.9) — otherwise the sender keeps
+    // retransmitting until its watchdog gives up. Inbound ICL takes the
+    // cancel() path instead, which correctly does not echo an RCL back.
+    try { this.send(CTX_RESOURCE_RCL, this.adv.hash, false); } catch { /* best effort */ }
     this.onError(reason);
   }
 }
@@ -388,6 +406,13 @@ export class ResourceSender {
         if (seg.length) {
           const body = concatBytes([this.hash, new Uint8Array(msgpackEncode([Math.floor(segStart / HASHMAP_MAX_LEN), concatBytes(seg)]))]);
           await this.send(CTX_RESOURCE_HMU, body, false);
+        } else {
+          // §10.7 (RNS >= 1.3.9): no hashmap left to continue with means the
+          // receiver's request sequencing is broken — cancel instead of
+          // emitting an empty HMU (or, pre-fix, silently stalling the peer).
+          this.done = true;
+          try { await this.send(CTX_RESOURCE_ICL, this.hash, false); } catch { /* best effort */ }
+          this.onError('exhausted REQ past end of hashmap — cancelling (SPEC §10.7)');
         }
       }
     }
