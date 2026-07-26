@@ -1,9 +1,10 @@
 // js/transport-flasher-app.js — UI controller for flasher.html.
-// Fetches the latest release of reticulum-lora-transport, lets the
+// Fetches the latest release of reticulum-lora-repeater, lets the
 // user download the matching UF2 (drag-and-drop install path) or
 // Web-Serial-DFU-flash a locally uploaded firmware.zip, and after the
 // device is running, configures it over BLE or Web Serial via the
-// msgpack protocol in ../reticulum-lora-transport/docs/transport_node_programming.md.
+// msgpack protocol in ../reticulum-lora-repeater/docs/CONFIG_FORMAT.md
+// (transport wiring in docs/SERIAL_PROTOCOL.md).
 
 import {
   TransportClient,
@@ -12,7 +13,7 @@ import {
 } from './transport-config.js';
 
 const TRANSPORT_OWNER = 'thatSFguy';
-const TRANSPORT_REPO  = 'reticulum-lora-transport';
+const TRANSPORT_REPO  = 'reticulum-lora-repeater';
 const RELEASES_URL    = `https://api.github.com/repos/${TRANSPORT_OWNER}/${TRANSPORT_REPO}/releases/latest`;
 
 // ---------------------------------------------------------------
@@ -83,9 +84,10 @@ async function fetchLatestRelease() {
   }
 }
 
-// firmware-XIAO_nRF52840-v0.1.5.uf2 → "XIAO_nRF52840"
+// reticulum-lora-repeater-Heltec_T114-v0.6.3.uf2 → "Heltec_T114"
+// (also accepts the pre-rename firmware-<board>-v*.uf2 asset naming)
 function parseBoard(filename) {
-  const m = filename.match(/^firmware-(.+?)-v[\d.]+\.uf2$/);
+  const m = filename.match(/^(?:reticulum-lora-repeater|firmware)-(.+)-v[\d.]+\.uf2$/);
   return m ? m[1] : filename;
 }
 

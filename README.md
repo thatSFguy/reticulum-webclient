@@ -6,6 +6,20 @@ A browser-based Reticulum messaging client. Connects either directly to an [RNod
 
 No build step, no framework, no bundler. Plain ES modules, loaded directly in the browser. The LoRa path runs entirely in the browser with no server. The TCP-via-WebSocket path needs a small bridge process to sit between the browser and an existing `rnsd` — pick either the prebuilt Go binary (no runtime to install; shows a live connection-status screen) or the Python script (`tools/ws_bridge.py`).
 
+## Screenshots
+
+| Messages | Nodes |
+|---|---|
+| ![Conversation view with delivery states, group chat, and reply threading](docs/screenshots/messages.png) | ![Discovered mesh nodes with telemetry beacons and the map view](docs/screenshots/nodes.png) |
+
+| NomadNet browser | Settings |
+|---|---|
+| ![NomadNet page browsing with bookmarks and the node directory](docs/screenshots/browser.png) | ![Radio configuration, announce intervals, and the ALN mesh bearer](docs/screenshots/settings.png) |
+
+The Go WebSocket bridge (`tools/ws_bridge.go`) bridging a browser to a public `rnsd` transport node:
+
+![WS bridge terminal status screen with live client and traffic stats](docs/screenshots/ws-bridge.png)
+
 ## What it does
 
 - Connects over any of three transports:

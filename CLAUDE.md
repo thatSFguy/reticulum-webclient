@@ -4,7 +4,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## Scope Rule
 
-**Never create, modify, or delete files outside this project directory (`reticulum-webclient/`).** Exception: may read files from the sibling `reticulum-rnode/` project for reference.
+**Never create, modify, or delete files outside this project directory (`reticulum-webclient/`).** Exception: may read files from the sibling `reticulum-*` projects for reference (see Sibling Projects below).
 
 ## Version Bump Rule
 
@@ -14,148 +14,103 @@ CI (`.github/workflows/deploy.yml`) syncs the version badge in `index.html` from
 
 ## Project Overview
 
-Reticulum-lite web client — a static JavaScript web app that connects to an RNode LoRa modem over Web Bluetooth and exchanges encrypted messages with Sideband/NomadNet users on a Reticulum LoRa network.
+Browser-based Reticulum messaging client — a static JavaScript web app that exchanges encrypted LXMF messages (including attachments) with Sideband/NomadNet/MeshChat users, and browses NomadNet pages (micron markup). Several bearers:
 
-No build step, no server, no framework — plain ES modules hosted on GitHub Pages.
+- **RNode LoRa modem** over Web Bluetooth or Web Serial (KISS framing)
+- **rnsd daemon** over a WebSocket bridge (`tools/ws_bridge.go` / `.py`) to TCP transport nodes
+- **Agnostic-LoRa-Net (ALN) mesh** over BLE (port of the mobile app's Kotlin stack)
+
+No build step, no server, no framework — plain ES modules hosted on GitHub Pages. All protocol logic (identity, crypto, announces, Links, Resources) runs in the browser; the radio/daemon on the far side only sees encrypted packets.
+
+The authoritative protocol reference is the sibling `reticulum-specifications/SPEC.md` — code comments cite it as `SPEC §…`.
 
 ## Architecture
-
-### Transport Chain
-
-```
-Browser (Web Bluetooth) → BLE NUS → RNode firmware (KISS) → SX1262 → LoRa RF
-                                                                        ↕
-Sideband (phone) ← BLE/USB → RNode firmware (KISS) ← SX1262 ← LoRa RF
-```
-
-The webapp implements enough of the Reticulum protocol to interoperate with the existing network. The RNode is a dumb radio modem — all protocol logic runs in the browser.
 
 ### Module Layout
 
 ```
 reticulum-webclient/
-  index.html              — Single-page app UI
-  css/style.css           — Dark theme (matches rnode flasher aesthetic)
+  index.html                — Single-page app UI
+  flasher.html              — Repeater-firmware flasher + config console
+  privacy.html              — Privacy notes for the live app
+  hubs.json                 — Curated public TCP transport entrypoints
+  css/style.css             — Dark theme
   js/
-    ble-transport.js      — Web Bluetooth NUS connection + byte stream
-    kiss.js               — KISS frame encode/decode
-    rnode.js              — RNode command layer (detect, config, CMD_DATA)
-    reticulum.js          — Packet header encode/decode, constants
-    identity.js           — Ed25519/X25519 keypair, identity hash, dest hash
-    crypto.js             — ECDH + HKDF + Token (Fernet-variant) encrypt/decrypt
-    announce.js           — Build and parse Reticulum announces
-    destination.js        — Destination hash computation
-    lxmf.js               — LXMF message pack/unpack + signature
-    store.js              — IndexedDB for identity, contacts, messages
-    app.js                — UI controller + state management
-  lib/
-    noble-curves.min.js   — @noble/curves (Ed25519, X25519) ~50KB
-    msgpack.min.js        — MessagePack encoder/decoder
+    app.js                  — UI controller + state management (the big one)
+    — transports —
+    ble-transport.js        — Web Bluetooth NUS connection + byte stream
+    serial-transport.js     — Web Serial byte stream
+    websocket-transport.js  — WS bridge byte stream (to rnsd TCP)
+    rnsd-interface.js       — rnsd-over-WS interface wiring
+    aln-interface.js/-router.js/-tunnel.js, nus-demux.js
+                            — Agnostic-LoRa-Net BLE mesh (ports of the
+                              mobile app's Kotlin, kept byte-for-byte)
+    kiss.js, hdlc.js        — Frame encode/decode
+    rnode.js                — RNode command layer (detect, config, CMD_DATA)
+    dfu.js                  — Web-Serial DFU flasher
+    — protocol —
+    reticulum.js            — Packet header encode/decode, constants
+    identity.js             — Ed25519/X25519 keypair, identity/dest hashes
+    crypto.js               — ECDH + HKDF + Token encrypt/decrypt
+    announce.js             — Build/parse/validate announces
+    lxmf.js                 — LXMF message pack/unpack + signature
+    link.js                 — Links: handshake, session crypto, keepalive
+    resource.js             — Resource transfers over Links (send + receive)
+    nomadnet.js, micron.js  — NomadNet page requests + micron renderer
+    known-destinations.js   — Well-known destination table
+    transport-config.js     — Repeater config protocol (BLE GATT / Serial)
+    transport-flasher-app.js— flasher.html controller
+    store.js                — IndexedDB for identity, contacts, messages
+  lib/                      — Vendored libraries (see Dependencies)
+  tools/                    — ws_bridge (Go + Python), RNS verify scripts
+  tests/                    — roundtrip harness (Node) validated against
+                              the Python RNS reference by run_tests.py
 ```
 
 ### Dependencies
 
-| Library | Purpose | Size | Source |
-|---------|---------|------|--------|
-| @noble/curves | Ed25519, X25519 | ~50KB | CDN (esm.sh or unpkg) |
-| @msgpack/msgpack | LXMF payload serialization | ~15KB | CDN |
-| Web Crypto API | AES-CBC, HMAC-SHA256, HKDF, SHA-256 | 0 (browser native) | — |
-| Web Bluetooth API | BLE NUS connection | 0 (browser native) | — |
+All vendored into `lib/` (no CDN at runtime, no npm install needed):
 
-No npm, no bundler, no build step. Libraries loaded via `<script>` or ESM import from CDN.
+| Library | Purpose |
+|---------|---------|
+| @noble/curves (`noble-curves-ed25519.js`) | Ed25519, X25519 |
+| @msgpack/msgpack (`msgpack.js`) | LXMF payload serialization |
+| `bz2.js` | Resource decompression |
+| Leaflet (`leaflet.js`) | Node map view |
+| qrcode-generator (`qrcode.js`) | Contact-card QR export |
+| Web Crypto API | AES-CBC, HMAC-SHA256, HKDF, SHA-256 (browser native) |
 
 ### Platform Support
 
-| Platform | Web Bluetooth | Works? |
-|----------|--------------|--------|
-| Chrome Android | Yes | Primary target |
-| Chrome Desktop | Yes | Dev/testing |
-| Edge Desktop | Yes | Works |
-| Safari iOS | No | Blocked (Apple) |
-| Firefox | No | Blocked |
+| Platform | Web Bluetooth | Web Serial | WebSocket | Works? |
+|----------|--------------|------------|-----------|--------|
+| Chrome/Edge/Brave Android | Yes | No | Yes | Primary target |
+| Chrome/Edge Desktop | Yes | Yes | Yes | Works |
+| Safari iOS | No | No | Yes | WS-bridge only (Apple blocks BLE/Serial) |
+| Firefox | No | No | Yes | WS-bridge only |
 
-## Implementation Plan
+## Implemented Protocol Surface
 
-### Phase 1: BLE Transport + Raw Packet Sniffer
-**Goal**: Connect to RNode via Web Bluetooth, configure radio, display raw LoRa packets.
+Everything from the original phased plan shipped long ago, plus a lot the plan deferred. In scope and working today:
 
-Build: `ble-transport.js`, `kiss.js`, `rnode.js`, basic `app.js` + `index.html`
-
-Key detail: Web Bluetooth uses GATT characteristics, not a Stream. KISS frames may arrive split across multiple BLE notifications — the parser must accumulate bytes and emit complete frames on FEND boundaries.
-
-NUS UUIDs:
-- Service: `6e400001-b5a3-f393-e0a9-e50e24dcca9e`
-- TX (write): `6e400002-b5a3-f393-e0a9-e50e24dcca9e`
-- RX (notify): `6e400003-b5a3-f393-e0a9-e50e24dcca9e`
-
-**Verify**: See hex dumps of Reticulum announces from a nearby Sideband node.
-
-### Phase 2: Reticulum Packet Parser + Identity
-**Goal**: Parse packet headers, generate persistent Ed25519/X25519 identity.
-
-Build: `identity.js`, `destination.js`, `reticulum.js`, `store.js`
-
-Identity structure:
-- encryption_public_key (32 bytes, X25519) + signing_public_key (32 bytes, Ed25519) = 64 bytes
-- identity_hash = SHA-256(public_key)[0:16]
-- destination_hash = SHA-256(name_hash + identity_hash)[0:16]
-- name_hash = SHA-256("lxmf.delivery")[0:10]
-
-**Verify**: Parse announces from Sideband, display sender identity hash.
-
-### Phase 3: Announce Send/Receive
-**Goal**: Validate incoming announces, send our own so Sideband can discover us.
-
-Build: `announce.js`
-
-Announce packet structure:
-- public_key(64) + name_hash(10) + random_hash(10) + signature(64) + [app_data]
-- Signature over: dest_hash + public_key + name_hash + random_hash + app_data
-
-**Verify**: Our announce shows up in Sideband's discovered list.
-
-### Phase 4: Receive LXMF Messages
-**Goal**: Decrypt and display messages sent from Sideband.
-
-Build: `crypto.js`, `lxmf.js`
-
-Decryption flow:
-1. Extract ephemeral X25519 pubkey (32 bytes) from ciphertext
-2. ECDH: shared_secret = X25519(our_private, ephemeral_public)
-3. HKDF(shared_secret, salt=recipient_identity_hash) → signing_key(32) + encryption_key(32)
-4. Verify HMAC-SHA256, decrypt AES-256-CBC, remove PKCS7 padding
-5. Parse LXMF: source_hash(16) + signature(64) + msgpack([timestamp, title, content, fields])
-
-**Verify**: Message from Sideband decrypts and displays correctly. This is the critical interop milestone.
-
-### Phase 5: Send LXMF Messages
-**Goal**: Compose and send encrypted messages to known contacts.
-
-Extend: `crypto.js` (encrypt), `lxmf.js` (pack outbound)
-
-Encryption is the reverse of decryption. Max single-packet message ~250-300 bytes after all overhead.
-
-**Verify**: Message sent from webclient appears correctly in Sideband.
-
-### Phase 6: UI Polish
-**Goal**: Usable messaging app with conversation view.
-
-Build out: `app.js`, `index.html`, `css/style.css`
-- Contact list from discovered announces
-- Conversation threads
-- Identity management (show our hash, set display name, export/import keys)
-- Radio config UI
+- Announces (send/receive/validate, ratchet field, display names, path responses)
+- Opportunistic LXMF send/receive with delivery proofs and retries
+- **Ratchets** — encrypt to the peer's announced ratchet key; rotate our own
+- **Links** — handshake, session crypto, keepalive, LXMF-over-Link
+- **Resources** — send and receive over Links (attachments, NomadNet pages)
+- NomadNet page browsing (micron renderer, forms, file downloads)
+- Reactions (SPEC §5.9.8) and reply-to threading (SPEC §5.9.9), group-chat-relay compliant
+- Path requests (§7.1/§7.2.6 leaf duties) and HEADER_2 originator conversion (§2.3)
+- Contact cards (JSON, QR export/scan — byte-compatible with the mobile app)
 
 ## Deferred (Not In Scope)
 
-- **Ratchets** — forward secrecy key rotation (parse the field to avoid byte misalignment, but don't implement rotation)
-- **Links** — bidirectional encrypted tunnels (needed for messages > single-packet)
-- **Resources** — large file/data transfers over Links
 - **Propagation nodes** — store-and-forward relay for offline recipients
-- **Multi-hop transport** — full routing table (single-hop LoRa is sufficient)
+- **Multi-hop transport** — full routing table (we are a leaf; the §2.3 HEADER_2 conversion + upstream transport_id is sufficient)
 - **LXMF stamps** — proof-of-work (skip unless target network requires it)
-- **IFAC** — interface authentication (skip unless network uses it)
+- **IFAC** — interface authentication (IFAC-flagged packets are rejected at parse)
 - **GROUP destinations** — only SINGLE needed for point-to-point messaging
+- **Multi-segment Resources** (> 1 MiB per segment)
 
 ## Reticulum Protocol Quick Reference
 
@@ -183,10 +138,15 @@ NAME_HASH_LENGTH = 10 bytes (80 bits)
 MTU = 500 bytes
 ```
 
-## Sibling Project
+## Sibling Projects
 
-The RNode firmware lives at `C:\Users\rob\PlatformIO\reticulum-rnode\`. Key files:
-- `src/Ble.cpp` — BLE NUS implementation (MTU, buffering, flush behavior)
-- `src/Kiss.cpp` — KISS protocol + transport abstraction
-- `docs/js/rnode.js` — JavaScript KISS implementation (reuse framing helpers)
-- `docs/dfu.js` — DFU flasher (reference for Web Serial patterns)
+All siblings live under `/home/robw/projects/` (WSL):
+
+- `reticulum-specifications/` — **`SPEC.md`, the authoritative protocol reference** cited throughout the code as `SPEC §…`. Runtime verifiers in its `tools/` lock claims against the Python RNS/LXMF reference.
+- `reticulum-mobile-app/` — Kotlin app; the webclient mirrors its patterns (reaction palette, contact cards, ALN stack, group-chat relay routing).
+- `reticulum-rnode/` — RNode firmware. `src/Ble.cpp` (BLE NUS), `src/Kiss.cpp` (KISS framing), `docs/dfu.js` (Web Serial DFU reference).
+- `reticulum-lora-repeater/` — repeater/transport firmware (formerly `reticulum-lora-transport`) that `flasher.html` flashes and configures; protocol docs in its `docs/CONFIG_FORMAT.md` / `SERIAL_PROTOCOL.md`.
+- `reticulum-group-chat/` — Go relay that re-originates group messages.
+- `reticulum-client-interoperability/` — cross-client interop test notes.
+
+Note: this WSL environment has **no Node.js** — `tests/*.mjs` can't run locally; rely on CI (`.github/workflows/verify.yml`). Python 3 is available.

@@ -1,16 +1,17 @@
-// js/transport-config.js — driver for the reticulum-lora-transport
+// js/transport-config.js — driver for the reticulum-lora-repeater
 // configuration protocol over Web Bluetooth (GATT) or Web Serial.
-// Wire format and command set live in the transport repo:
-//   ../reticulum-lora-transport/docs/transport_node_programming.md
+// Wire format and command set live in the repeater repo:
+//   ../reticulum-lora-repeater/docs/CONFIG_FORMAT.md
+//   ../reticulum-lora-repeater/docs/SERIAL_PROTOCOL.md
 // Firmware-side authoritative reference is src/Ble.cpp /
-// src/SerialConsole.cpp / src/ConfigProtocol.cpp in that same repo.
+// src/SerialConsole.cpp / src/Config.cpp in that same repo.
 
 import { Encoder, decode } from '../lib/msgpack.js';
 
 // forceFloat32 makes the encoder emit msgpack 0xCA (float32) instead of
 // 0xCB (float64) for non-integer numbers. The transport firmware reads
 // batt_mult strictly as float32 and rejects float64 with
-// "malformed set_config payload" — see transport repo docs §4.
+// "malformed set_config payload" — see the repeater repo's CONFIG_FORMAT.md.
 const encoder = new Encoder({ forceFloat32: true });
 const encode  = (obj) => encoder.encode(obj);
 
