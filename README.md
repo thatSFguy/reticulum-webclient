@@ -1,6 +1,3 @@
-> [!NOTE]
-> **🙋 Seeking a co-maintainer / partner.** I'm stepping back from active development of this repo and looking for someone to help maintain this project (or take it over). Bug reports with a clear repro are welcome; feature requests are PR-welcome but not promised. Interested in partnering? See **[#5](https://github.com/thatSFguy/reticulum-webclient/issues/5)**.
-
 # reticulum-webclient
 
 A browser-based Reticulum messaging client. Connects either directly to an [RNode](https://unsigned.io/rnode) LoRa modem over Web Bluetooth or Web Serial, or to any running Reticulum daemon (`rnsd`) over a WebSocket bridge, and exchanges encrypted LXMF messages — including file and image attachments — with Sideband, NomadNet, MeshChat, and other Reticulum nodes anywhere on the network. It also browses NomadNet pages (micron markup, interactive forms, tables, file downloads).
