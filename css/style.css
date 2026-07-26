@@ -732,6 +732,13 @@ a { color: var(--accent); }
   white-space: pre-wrap;
   word-break: break-word;
 }
+/* Linkified URLs: inherit the bubble text color (the accent link color
+   would vanish on the accent outgoing bubble); underline marks them. */
+.message-text a {
+  color: inherit;
+  text-decoration: underline;
+  word-break: break-all;
+}
 .message.incoming {
   background: var(--bubble-in-bg);
   color: var(--bubble-in-text);

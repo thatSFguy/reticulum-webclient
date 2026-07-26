@@ -3758,7 +3758,7 @@ async function renderMessages(contactHash) {
     const stateIcon = renderOutgoingStateIcon(msg);
     const rxMeta = renderIncomingRxMeta(msg);
     const quote = renderReplyPreview(msg, byMessageId);
-    const body = msg.content ? `<div class="message-text">${escapeHtml(msg.content)}</div>` : '';
+    const body = msg.content ? `<div class="message-text">${linkifyEscaped(msg.content)}</div>` : '';
     const reactions = renderReactions(msg.reactions);
     div.innerHTML = `${quote}${renderAttachment(msg.attachment)}${body}${reactions}<div class="meta">${time}${stateIcon}${rxMeta}</div>`;
     // Tap-back affordance — only on incoming messages that carry a
@@ -4003,6 +4003,27 @@ function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
   return div.innerHTML;
+}
+
+// Escape text and turn bare http(s) URLs into anchors that open in a new
+// tab. Only http/https schemes are matched, so no javascript: injection;
+// everything (including the URL itself) still passes through escapeHtml.
+const LINKIFY_RE = /https?:\/\/[^\s<>"']+/g;
+function linkifyEscaped(str) {
+  let html = '';
+  let last = 0;
+  for (const m of str.matchAll(LINKIFY_RE)) {
+    let url = m[0];
+    // Trailing sentence punctuation is almost never part of the URL.
+    const trail = url.match(/[)\].,;:!?'"]+$/);
+    if (trail) url = url.slice(0, -trail[0].length);
+    html += escapeHtml(str.slice(last, m.index));
+    html += `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`;
+    if (trail) html += escapeHtml(trail[0]);
+    last = m.index + m[0].length;
+  }
+  html += escapeHtml(str.slice(last));
+  return html;
 }
 
 // ---- DOM mirror helpers ---------------------------------------------
