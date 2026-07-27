@@ -1530,7 +1530,8 @@ async function dispatchIncomingMessage(msg, rxInfo) {
     log('info', `  Created placeholder contact for unknown sender ${sourceHashHex.substring(0,16)}... (no announce seen yet — reply disabled until they announce)`);
   }
 
-  const via = rxInfo.hops === 0 ? 'direct' : `${rxInfo.hops} hop${rxInfo.hops > 1 ? 's' : ''}`;
+  const via = rxInfo.propagated ? 'propagation sync'
+    : rxInfo.hops === 0 ? 'direct' : `${rxInfo.hops} hop${rxInfo.hops > 1 ? 's' : ''}`;
   log('ok', `  Message from "${senderName}" (${via}, RSSI=${rxInfo.rssi}, SNR=${rxInfo.snr}): ${msg.content}`);
 
   // Reply threading (FIELD_REPLY_TO 0x30 + optional quote 0x31, SPEC
@@ -1563,6 +1564,9 @@ async function dispatchIncomingMessage(msg, rxInfo) {
     snr: rxInfo.snr,
     hops: rxInfo.hops,
     headerType: rxInfo.headerType,
+    // Retrieved from a propagation node (not heard on air) — rendered
+    // as "synced" in the bubble meta instead of a hops label.
+    propagated: rxInfo.propagated || undefined,
     dupeCount: 1,
   };
   // Pull out any image/file/audio attachment for rendering.
@@ -2203,7 +2207,7 @@ async function pnIngestBlob(blob, wantedIds) {
     ].filter(Boolean);
     const plaintext = await decrypt(blob.subarray(16), candidatePrivs, myIdentity.hash);
     const msg = await unpackMessage(plaintext, myDestHash);
-    await dispatchIncomingMessage(msg, { rssi: null, snr: null, hops: 0, headerType: null });
+    await dispatchIncomingMessage(msg, { rssi: null, snr: null, hops: null, headerType: null, propagated: true });
     return { id, ok: true };
   } catch (e) {
     log('err', `  PN message ingest failed (skipped permanently): ${e.message}`);
@@ -4097,13 +4101,25 @@ async function renderMessages(contactHash) {
     return;
   }
 
-  // Sort by the IndexedDB auto-increment id, which is strictly the
-  // order the rows were saved. Using the stored timestamp would put
-  // any historical messages that were saved before the bogus-sender-
-  // clock fix at the top of the list, because those rows hold
-  // seconds-since-boot values from clockless LoRa senders that
-  // resolve to Jan 1, 1970.
-  const ordered = msgs.slice().sort((a, b) => (a.id || 0) - (b.id || 0));
+  // Order chronologically by sender timestamp, with save order (the
+  // IndexedDB auto-increment id) as the tiebreaker and the fallback.
+  // Save order alone is wrong since propagation-node sync landed: a
+  // sync ingests older messages AFTER newer direct ones, which used to
+  // pin them to the bottom of the thread. Pure timestamp order is also
+  // wrong: rows saved before the bogus-sender-clock fix hold
+  // seconds-since-boot values from clockless LoRa senders (Jan 1970,
+  // normalized to null here) and would all float to the top. So rows
+  // without a sane timestamp inherit the previous row's effective time
+  // in save order — they stay glued to their arrival neighbours.
+  const bySaveOrder = msgs.slice().sort((a, b) => (a.id || 0) - (b.id || 0));
+  let carryTs = 0;
+  const keyed = bySaveOrder.map((m, seq) => {
+    const ts = normalizeLxmfTimestamp(m.timestamp);
+    if (ts != null) carryTs = ts;
+    return { m, key: carryTs, seq };
+  });
+  keyed.sort((a, b) => a.key - b.key || a.seq - b.seq);
+  const ordered = keyed.map(k => k.m);
 
   // Conversation-local lookup for reply-quote previews (SPEC §5.9.9) —
   // same scope as the mobile app's byMessageId map.
@@ -4313,6 +4329,7 @@ function renderReactions(reactions) {
 function renderIncomingRxMeta(msg) {
   if (msg.direction !== 'incoming') return '';
   const parts = [];
+  if (msg.propagated) parts.push('synced');
   if (typeof msg.hops === 'number') {
     parts.push(msg.hops === 0 ? 'direct' : `${msg.hops} hop${msg.hops > 1 ? 's' : ''}`);
   }
