@@ -192,6 +192,19 @@
             <span class="js-radio-status rp-val-muted">—</span>
           </div>
         </div>
+        <div class="rp-section">
+          <div class="rp-title">Mailbox</div>
+          <div class="rp-stat-row">
+            <span>Propagation node</span>
+            <span id="pn-node-label" class="rp-val-muted">none heard yet</span>
+          </div>
+          <div class="rp-stat-row">
+            <span>Last sync</span>
+            <span id="pn-last-sync" class="rp-val-muted">never</span>
+          </div>
+          <button id="btn-pn-sync" class="btn-secondary btn-block js-pn-sync-btn">Sync now</button>
+          <div id="pn-status" class="pn-status"></div>
+        </div>
       </aside>
     </section>
 
@@ -301,6 +314,32 @@
           <button id="btn-import-id" class="btn-secondary">Import Identity</button>
           <button id="btn-new-id" class="btn-secondary btn-danger">New Identity</button>
           <input id="import-id-input" type="file" accept="application/json,.json" class="hidden">
+        </div>
+      </div>
+
+      <!-- Propagation node -->
+      <div class="settings-card" id="pn-panel">
+        <h3 class="settings-card-title">Offline Messages (Propagation Node)</h3>
+        <p class="settings-card-hint">
+          Messages sent while you were offline can be held by an LXMF propagation node
+          and retrieved when you reconnect. Syncing runs automatically after connecting
+          and every 15 minutes; the sender's client must have handed the message to a
+          propagation node for there to be anything to fetch.
+        </p>
+        <div class="row">
+          <div class="field wide">
+            <label>Propagation node</label>
+            <select id="pn-node-select">
+              <option value="">Automatic — none heard yet</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Auto-sync</label>
+            <label class="pn-checkbox"><input type="checkbox" id="pn-auto-sync" checked> Enabled</label>
+          </div>
+        </div>
+        <div class="row">
+          <button class="btn-secondary js-pn-sync-btn">Sync now</button>
         </div>
       </div>
 

@@ -7,7 +7,7 @@ import { RNode } from './rnode.js';
 import { RnsdInterface } from './rnsd-interface.js';
 import { AlnInterface } from './aln-interface.js';
 import { toHex } from './kiss.js';
-import { Identity, computeDestinationHash, computeNameHash, truncatedHash } from './identity.js';
+import { Identity, computeDestinationHash, computeNameHash, truncatedHash, sha256 } from './identity.js';
 import { parsePacket, buildPacket, PACKET_ANNOUNCE, PACKET_DATA, PACKET_LINKREQ, PACKET_PROOF, DEST_SINGLE, DEST_LINK, DEST_PLAIN, HEADER_1, HEADER_2, TRANSPORT_BROADCAST, TRANSPORT_TRANSPORT, PACKET_TYPE_NAMES } from './reticulum.js';
 import { parseAnnounce, validateAnnounce, buildAnnounce, extractDisplayName, concatBytes, arraysEqual } from './announce.js';
 import { encrypt, decrypt } from './crypto.js';
@@ -16,6 +16,7 @@ import { Link, LINK_ACTIVE, LINK_CLOSED, computePacketFullHash } from './link.js
 import { lookupDestination } from './known-destinations.js';
 import { ed25519 } from '@noble/curves/ed25519';
 import { CTX_REQUEST, CTX_RESPONSE, NN_DEFAULT_PATH, buildRequest, parseResponse, responseToText, stripPageHeaders, parseLinkTarget } from './nomadnet.js';
+import { PN_NAME, PN_GET_PATH, pnErrorName, pnResponseIsError, parsePnAppData, normalizeIdList, normalizeMessageBundle } from './propagation.js';
 import { ResourceReceiver, ResourceSender, parseAdvertisement, CTX_RESOURCE, CTX_RESOURCE_ADV, CTX_RESOURCE_REQ, CTX_RESOURCE_HMU, CTX_RESOURCE_PRF, CTX_RESOURCE_ICL, CTX_RESOURCE_RCL } from './resource.js';
 import { renderMicron } from './micron.js';
 import { qrcode } from '../lib/qrcode.js';
@@ -28,6 +29,7 @@ qrcode.stringToBytes = (s) => Array.from(new TextEncoder().encode(s));
 const CTX_NONE          = 0x00;
 const CTX_PATH_RESPONSE = 0x0B;
 const CTX_KEEPALIVE     = 0xFA;
+const CTX_LINKIDENTIFY  = 0xFB;
 const CTX_LINKCLOSE     = 0xFC;
 const CTX_LRRTT         = 0xFE;
 const CTX_LRPROOF       = 0xFF;
@@ -655,6 +657,10 @@ async function handleNonLxmfAnnounce(announce, pkt, rssi) {
   const coordsLabel = node.lat != null ? ` (lat=${node.lat.toFixed(4)}, lon=${node.lon.toFixed(4)})` : '';
   log('info', `  Non-LXMF announce from ${idHash.substring(0, 12)}...${serviceLabel} → Nodes panel${coordsLabel}`);
   scheduleRenderNodesList();
+
+  // A propagation node announcing is the "mailbox reachable" signal —
+  // refresh the sync UI and maybe kick an auto-sync (SPEC §5.8 flow step 1).
+  if (known?.name === PN_NAME) pnOnAnnounce();
 }
 
 // ---- Node-store retention --------------------------------------------
@@ -1125,17 +1131,19 @@ async function handleData(pkt, rxInfo) {
 
   log('info', '  Packet addressed to us — attempting decrypt...');
 
+  // Try current ratchet, then the previous one (in-memory 1-deep
+  // ring per SPEC §7.4 — covers messages already encrypted to the
+  // outgoing ratchet by senders that haven't seen the new announce
+  // yet), then the long-term identity X25519 key as the ultimate
+  // fallback for senders that have no ratchet cached at all.
+  // Declared outside the try — the catch logs how many keys were tried.
+  const candidatePrivs = [
+    myIdentity.ratchetPrivKey,
+    myIdentity.previousRatchetPrivKey,
+    myIdentity.encPrivKey,
+  ].filter(Boolean);
+
   try {
-    // Try current ratchet, then the previous one (in-memory 1-deep
-    // ring per SPEC §7.4 — covers messages already encrypted to the
-    // outgoing ratchet by senders that haven't seen the new announce
-    // yet), then the long-term identity X25519 key as the ultimate
-    // fallback for senders that have no ratchet cached at all.
-    const candidatePrivs = [
-      myIdentity.ratchetPrivKey,
-      myIdentity.previousRatchetPrivKey,
-      myIdentity.encPrivKey,
-    ].filter(Boolean);
     const plaintext = await decrypt(pkt.payload, candidatePrivs, myIdentity.hash);
     const msg = await unpackMessage(plaintext, myDestHash);
     await dispatchIncomingMessage(msg, rxInfo);
@@ -1737,10 +1745,13 @@ async function handleLinkData(pkt, rxInfo) {
         break;
       }
       case CTX_RESPONSE: {
-        // Inline NomadNet RESPONSE (fits one packet) — msgpack [request_id, response].
+        // Inline RESPONSE (fits one packet) — msgpack [request_id, response].
+        // A pending propagation-node /get on this link takes precedence;
+        // otherwise it's a NomadNet page response.
         const plaintext = await link.decrypt(pkt.payload);
         const { requestId, response } = parseResponse(plaintext);
-        await handleNomadNetResponse(link, requestId, response);
+        if (link._pnPending) handlePnResponse(link, requestId, response);
+        else await handleNomadNetResponse(link, requestId, response);
         break;
       }
       case CTX_RESOURCE_ADV: {
@@ -2022,6 +2033,309 @@ async function handleLinkDeliveryProof(pkt) {
   }
 }
 
+// ---- Propagation-node sync (SPEC §5.8.3) -----------------------------
+//
+// Retrieves messages a propagation node held for us while we were offline.
+// Rides the same initiator-link + REQUEST/RESPONSE machinery as the
+// NomadNet browser: open a Link to the node's lxmf.propagation destination,
+// LINKIDENTIFY (§6.7.6) so the node knows whose mailbox to open, then /get
+// rounds — a listing first, then small fetch batches (each request must fit
+// one link packet; we don't send Resource-sized requests). Fetched blobs
+// are dest_hash(16) || ciphertext: decrypted and ingested through the
+// exact same path as an opportunistic packet.
+
+const PN_SEEN_KEY  = 'rlw.pnSeenIds';   // transient ids already ingested (hex[])
+const PN_NODE_KEY  = 'rlw.pnNode';      // preferred node dest hash, '' = auto
+const PN_AUTO_KEY  = 'rlw.pnAutoSync';  // '0' disables auto-sync
+const PN_SYNC_INTERVAL_MS  = 15 * 60 * 1000;
+const PN_WANTED_PER_ROUND  = 5;         // 5×32B ids × 2 slots keeps the request in one packet
+const PN_MAX_ROUNDS        = 10;        // per sync; leftovers picked up next sync
+const PN_TRANSFER_LIMIT_KB = 1000;      // stay inside a single-segment Resource (1 MiB)
+const PN_SEEN_CAP          = 500;
+
+let pnSyncTimer = null;      // periodic re-sync while connected
+let pnKickTimer = null;      // one-shot delayed sync (startup / PN announce)
+const pnState = { syncing: false, lastAttemptAt: 0, lastOkAt: 0 };
+
+function pnAutoSyncEnabled() {
+  try { return localStorage.getItem(PN_AUTO_KEY) !== '0'; } catch { return true; }
+}
+
+function pnLoadSeenIds() {
+  try { return new Set(JSON.parse(localStorage.getItem(PN_SEEN_KEY) || '[]')); }
+  catch { return new Set(); }
+}
+
+function pnSaveSeenIds(set) {
+  try { localStorage.setItem(PN_SEEN_KEY, JSON.stringify(Array.from(set).slice(-PN_SEEN_CAP))); }
+  catch (_) { /* private mode — sync still works, just refetches next time */ }
+}
+
+function pnSetStatus(msg, kind = 'info') {
+  const el = $('pn-status');
+  if (el) { el.textContent = msg; el.classList.toggle('err', kind === 'err'); }
+  if (msg) log(kind === 'err' ? 'err' : 'info', `  PN sync: ${msg}`);
+}
+
+// Discovered propagation nodes, most recently heard first. They arrive via
+// handleNonLxmfAnnounce, which stores them in the nodes store with
+// appName='lxmf.propagation' and the 64-byte public key we need for a Link.
+async function pnCandidateNodes() {
+  const nodes = (await getAllNodes()).filter(
+    n => n.appName === PN_NAME && n.publicKey && n.publicKey.length === 64
+  );
+  nodes.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+  return nodes;
+}
+
+// The node to sync with: the user's Settings pick if it's still known,
+// otherwise the most recently heard one.
+async function pnPickNode() {
+  const nodes = await pnCandidateNodes();
+  if (!nodes.length) return null;
+  let preferred = '';
+  try { preferred = localStorage.getItem(PN_NODE_KEY) || ''; } catch (_) {}
+  return nodes.find(n => n.hash === preferred) || nodes[0];
+}
+
+function pnNodeLabel(node) {
+  const state = parsePnAppData(node.appDataHex ? hexToBytes(node.appDataHex) : new Uint8Array(0));
+  const paused = state && !state.active ? ' (paused)' : '';
+  return `${(node.userLabel || node.hash.slice(0, 12) + '…')}${paused}`;
+}
+
+// LINKIDENTIFY (§6.7.6): prove our long-term identity on the link so the
+// node's /get handler knows whose mailbox to serve. Body is
+// public_key(64) || Ed25519(link_id || public_key), link-encrypted.
+async function sendLinkIdentify(link) {
+  const signed = concatBytes([link.linkId, myIdentity.publicKey]);
+  const signature = ed25519.sign(signed, myIdentity.sigPrivKey);
+  const payload = concatBytes([myIdentity.publicKey, signature]);
+  const enc = await link.encrypt(payload);
+  const packet = buildPacket({
+    headerType: HEADER_1, destType: DEST_LINK, packetType: PACKET_DATA,
+    destHash: link.linkId, context: CTX_LINKIDENTIFY, payload: enc,
+  });
+  await rnode.sendPacket(packet);
+}
+
+// One /get REQUEST on the sync link; resolves with the decoded RESPONSE
+// value. Correlation is by request_id — the truncated hash of the request
+// packet's wire bytes (§11.1) — checked in handlePnResponse.
+async function pnRequest(link, data, timeoutMs = 30000) {
+  const body = await buildRequest(PN_GET_PATH, data);
+  const enc = await link.encrypt(body);
+  const packet = buildPacket({
+    headerType: HEADER_1, destType: DEST_LINK, packetType: PACKET_DATA,
+    destHash: link.linkId, context: CTX_REQUEST, payload: enc,
+  });
+  const fullHash = await computePacketFullHash(parsePacket(packet));
+  return new Promise((resolve, reject) => {
+    link._pnPending = {
+      expectedId: fullHash.subarray(0, 16),
+      resolve, reject,
+      timer: setTimeout(() => {
+        if (link._pnPending) { link._pnPending = null; reject(new Error('request timed out')); }
+      }, timeoutMs),
+    };
+    rnode.sendPacket(packet).catch((e) => {
+      if (link._pnPending) { clearTimeout(link._pnPending.timer); link._pnPending = null; }
+      reject(e);
+    });
+  });
+}
+
+function handlePnResponse(link, requestId, response) {
+  const pending = link._pnPending;
+  if (!pending) { log('info', '  PN response with no pending request — dropped'); return; }
+  if (!arraysEqual(requestId, pending.expectedId)) {
+    // SPEC §11.2: drop responses whose request_id doesn't match.
+    log('err', '  PN response request_id mismatch — dropped');
+    return;
+  }
+  clearTimeout(pending.timer);
+  link._pnPending = null;
+  pending.resolve(response);
+}
+
+function pnRejectPending(link, reason) {
+  const pending = link._pnPending;
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  link._pnPending = null;
+  pending.reject(new Error(reason));
+}
+
+// Decrypt and ingest one retrieved blob. Returns { id, ok } where id is
+// the transient id to mark seen/ack (matched against `wantedIds` by hash
+// prefix so 16- vs 32-byte server ids both work), or null id when the blob
+// is malformed beyond identification. An undecryptable blob (encrypted to
+// a ratchet we've rotated past) is marked seen anyway — keys never come
+// back, so retrying every sync forever would just poison the loop.
+async function pnIngestBlob(blob, wantedIds) {
+  let id = null;
+  try {
+    if (!(blob instanceof Uint8Array)) blob = new Uint8Array(blob);
+    if (blob.length < 17) throw new Error('blob too short');
+    const fullHash = await sha256(blob);
+    id = wantedIds.find(w => arraysEqual(w, fullHash.subarray(0, w.length)))
+      || fullHash.subarray(0, 16);
+    if (!arraysEqual(blob.subarray(0, 16), myDestHash)) {
+      throw new Error('not addressed to us');
+    }
+    const candidatePrivs = [
+      myIdentity.ratchetPrivKey,
+      myIdentity.previousRatchetPrivKey,
+      myIdentity.encPrivKey,
+    ].filter(Boolean);
+    const plaintext = await decrypt(blob.subarray(16), candidatePrivs, myIdentity.hash);
+    const msg = await unpackMessage(plaintext, myDestHash);
+    await dispatchIncomingMessage(msg, { rssi: null, snr: null, hops: 0, headerType: null });
+    return { id, ok: true };
+  } catch (e) {
+    log('err', `  PN message ingest failed (skipped permanently): ${e.message}`);
+    return { id, ok: false };
+  }
+}
+
+// Full sync session: link → identify → listing → fetch/ack rounds → close.
+async function pnSyncNow(trigger = 'manual') {
+  const manual = trigger === 'manual';
+  if (!manual && !pnAutoSyncEnabled()) return;
+  if (pnState.syncing) { if (manual) pnSetStatus('sync already running'); return; }
+  if (!radioOn || !myIdentity) { if (manual) pnSetStatus('not connected', 'err'); return; }
+
+  const node = await pnPickNode();
+  if (!node) { pnSetStatus(manual ? 'no propagation node heard yet — wait for an announce' : ''); return; }
+
+  pnState.syncing = true;
+  pnState.lastAttemptAt = Date.now();
+  const label = pnNodeLabel(node);
+  pnSetStatus(`syncing with ${label}…`);
+  let link = null;
+  try {
+    const identity = new Identity();
+    await identity.loadFromPublicKey(new Uint8Array(node.publicKey));
+    link = await openLinkToContact({
+      identity, destHash: hexToBytes(node.hash), displayName: label, hash: node.hash,
+    });
+    await sendLinkIdentify(link);
+
+    const listing = await pnRequest(link, [null, null]);
+    if (pnResponseIsError(listing)) throw new Error(pnErrorName(Number(listing)));
+    const ids = normalizeIdList(listing);
+
+    const seen = pnLoadSeenIds();
+    const fresh = ids.filter(id => !seen.has(toHex(id)));
+    // Ids we already ingested but the node still holds: ack them so it
+    // purges (§5.8.3 "ack and purge" — a courtesy that bounds its store).
+    const ackQueue = ids.filter(id => seen.has(toHex(id)));
+
+    log('info', `  PN sync: ${ids.length} stored, ${fresh.length} new (node ${node.hash.slice(0, 12)}…)`);
+
+    let ingested = 0, failed = 0, rounds = 0;
+    while ((fresh.length || ackQueue.length) && rounds < PN_MAX_ROUNDS) {
+      rounds++;
+      const wanted = fresh.splice(0, PN_WANTED_PER_ROUND);
+      const acks = ackQueue.splice(0, PN_WANTED_PER_ROUND);
+      if (wanted.length) pnSetStatus(`fetching ${wanted.length} message${wanted.length > 1 ? 's' : ''}…`);
+      const resp = await pnRequest(link, [wanted, acks, PN_TRANSFER_LIMIT_KB], 120000);
+      if (pnResponseIsError(resp)) throw new Error(pnErrorName(Number(resp)));
+      if (!wanted.length) continue;  // pure ack round
+      const bundle = normalizeMessageBundle(resp);
+      for (const blob of bundle.messages) {
+        const { id, ok } = await pnIngestBlob(blob, wanted);
+        if (id) { seen.add(toHex(id)); ackQueue.push(id); }
+        if (ok) ingested++; else failed++;
+      }
+    }
+    pnSaveSeenIds(seen);
+
+    pnState.lastOkAt = Date.now();
+    const leftovers = fresh.length ? ` (${fresh.length} left for next sync)` : '';
+    const failNote = failed ? `, ${failed} undecryptable` : '';
+    pnSetStatus(ingested
+      ? `synced — ${ingested} new message${ingested > 1 ? 's' : ''}${failNote}${leftovers}`
+      : `synced — no new messages${failNote}`);
+  } catch (e) {
+    pnSetStatus(`sync failed: ${e.message}`, 'err');
+  } finally {
+    if (link) { pnRejectPending(link, 'sync ended'); closeLink(link).catch(() => {}); }
+    pnState.syncing = false;
+    pnRefreshUi().catch(() => {});
+  }
+}
+
+// Called from handleNonLxmfAnnounce when an lxmf.propagation announce
+// lands: refresh the pickers, and if auto-sync is on and we haven't
+// synced recently, kick one — this is the "mailbox open again" signal.
+function pnOnAnnounce() {
+  pnRefreshUi().catch(() => {});
+  if (radioOn && pnAutoSyncEnabled() && !pnState.syncing &&
+      Date.now() - pnState.lastAttemptAt > 5 * 60 * 1000) {
+    clearTimeout(pnKickTimer);
+    pnKickTimer = setTimeout(() => pnSyncNow('announce'), 3000);
+  }
+}
+
+function pnStartTimers() {
+  if (pnSyncTimer) clearInterval(pnSyncTimer);
+  pnSyncTimer = setInterval(() => pnSyncNow('interval'), PN_SYNC_INTERVAL_MS);
+  // Give the connect a moment to settle (announces, path table) first.
+  clearTimeout(pnKickTimer);
+  pnKickTimer = setTimeout(() => pnSyncNow('startup'), 20000);
+}
+
+function pnStopTimers() {
+  if (pnSyncTimer) { clearInterval(pnSyncTimer); pnSyncTimer = null; }
+  clearTimeout(pnKickTimer);
+  pnKickTimer = null;
+}
+
+// Refresh the right-panel Mailbox rows and the Settings node picker.
+async function pnRefreshUi() {
+  const nodes = await pnCandidateNodes();
+  const chosen = await pnPickNode();
+
+  const labelEl = $('pn-node-label');
+  if (labelEl) labelEl.textContent = chosen ? pnNodeLabel(chosen) : 'none heard yet';
+  const lastEl = $('pn-last-sync');
+  if (lastEl) lastEl.textContent = pnState.lastOkAt ? new Date(pnState.lastOkAt).toLocaleTimeString() : 'never';
+
+  const select = $('pn-node-select');
+  if (select) {
+    let preferred = '';
+    try { preferred = localStorage.getItem(PN_NODE_KEY) || ''; } catch (_) {}
+    select.innerHTML = '';
+    const auto = document.createElement('option');
+    auto.value = '';
+    auto.textContent = nodes.length
+      ? `Automatic — most recently heard (${nodes[0].hash.slice(0, 12)}…)`
+      : 'Automatic — none heard yet';
+    select.appendChild(auto);
+    for (const n of nodes) {
+      const opt = document.createElement('option');
+      opt.value = n.hash;
+      opt.textContent = pnNodeLabel(n);
+      select.appendChild(opt);
+    }
+    select.value = nodes.some(n => n.hash === preferred) ? preferred : '';
+  }
+}
+
+document.querySelectorAll('.js-pn-sync-btn').forEach(b => {
+  b.addEventListener('click', () => pnSyncNow('manual'));
+});
+$('pn-node-select')?.addEventListener('change', (e) => {
+  try { localStorage.setItem(PN_NODE_KEY, e.target.value); } catch (_) {}
+  pnRefreshUi().catch(() => {});
+});
+$('pn-auto-sync')?.addEventListener('change', (e) => {
+  try { localStorage.setItem(PN_AUTO_KEY, e.target.checked ? '1' : '0'); } catch (_) {}
+});
+try { const cb = $('pn-auto-sync'); if (cb) cb.checked = pnAutoSyncEnabled(); } catch (_) {}
+pnRefreshUi().catch(() => {});
+
 // ---- NomadNet browser ------------------------------------------------
 //
 // Drives the existing initiator-link path (openLinkToContact → sendViaLink
@@ -2119,21 +2433,36 @@ const NN_MAX_RESOURCE = 64 * 1024 * 1024;
 function startResourceReceive(link, adv) {
   if (link._resource) { link._resource.abort('superseded'); }
 
-  // Two kinds of inbound Resource: a NomadNet page RESPONSE (we have a
-  // pending request on this link) or a large LXMF message delivered to us.
-  const isPage = !!link._nnRequest;
-  if (isPage) nnSetStatus(`receiving page (${adv.parts} parts)…`);
+  // Three kinds of inbound Resource: a propagation-node /get RESPONSE, a
+  // NomadNet page RESPONSE (we have a pending request on this link), or a
+  // large LXMF message delivered to us.
+  const isPn = !!link._pnPending;
+  const isPage = !isPn && !!link._nnRequest;
+  if (isPn) log('info', `  Receiving propagation bundle (${adv.parts} parts) on link ${toHex(link.linkId).substring(0,12)}...`);
+  else if (isPage) nnSetStatus(`receiving page (${adv.parts} parts)…`);
   else log('info', `  Receiving LXMF resource (${adv.parts} parts) on link ${toHex(link.linkId).substring(0,12)}...`);
 
   link._resource = new ResourceReceiver(link, adv, {
     maxSize: isPage ? NN_MAX_RESOURCE : undefined,
     send: makeResourceSend(link),
-    onProgress: (frac) => { if (isPage) nnSetStatus(`receiving page… ${Math.round(frac * 100)}%`); },
-    onError: (reason) => { link._resource = null; if (isPage) nnSetStatus(reason, 'err'); else log('err', `  LXMF resource failed: ${reason}`); },
+    onProgress: (frac) => {
+      if (isPage) nnSetStatus(`receiving page… ${Math.round(frac * 100)}%`);
+      else if (isPn) pnSetStatus(`downloading messages… ${Math.round(frac * 100)}%`);
+    },
+    onError: (reason) => {
+      link._resource = null;
+      if (isPn) pnRejectPending(link, reason);
+      else if (isPage) nnSetStatus(reason, 'err');
+      else log('err', `  LXMF resource failed: ${reason}`);
+    },
     onComplete: async ({ data }) => {
       link._resource = null;
       try {
-        if (isPage) {
+        if (isPn) {
+          // Propagation /get RESPONSE: packed [request_id, response] (§11.2).
+          const { requestId, response } = parseResponse(data);
+          handlePnResponse(link, requestId, response);
+        } else if (isPage) {
           // Page RESPONSE: the packed [request_id, response] envelope (§11.2).
           const { requestId, response } = parseResponse(data);
           await handleNomadNetResponse(link, requestId, response);
@@ -2144,6 +2473,7 @@ function startResourceReceive(link, adv) {
           await dispatchIncomingMessage(msg, link._rxInfo || { rssi: null, snr: null, hops: 0, headerType: 0 });
         }
       } catch (e) {
+        if (isPn) pnRejectPending(link, e.message);
         log('err', `  Resource assembly handling failed: ${e.message}`);
       }
     },
@@ -4435,6 +4765,7 @@ async function connect(transportType) {
       log('err', 'Transport disconnected unexpectedly');
       if (announceTimer) { clearInterval(announceTimer); announceTimer = null; }
       if (outboundRetryTimer) { clearInterval(outboundRetryTimer); outboundRetryTimer = null; }
+      pnStopTimers();
       // Routing state is per-interface — different rnsd has a different
       // identity hash and a different mesh topology. Clear so a future
       // reconnect rediscovers everything from the next batch of announces
@@ -4511,6 +4842,7 @@ function markInterfaceReady() {
     outboundRetryTick().catch(e => log('info', `Retry tick error: ${e.message}`));
   }, MSG_RETRY_TICK_MS);
   outboundRetryTick().catch(e => log('info', `Retry tick error: ${e.message}`));
+  pnStartTimers();
 }
 
 // Wire every connect button (sidebar quick-connect, mobile hero,
@@ -4541,6 +4873,7 @@ document.querySelectorAll('.js-connect-btn').forEach(b => {
 $('btn-disconnect').addEventListener('click', async () => {
   if (announceTimer) { clearInterval(announceTimer); announceTimer = null; }
   if (outboundRetryTimer) { clearInterval(outboundRetryTimer); outboundRetryTimer = null; }
+  pnStopTimers();
   // Gracefully LINKCLOSE any active links before the transport drops, so
   // peers don't hold them open until their watchdog expires (SPEC §6.7.3).
   if (radioOn) await closeAllLinks();

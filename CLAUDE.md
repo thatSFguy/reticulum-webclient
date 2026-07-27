@@ -57,6 +57,7 @@ reticulum-webclient/
     link.js                 — Links: handshake, session crypto, keepalive
     resource.js             — Resource transfers over Links (send + receive)
     nomadnet.js, micron.js  — NomadNet page requests + micron renderer
+    propagation.js          — propagation-node /get wire-shape helpers (§5.8)
     known-destinations.js   — Well-known destination table
     transport-config.js     — Repeater config protocol (BLE GATT / Serial)
     transport-flasher-app.js— flasher.html controller
@@ -102,10 +103,11 @@ Everything from the original phased plan shipped long ago, plus a lot the plan d
 - Reactions (SPEC §5.9.8) and reply-to threading (SPEC §5.9.9), group-chat-relay compliant
 - Path requests (§7.1/§7.2.6 leaf duties) and HEADER_2 originator conversion (§2.3)
 - Contact cards (JSON, QR export/scan — byte-compatible with the mobile app)
+- **Propagation-node retrieval** (§5.8.3) — sync offline messages via `/get` over an identified Link (LINKIDENTIFY §6.7.6); auto-sync on connect + every 15 min
 
 ## Deferred (Not In Scope)
 
-- **Propagation nodes** — store-and-forward relay for offline recipients
+- **Propagation-node submission** — the outbound `PROPAGATED` method (handing our own sends to a node for offline recipients); we only retrieve
 - **Multi-hop transport** — full routing table (we are a leaf; the §2.3 HEADER_2 conversion + upstream transport_id is sufficient)
 - **LXMF stamps** — proof-of-work (skip unless target network requires it)
 - **IFAC** — interface authentication (IFAC-flagged packets are rejected at parse)

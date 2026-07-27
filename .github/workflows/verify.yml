@@ -75,10 +75,11 @@ jobs:
       - name: Install JS dependencies
         run: npm install
 
-      - name: Run JS unit tests (ALN tunnel, reply threading)
+      - name: Run JS unit tests (ALN tunnel, reply threading, propagation)
         run: |
           node tests/aln.mjs
           node tests/reply.mjs
+          node tests/propagation.mjs
 
       - name: Set up Python
         uses: actions/setup-python@v5

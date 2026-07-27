@@ -1044,6 +1044,26 @@ a { color: var(--accent); }
 
 .conn-pill-rp { padding: 2px 8px; }
 
+/* Propagation-node sync (Mailbox section + Settings card) */
+.pn-status {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  min-height: 14px;
+  word-break: break-word;
+}
+.pn-status.err { color: var(--err); }
+.pn-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-2);
+  padding: 8px 0;
+  cursor: pointer;
+}
+.pn-checkbox input { margin: 0; accent-color: var(--accent); cursor: pointer; }
+
 /* ================= Nodes view ================= */
 
 .view-nodes {
