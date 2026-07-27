@@ -765,6 +765,24 @@ a { color: var(--accent); }
   justify-content: flex-end;
 }
 
+/* Unseen incoming rows: accent edge on the bubble + a "new" chip in the
+   meta line. Applied per row — propagation sync can slot unseen rows into
+   the middle of the thread, so a single divider can't mark them all. */
+.message.msg-new {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.msg-new-pill {
+  display: inline-block;
+  padding: 0 6px;
+  background: var(--accent);
+  color: var(--accent-bg);
+  border-radius: 8px;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
 .message-state { font-family: var(--font-mono); font-size: 11px; }
 .message-state.pending   { color: var(--text-muted); }
 .message-state.sending   { color: var(--accent); }

@@ -197,6 +197,13 @@ let myIdentity = null;     // Identity instance
 let myDestHash = null;     // Our LXMF destination hash (16 bytes)
 let contacts = new Map();  // hash_hex → { hash, publicKey, displayName, destHash, identity, favorite }
 let activeContactHash = null;
+// Unread baseline for the open thread, frozen at selectContact time: rows
+// with a higher IDB id render with a "new" marker until the thread is next
+// reopened. Infinity until a thread is opened (nothing marked). The
+// persisted source of truth is contact.lastReadId — the highest message id
+// the user has had on screen for that thread; the sidebar badge counts
+// incoming rows above it.
+let activeThreadBaselineId = Infinity;
 // destHashHex of every contact we've exchanged a message with — drives the
 // "Messages = favorites + conversations" filter (matches reticulum-mobile-app:
 // the conversation list is message-history ∪ favorited messagable dests, not
@@ -397,8 +404,30 @@ async function initIdentity() {
   }
   // Seed the conversation set so the Messages filter knows which contacts
   // have history (one IDB read at startup; kept current on send/receive).
+  // The same pass rebuilds the per-contact unread badge: incoming rows with
+  // an id above the contact's persisted lastReadId are unread — so the
+  // badge survives reloads instead of living only in memory.
   try {
-    for (const m of await getAllMessages()) if (m.contactHash) conversedHashes.add(m.contactHash);
+    const perContactMaxId = new Map();
+    for (const m of await getAllMessages()) {
+      if (!m.contactHash) continue;
+      conversedHashes.add(m.contactHash);
+      perContactMaxId.set(m.contactHash,
+        Math.max(perContactMaxId.get(m.contactHash) || 0, m.id || 0));
+      const c = contacts.get(m.contactHash);
+      if (c && c.lastReadId != null && m.direction === 'incoming' && (m.id || 0) > c.lastReadId) {
+        c.unreadCount = (c.unreadCount || 0) + 1;
+      }
+    }
+    // One-time migration: contacts saved before read-tracking existed have
+    // no lastReadId. Treat their current history as read (a wall of stale
+    // badges on upgrade would drown the signal) and persist the watermark.
+    for (const [hash, c] of contacts) {
+      if (c.lastReadId == null) {
+        c.lastReadId = perContactMaxId.get(hash) || 0;
+        await saveContact(serializeContact(c));
+      }
+    }
   } catch (_) { /* non-fatal */ }
   // Node-store retention pass — after conversedHashes is seeded (the
   // protection set derives from it) and before the first Nodes render.
@@ -554,6 +583,7 @@ async function handleAnnounce(pkt, rssi) {
     userLabel: existingContact?.userLabel || null,
     pinned: !!existingContact?.pinned,
     favorite: !!existingContact?.favorite,
+    lastReadId: existingContact?.lastReadId ?? 0,
     lastSeen: Date.now(),
     rssi,
   };
@@ -561,7 +591,11 @@ async function handleAnnounce(pkt, rssi) {
   const identity = new Identity();
   await identity.loadFromPublicKey(announce.publicKey);
   const ratchetPubBytes = announce.ratchet ? new Uint8Array(announce.ratchet) : null;
-  contacts.set(destHashHex, { ...contact, identity, destHash: destHashBytes, ratchetPub: ratchetPubBytes });
+  contacts.set(destHashHex, {
+    ...contact, identity, destHash: destHashBytes, ratchetPub: ratchetPubBytes,
+    // In-memory only — an announce must not eat an unread badge.
+    unreadCount: existingContact?.unreadCount || 0,
+  });
 
   await saveContact(contact);
   scheduleRenderContactList();
@@ -1520,6 +1554,7 @@ async function dispatchIncomingMessage(msg, rxInfo) {
       ratchetPub: null,
       displayName: placeholderName,
       placeholder: true,
+      lastReadId: 0,
       lastSeen: Date.now(),
       rssi: rxInfo.rssi,
     };
@@ -1591,10 +1626,13 @@ async function dispatchIncomingMessage(msg, rxInfo) {
     await renderMessages(activeContactHash);
   }
   // Flag the contact as having unread traffic so the sidebar shows
-  // something even when the user isn't currently in that conversation.
+  // where the new messages are. Skip when the thread is on screen right
+  // now — the renderMessages call above already marked it read.
   const c = contacts.get(savedMsg.contactHash);
   if (c) {
-    c.unreadCount = (c.unreadCount || 0) + 1;
+    const onScreen = activeContactHash === savedMsg.contactHash
+      && (_activeView === null || _activeView === 'messages');
+    if (!onScreen) c.unreadCount = (c.unreadCount || 0) + 1;
     renderContactList();
   }
 }
@@ -3647,23 +3685,10 @@ async function togglePin(hash) {
   const c = contacts.get(hash);
   if (!c) return;
   c.pinned = !c.pinned;
-  // Persist to IDB. Strip the in-memory-only fields (Identity instance,
-  // raw byte arrays) into a plain serialisable object before writing.
-  const stored = {
-    hash: c.hash,
-    identityHash: c.identityHash,
-    publicKey: c.publicKey instanceof Uint8Array ? Array.from(c.publicKey) : (c.publicKey || []),
-    destHash: c.destHash instanceof Uint8Array ? Array.from(c.destHash) : c.destHash,
-    nameHash: c.nameHash instanceof Uint8Array ? Array.from(c.nameHash) : c.nameHash,
-    ratchetPub: c.ratchetPub instanceof Uint8Array ? Array.from(c.ratchetPub) : (c.ratchetPub || null),
-    displayName: c.displayName,
-    placeholder: !!c.placeholder,
-    pinned: c.pinned,
-    favorite: !!c.favorite,
-    lastSeen: c.lastSeen,
-    rssi: c.rssi,
-  };
-  await saveContact(stored);
+  // Persist to IDB, stripped of the in-memory-only fields (Identity
+  // instance, raw byte arrays). The shared serializer also keeps fields a
+  // hand-rolled copy here used to drop (userLabel, lastReadId).
+  await saveContact(serializeContact(c));
   renderContactList();
 }
 
@@ -3683,6 +3708,7 @@ function serializeContact(c) {
     placeholder: !!c.placeholder,
     pinned: !!c.pinned,
     favorite: !!c.favorite,
+    lastReadId: c.lastReadId || 0,
     lastSeen: c.lastSeen,
     rssi: c.rssi,
   };
@@ -3905,6 +3931,8 @@ async function importContactCard(card) {
     ratchetPub, displayName: card.displayName || destHash.slice(0, 8),
     userLabel: existing?.userLabel || null,
     placeholder: false, pinned: !!existing?.pinned, favorite: true,
+    lastReadId: existing?.lastReadId ?? 0,
+    unreadCount: existing?.unreadCount || 0,
     lastSeen: Date.now(), rssi: null, identity,
   };
   contacts.set(destHash, mem);
@@ -3925,6 +3953,7 @@ async function addManualHash(str) {
     hash: cleaned, identityHash: null, publicKey: [], destHash: hexToBytes(cleaned),
     nameHash: lxmfNameHash, ratchetPub: null, displayName: cleaned.slice(0, 8),
     userLabel: null, placeholder: true, pinned: false, favorite: true,
+    lastReadId: 0,
     lastSeen: Date.now(), rssi: null, identity: null,
   };
   contacts.set(cleaned, mem);
@@ -4085,14 +4114,17 @@ async function selectContact(hash) {
   clearStagedAttachment();  // don't carry a staged file into a different conversation
   clearReplyState();        // …nor a pending reply target (§5.9.9)
   const c = contacts.get(hash);
+  // Freeze the unread baseline for this viewing session: rows above it keep
+  // their "new" marker (and get scrolled to) until the thread is reopened.
+  activeThreadBaselineId = c?.lastReadId ?? Infinity;
   if (c) c.unreadCount = 0;
   $('conv-title').textContent = c ? c.displayName : hash.substring(0, 16);
   $('compose-area').classList.remove('hidden');
   renderContactList();
-  await renderMessages(hash);
+  await renderMessages(hash, { scrollToNew: true });
 }
 
-async function renderMessages(contactHash) {
+async function renderMessages(contactHash, { scrollToNew = false } = {}) {
   const list = $('message-list');
   const msgs = await getMessages(contactHash);
 
@@ -4132,15 +4164,20 @@ async function renderMessages(contactHash) {
     // the reaction-carrying LXMF is never its own bubble); skip them.
     if (msg.isReaction) continue;
     const div = document.createElement('div');
-    div.className = `message ${msg.direction}`;
+    // Unseen rows get a "new" marker. Per-row (not a single divider)
+    // because propagation sync slots new-but-older rows into the middle
+    // of the chronological thread, so the unseen set can be scattered.
+    const isNew = msg.direction === 'incoming' && (msg.id || 0) > activeThreadBaselineId;
+    div.className = `message ${msg.direction}${isNew ? ' msg-new' : ''}`;
     const ts = normalizeLxmfTimestamp(msg.timestamp);
     const time = ts != null ? formatMessageTime(ts) : '(no time)';
     const stateIcon = renderOutgoingStateIcon(msg);
     const rxMeta = renderIncomingRxMeta(msg);
+    const newPill = isNew ? ' <span class="msg-new-pill">new</span>' : '';
     const quote = renderReplyPreview(msg, byMessageId);
     const body = msg.content ? `<div class="message-text">${linkifyEscaped(msg.content)}</div>` : '';
     const reactions = renderReactions(msg.reactions);
-    div.innerHTML = `${quote}${renderAttachment(msg.attachment)}${body}${reactions}<div class="meta">${time}${stateIcon}${rxMeta}</div>`;
+    div.innerHTML = `${quote}${renderAttachment(msg.attachment)}${body}${reactions}<div class="meta">${time}${stateIcon}${rxMeta}${newPill}</div>`;
     // Tap-back affordance — only on incoming messages that carry a
     // canonical id to target (mirrors the mobile app: no self-reactions,
     // and rows received before reaction support have no messageId).
@@ -4173,7 +4210,31 @@ async function renderMessages(contactHash) {
     }
     list.appendChild(div);
   }
-  list.scrollTop = list.scrollHeight;
+  // On thread open, land on the first unseen row (which propagation sync
+  // may have slotted mid-thread) rather than the bottom.
+  const firstNew = scrollToNew ? list.querySelector('.message.msg-new') : null;
+  if (firstNew) {
+    list.scrollTop = 0;
+    const delta = firstNew.getBoundingClientRect().top - list.getBoundingClientRect().top;
+    list.scrollTop = Math.max(0, delta - 60);
+  } else {
+    list.scrollTop = list.scrollHeight;
+  }
+
+  // Mark the thread read up to the newest row just painted — but only when
+  // the Messages view is actually on screen (renders fired while the user
+  // is on another view must not eat the unread state). _activeView is null
+  // until the first explicit switch; Messages is the view visible at boot.
+  if (_activeView === null || _activeView === 'messages') {
+    const c = contacts.get(contactHash);
+    const maxId = msgs.reduce((acc, m) => Math.max(acc, m.id || 0), 0);
+    if (c && maxId > (c.lastReadId ?? -1)) {
+      c.lastReadId = maxId;
+      c.unreadCount = 0;
+      saveContact(serializeContact(c)).catch(() => {});
+      renderContactList();
+    }
+  }
 }
 
 // Reply-quote preview at the top of a reply bubble (SPEC §5.9.9). Resolve
@@ -4494,6 +4555,11 @@ function switchView(name) {
   document.querySelectorAll('[data-view]').forEach(n => {
     n.classList.toggle('active', n.dataset.view === name);
   });
+  // Catch up the open thread on return: renders that fired while this
+  // view was hidden deliberately did not mark anything read.
+  if (name === 'messages' && activeContactHash) {
+    renderMessages(activeContactHash).catch(() => { /* best effort */ });
+  }
   // Leaflet needs a sized container to lay out. The first time the
   // Nodes view is opened we create the map; on every subsequent
   // visit we invalidate its size so it recomputes against whatever
