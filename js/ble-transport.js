@@ -32,14 +32,19 @@ export class BleTransport {
   }
 
   // Request a BLE device that advertises NUS, connect, and subscribe.
-  async connect() {
+  //
+  // extraFilters broadens the chooser for firmwares whose ad packet lacks
+  // the NUS UUID (ALN nodes advertise only their config service + name;
+  // NUS is only discoverable post-connect). Chrome ORs the filter list,
+  // so NUS-advertising devices always still match.
+  async connect({ extraFilters = [] } = {}) {
     if (!navigator.bluetooth) {
       throw new Error('Web Bluetooth not supported in this browser');
     }
 
     this._log('Requesting BLE device with NUS service...');
     this.device = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [NUS_SERVICE_UUID] }],
+      filters: [{ services: [NUS_SERVICE_UUID] }, ...extraFilters],
       optionalServices: [NUS_SERVICE_UUID],
     });
 

@@ -40,6 +40,14 @@ import { parsePacket, PACKET_TYPE_NAMES } from './reticulum.js';
 const POLL_TICK_MS       = 5_000;     // resolve retries while sends are buffered
 const DIRDUMP_INTERVAL_MS = 600_000;  // slow re-enumeration safety net
 
+// ALN nodes don't put the NUS UUID in their advertisement — only their
+// repeater-config service and the "ALN-…" name (in the scan response).
+// Chrome's chooser matches on advertisement contents, so filtering by NUS
+// alone hides every ALN node. Match what they actually broadcast; NUS is
+// still reachable after connect (it's in optionalServices).
+const ALN_NAME_PREFIX = 'ALN';
+const RLR_SERVICE_UUID = '00000000-a5a5-524c-7272-00000100726c'; // advertised config service
+
 export class AlnInterface {
   // selfIdHex: our 16-byte LXMF destination hash (32 hex) — the directory id.
   // fallbackPeerHex: optional static gateway node id (blank = directory only).
@@ -80,7 +88,12 @@ export class AlnInterface {
       this._demux.reset();
       if (this._onDisconnect) this._onDisconnect();
     };
-    await this.transport.connect();
+    await this.transport.connect({
+      extraFilters: [
+        { namePrefix: ALN_NAME_PREFIX },
+        { services: [RLR_SERVICE_UUID] },
+      ],
+    });
     this._demux.reset();
     this._inboundQueue = [];
 
