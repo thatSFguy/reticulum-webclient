@@ -2088,18 +2088,30 @@ async function pnCandidateNodes() {
   return nodes;
 }
 
+// Parsed §5.8.5 announce app_data for a stored node, or null when the
+// announce didn't carry the 7-element shape.
+function pnNodeState(node) {
+  return parsePnAppData(node.appDataHex ? hexToBytes(node.appDataHex) : new Uint8Array(0));
+}
+
 // The node to sync with: the user's Settings pick if it's still known,
-// otherwise the most recently heard one.
+// otherwise the freshest ACTIVE one. A paused node (announce element [2]
+// false) holds the Link open but never answers /get — every request just
+// times out — so auto mode only falls back to a paused node when nothing
+// else has been heard.
 async function pnPickNode() {
   const nodes = await pnCandidateNodes();
   if (!nodes.length) return null;
   let preferred = '';
   try { preferred = localStorage.getItem(PN_NODE_KEY) || ''; } catch (_) {}
-  return nodes.find(n => n.hash === preferred) || nodes[0];
+  const pinned = nodes.find(n => n.hash === preferred);
+  if (pinned) return pinned;
+  const active = nodes.filter(n => pnNodeState(n)?.active !== false);
+  return active[0] || nodes[0];
 }
 
 function pnNodeLabel(node) {
-  const state = parsePnAppData(node.appDataHex ? hexToBytes(node.appDataHex) : new Uint8Array(0));
+  const state = pnNodeState(node);
   const paused = state && !state.active ? ' (paused)' : '';
   return `${(node.userLabel || node.hash.slice(0, 12) + '…')}${paused}`;
 }
@@ -2121,8 +2133,9 @@ async function sendLinkIdentify(link) {
 
 // One /get REQUEST on the sync link; resolves with the decoded RESPONSE
 // value. Correlation is by request_id — the truncated hash of the request
-// packet's wire bytes (§11.1) — checked in handlePnResponse.
-async function pnRequest(link, data, timeoutMs = 30000) {
+// packet's wire bytes (§11.1) — checked in handlePnResponse. `label` names
+// the round in the timeout error so failures are diagnosable.
+async function pnRequest(link, data, timeoutMs = 30000, label = 'request') {
   const body = await buildRequest(PN_GET_PATH, data);
   const enc = await link.encrypt(body);
   const packet = buildPacket({
@@ -2135,7 +2148,7 @@ async function pnRequest(link, data, timeoutMs = 30000) {
       expectedId: fullHash.subarray(0, 16),
       resolve, reject,
       timer: setTimeout(() => {
-        if (link._pnPending) { link._pnPending = null; reject(new Error('request timed out')); }
+        if (link._pnPending) { link._pnPending = null; reject(new Error(`${label} timed out`)); }
       }, timeoutMs),
     };
     rnode.sendPacket(packet).catch((e) => {
@@ -2208,6 +2221,20 @@ async function pnSyncNow(trigger = 'manual') {
   const node = await pnPickNode();
   if (!node) { pnSetStatus(manual ? 'no propagation node heard yet — wait for an announce' : ''); return; }
 
+  // A paused node won't answer /get — don't burn auto-syncs on it. A
+  // manual sync still tries (the announce may be stale), with a warning.
+  const state = pnNodeState(node);
+  if (state && !state.active) {
+    if (!manual) {
+      log('info', `  PN sync: skipped — only paused node ${node.hash.slice(0, 12)}… known`);
+      return;
+    }
+    pnSetStatus('note: node announced itself paused — it may not answer');
+  }
+  if (state && state.stampCost > 0) {
+    log('info', `  PN sync: node advertises retrieval stamp cost ${state.stampCost} — stamps are not implemented, the node may refuse or ignore us`);
+  }
+
   pnState.syncing = true;
   pnState.lastAttemptAt = Date.now();
   const label = pnNodeLabel(node);
@@ -2221,7 +2248,7 @@ async function pnSyncNow(trigger = 'manual') {
     });
     await sendLinkIdentify(link);
 
-    const listing = await pnRequest(link, [null, null]);
+    const listing = await pnRequest(link, [null, null], 30000, 'mailbox listing');
     if (pnResponseIsError(listing)) throw new Error(pnErrorName(Number(listing)));
     const ids = normalizeIdList(listing);
 
@@ -2239,7 +2266,7 @@ async function pnSyncNow(trigger = 'manual') {
       const wanted = fresh.splice(0, PN_WANTED_PER_ROUND);
       const acks = ackQueue.splice(0, PN_WANTED_PER_ROUND);
       if (wanted.length) pnSetStatus(`fetching ${wanted.length} message${wanted.length > 1 ? 's' : ''}…`);
-      const resp = await pnRequest(link, [wanted, acks, PN_TRANSFER_LIMIT_KB], 120000);
+      const resp = await pnRequest(link, [wanted, acks, PN_TRANSFER_LIMIT_KB], 120000, 'message fetch');
       if (pnResponseIsError(resp)) throw new Error(pnErrorName(Number(resp)));
       if (!wanted.length) continue;  // pure ack round
       const bundle = normalizeMessageBundle(resp);
@@ -2258,7 +2285,14 @@ async function pnSyncNow(trigger = 'manual') {
       ? `synced — ${ingested} new message${ingested > 1 ? 's' : ''}${failNote}${leftovers}`
       : `synced — no new messages${failNote}`);
   } catch (e) {
-    pnSetStatus(`sync failed: ${e.message}`, 'err');
+    // A timeout after a successful link handshake means the node is
+    // reachable but not serving — paused, stamp-gated, or misbehaving.
+    const hint = /timed out/.test(e.message) && link
+      ? (state && !state.active
+        ? ' (node is paused — pick another in Settings)'
+        : ' (node reachable but not answering — it may be paused or require stamps; try another node)')
+      : '';
+    pnSetStatus(`sync failed: ${e.message}${hint}`, 'err');
   } finally {
     if (link) { pnRejectPending(link, 'sync ended'); closeLink(link).catch(() => {}); }
     pnState.syncing = false;
