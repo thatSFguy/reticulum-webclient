@@ -2577,7 +2577,10 @@ function startResourceReceive(link, adv) {
   const isPage = !isPn && !!link._nnRequest;
   if (isPn) log('info', `  Receiving propagation bundle (${adv.parts} parts) on link ${toHex(link.linkId).substring(0,12)}...`);
   else if (isPage) nnSetStatus(`receiving page (${adv.parts} parts)…`);
-  else log('info', `  Receiving LXMF resource (${adv.parts} parts) on link ${toHex(link.linkId).substring(0,12)}...`);
+  else log('info', `  Receiving LXMF resource (${adv.parts} parts, ${fmtBytesShort(adv.transferSize || 0)}) on link ${toHex(link.linkId).substring(0,12)}...`);
+
+  const rxStartedAt = Date.now();
+  let rxLastDecile = -1;
 
   link._resource = new ResourceReceiver(link, adv, {
     maxSize: isPage ? NN_MAX_RESOURCE : undefined,
@@ -2588,8 +2591,19 @@ function startResourceReceive(link, adv) {
     stallMs:   announceClass(activeTransport) === 'lora' ? 25000 : 12000,
     send: makeResourceSend(link),
     onProgress: (frac) => {
-      if (isPage) nnSetStatus(`receiving page… ${Math.round(frac * 100)}%`);
-      else if (isPn) pnSetStatus(`downloading messages… ${Math.round(frac * 100)}%`);
+      if (isPage) { nnSetStatus(`receiving page… ${Math.round(frac * 100)}%`); return; }
+      if (isPn) { pnSetStatus(`downloading messages… ${Math.round(frac * 100)}%`); return; }
+      // Inbound large LXMF (image/file): decile-throttled progress with rate,
+      // so a minutes-long LoRa transfer visibly moves in the log.
+      const decile = Math.floor(frac * 10);
+      if (decile > rxLastDecile) {
+        rxLastDecile = decile;
+        const bytes = frac * (adv.transferSize || 0);
+        const elapsed = (Date.now() - rxStartedAt) / 1000;
+        const rate = elapsed > 0 ? bytes / elapsed : 0;
+        const eta = rate > 0 ? ((adv.transferSize || 0) - bytes) / rate : NaN;
+        log('info', `  Receiving resource… ${Math.round(frac * 100)}% (${fmtBytesShort(rate)}/s, ~${fmtDurationShort(eta)} left)`);
+      }
     },
     onError: (reason) => {
       link._resource = null;
@@ -3355,21 +3369,45 @@ async function sendLxmfOverLink(contact, content, title, fields, rowId = null) {
     await sendViaLink(link, container);
     return false;
   }
-  await new Promise((resolve, reject) => {
-    const sender = new ResourceSender(link, container, {
-      send: makeResourceSend(link),
-      // Slow-mesh shaping: 192B slices keep each part packet (19B header +
-      // slice) inside the ALN 214B single-frame cutoff — no SAR per part —
-      // and pacing to ~channel rate stops a window burst from overrunning
-      // the node's shallow tx queues (that burst was the image-send hang).
-      sdu:      announceClass(activeTransport) === 'lora' ? 192 : undefined,
-      pacingMs: announceClass(activeTransport) === 'lora' ? 1200 : 0,
-      onComplete: resolve,
-      onError: (r) => reject(new Error(r)),
+  const startedAt = Date.now();
+  let lastLoggedDecile = -1;
+  try {
+    await new Promise((resolve, reject) => {
+      const sender = new ResourceSender(link, container, {
+        send: makeResourceSend(link),
+        // Slow-mesh shaping: 192B slices keep each part packet (19B header +
+        // slice) inside the ALN 214B single-frame cutoff — no SAR per part —
+        // and pacing to ~channel rate stops a window burst from overrunning
+        // the node's shallow tx queues (that burst was the image-send hang).
+        sdu:      announceClass(activeTransport) === 'lora' ? 192 : undefined,
+        pacingMs: announceClass(activeTransport) === 'lora' ? 1200 : 0,
+        onProgress: (sent, total, bytes, totalBytes) => {
+          const elapsed = (Date.now() - startedAt) / 1000;
+          const rate = elapsed > 0 ? bytes / elapsed : 0;
+          const eta = rate > 0 ? (totalBytes - bytes) / rate : NaN;
+          const pct = Math.floor((sent / total) * 100);
+          if (rowId != null) {
+            activeSendProgress.set(rowId, {
+              pct, rate,
+              detail: `${fmtBytesShort(bytes)} of ${fmtBytesShort(totalBytes)} · part ${sent}/${total} · ~${fmtDurationShort(eta)} left`,
+            });
+            paintSendProgress(rowId);
+          }
+          const decile = Math.floor((sent / total) * 10);
+          if (decile > lastLoggedDecile) {
+            lastLoggedDecile = decile;
+            log('info', `  Resource send ${pct}% — ${fmtBytesShort(bytes)}/${fmtBytesShort(totalBytes)} at ${fmtBytesShort(rate)}/s, ~${fmtDurationShort(eta)} left`);
+          }
+        },
+        onComplete: resolve,
+        onError: (r) => reject(new Error(r)),
+      });
+      link._resourceSender = sender;
+      sender.start().catch(reject);
     });
-    link._resourceSender = sender;
-    sender.start().catch(reject);
-  });
+  } finally {
+    if (rowId != null) { activeSendProgress.delete(rowId); paintSendProgress(rowId); }
+  }
   return true;
 }
 
@@ -4252,6 +4290,7 @@ async function renderMessages(contactHash, { scrollToNew = false } = {}) {
     // of the chronological thread, so the unseen set can be scattered.
     const isNew = msg.direction === 'incoming' && (msg.id || 0) > activeThreadBaselineId;
     div.className = `message ${msg.direction}${isNew ? ' msg-new' : ''}`;
+    if (msg.id != null) div.dataset.rowId = msg.id;   // live transfer-progress hook
     const ts = normalizeLxmfTimestamp(msg.timestamp);
     const time = ts != null ? formatMessageTime(ts) : '(no time)';
     const stateIcon = renderOutgoingStateIcon(msg);
@@ -4484,6 +4523,35 @@ function renderIncomingRxMeta(msg) {
   return ` <span class="rx-meta">${escapeHtml(parts.join(' · '))}</span>`;
 }
 
+// Live Resource-transfer progress for outgoing rows, keyed by DB row id.
+// Written by sendLxmfOverLink's onProgress, painted in place on the bubble's
+// state icon (no full thread re-render per part \u2014 at LoRa rates that's an
+// update every ~1.2s for minutes). Cleared when the transfer settles.
+const activeSendProgress = new Map();
+
+function fmtBytesShort(n) {
+  if (!Number.isFinite(n) || n < 0) return '?';
+  if (n < 1024) return `${Math.round(n)} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function fmtDurationShort(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return '?';
+  if (sec < 90) return `${Math.round(sec)}s`;
+  return `${Math.round(sec / 60)} min`;
+}
+
+// Patch the sending bubble's state icon in place with current progress.
+function paintSendProgress(rowId) {
+  const el = document.querySelector(`.message[data-row-id="${rowId}"] .message-state.sending`);
+  if (!el) return;
+  const p = activeSendProgress.get(rowId);
+  if (!p) { el.textContent = '\u2191'; el.title = ''; return; }
+  el.textContent = `\u2191 ${p.pct}% \u00B7 ${fmtBytesShort(p.rate)}/s`;
+  el.title = p.detail;
+}
+
 // Small state indicator for outgoing rows. Returns HTML that lives
 // inline next to the timestamp in the message meta line. Incoming
 // rows and legacy outgoing rows (saved before the retry queue
@@ -4499,10 +4567,17 @@ function renderOutgoingStateIcon(msg) {
   };
   const entry = labels[msg.state];
   if (!entry) return '';
-  const [glyph, cls] = entry;
-  const title = msg.state === MSG_STATE_FAILED && msg.lastError
+  let [glyph, cls] = entry;
+  let title = msg.state === MSG_STATE_FAILED && msg.lastError
     ? ` title="${escapeHtml(msg.lastError)}"`
     : '';
+  // A row mid-Resource-transfer renders with its live progress so a
+  // re-render (new message, reaction) doesn't wipe the readout.
+  const p = msg.state === MSG_STATE_SENDING && msg.id != null ? activeSendProgress.get(msg.id) : null;
+  if (p) {
+    glyph = `\u2191 ${p.pct}% \u00B7 ${fmtBytesShort(p.rate)}/s`;
+    title = ` title="${escapeHtml(p.detail)}"`;
+  }
   return ` <span class="message-state ${cls}"${title}>${glyph}</span>`;
 }
 

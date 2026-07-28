@@ -392,6 +392,12 @@ export class ResourceSender {
     // pacing to ~channel rate keeps every part inside per-hop ARQ cover.
     this.sdu = opts.sdu || SDU;
     this.pacingMs = opts.pacingMs || 0;
+    // onProgress(servedParts, totalParts, servedBytes, totalBytes) — fired
+    // after each part goes out. Counts DISTINCT parts (a re-requested part
+    // doesn't move the bar), so the fraction is honest under stall recovery.
+    this.onProgress = opts.onProgress || (() => {});
+    this._served = new Set();
+    this._servedBytes = 0;
     this.done = false;
   }
 
@@ -416,6 +422,7 @@ export class ResourceSender {
     }
     if (this.parts.length === 0) this.parts.push(new Uint8Array(0));
     this.totalParts = this.parts.length;
+    this.transferSize = encrypted.length;   // wire bytes, for progress/rate
 
     this.mapHashes = [];
     this.partByMapHash = new Map();
@@ -450,9 +457,15 @@ export class ResourceSender {
     if (!arraysEqual(resHash, this.hash)) return;  // not ours
 
     for (; off + MAPHASH_LEN <= plaintext.length; off += MAPHASH_LEN) {
-      const part = this.partByMapHash.get(hex(plaintext.subarray(off, off + MAPHASH_LEN)));
+      const mhHex = hex(plaintext.subarray(off, off + MAPHASH_LEN));
+      const part = this.partByMapHash.get(mhHex);
       if (!part) continue;
       await this.send(CTX_RESOURCE, part, false);  // raw slice
+      if (!this._served.has(mhHex)) {
+        this._served.add(mhHex);
+        this._servedBytes += part.length;
+        this.onProgress(this._served.size, this.totalParts, this._servedBytes, this.transferSize || 0);
+      }
       if (this.pacingMs && !this.done) {
         await new Promise((r) => setTimeout(r, this.pacingMs));
       }
