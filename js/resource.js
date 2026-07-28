@@ -100,6 +100,18 @@ export class ResourceReceiver {
     this.onError = opts.onError || (() => {});
     this.onProgress = opts.onProgress || (() => {});
     this.maxSize = opts.maxSize || DEFAULT_MAX_SIZE;
+    // Slow-transport knobs (set by the caller for lora-class transports):
+    // maxWindow caps §10.10 window growth — the ALN node's tunnel/tx queues
+    // are shallow, and a burst larger than they hold guarantees a dropped
+    // part. stallMs arms a re-request watchdog: without one, a single lost
+    // part left `outstanding` non-empty FOREVER (the next window is only
+    // requested when all outstanding parts arrive) — the observed image-
+    // transfer hang. 0 disables.
+    this.maxWindow = opts.maxWindow || 16;
+    this.stallMs = opts.stallMs || 0;
+    this._stallRetries = opts.stallRetries ?? 5;
+    this.stallRetriesLeft = this._stallRetries;
+    this._stallTimer = null;
 
     this.totalParts = adv.parts;
     this.parts = new Array(this.totalParts).fill(null);
@@ -112,6 +124,28 @@ export class ResourceReceiver {
 
     // Seed the hashmap from the advertisement fragment.
     this._ingestHashmap(adv.hashmapFragment);
+  }
+
+  _armStall() {
+    if (!this.stallMs || this.done) return;
+    clearTimeout(this._stallTimer);
+    this._stallTimer = setTimeout(() => this._onStall(), this.stallMs);
+  }
+
+  _onStall() {
+    if (this.done) return;
+    if (this.stallRetriesLeft-- <= 0) {
+      this._fail(`stalled: ${this.outstanding.size} part(s) outstanding, retries exhausted`);
+      return;
+    }
+    // Shrink back to the initial window (loss = the burst was too big for
+    // the path) and re-request everything still missing. A lost HMU is
+    // recovered the same way — waitingHMU is cleared so _requestNext can
+    // re-issue the exhausted REQ.
+    this.window = INITIAL_WINDOW;
+    this.outstanding.clear();
+    this.waitingHMU = false;
+    this._requestNext();
   }
 
   // Kick off the transfer (caps check + first request).
@@ -155,6 +189,7 @@ export class ResourceReceiver {
         ...requested,
       ]);
       this.send(CTX_RESOURCE_REQ, body, false);
+      this._armStall();
       return;
     }
 
@@ -170,6 +205,7 @@ export class ResourceReceiver {
       ]);
       this.waitingHMU = true;
       this.send(CTX_RESOURCE_REQ, body, false);
+      this._armStall();
     }
     // else: everything known and requested — completion is driven by handlePart.
   }
@@ -177,9 +213,15 @@ export class ResourceReceiver {
   // An inbound RESOURCE (0x01) part: a raw slice, matched by SHA256(slice||r)[:4].
   async handlePart(sliceBytes) {
     if (this.done) return;
+    this._armStall();              // any part activity = the sender is alive
     const mh = (await sha256(concatBytes([sliceBytes, this.adv.randomHash]))).subarray(0, MAPHASH_LEN);
     const mhHex = hex(mh);
     if (!this.outstanding.has(mhHex)) return;  // unrequested / duplicate
+    // A requested part arrived = real progress. Replenish the stall budget so
+    // it only counts CONSECUTIVE silent periods (upstream's MAX_RETRIES is
+    // likewise no-progress-rounds) — a long transfer trickling over a slow
+    // far path must not exhaust a lifetime total and fail mid-way.
+    this.stallRetriesLeft = this._stallRetries;
 
     // Place into the first matching empty slot within the known hashmap.
     for (let i = 0; i < this.knownHashmap.length; i++) {
@@ -196,7 +238,7 @@ export class ResourceReceiver {
       await this._assemble();
     } else if (this.outstanding.size === 0) {
       // Grow the window each completed round (§10.10), then ask for more.
-      if (this.window < 16) this.window++;
+      if (this.window < this.maxWindow) this.window++;
       this._requestNext();
     }
   }
@@ -227,6 +269,7 @@ export class ResourceReceiver {
   cancel(reason = 'cancelled by sender') {
     if (this.done) return;
     this.done = true;
+    clearTimeout(this._stallTimer);
     this.onError(reason);
   }
 
@@ -263,6 +306,7 @@ export class ResourceReceiver {
       }
 
       this.done = true;
+      clearTimeout(this._stallTimer);
 
       // Emit the proof: resource_hash(32) || SHA256(plaintext || resource_hash) (§10.8).
       const fullProof = await sha256(concatBytes([plaintext, this.adv.hash]));
@@ -286,6 +330,7 @@ export class ResourceReceiver {
   _fail(reason) {
     if (this.done) return;
     this.done = true;
+    clearTimeout(this._stallTimer);
     // §10.9: RESOURCE_RCL on ANY receiver-side abort, not just advertisement
     // reject (matches RNS >= 1.3.9) — otherwise the sender keeps
     // retransmitting until its watchdog gives up. Inbound ICL takes the
@@ -336,6 +381,17 @@ export class ResourceSender {
     this.isRequest = !!opts.isRequest;
     this.onComplete = opts.onComplete || (() => {});
     this.onError = opts.onError || (() => {});
+    // Slow-transport knobs (caller sets these for lora-class transports):
+    // sdu — part slice size. The default 464 (RNS MTU maths) makes each part
+    // a ~484B packet that the ALN node must SAR-fragment; 192 keeps the whole
+    // link DATA packet (19B header + slice) inside the mesh's 214B single-
+    // frame cutoff — the same change that made texts fast. Sender-internal:
+    // the receiver reassembles by hashmap order whatever the slice size.
+    // pacingMs — inter-part gap when serving a window. Firing a window
+    // back-to-back overran the node's shallow queues (guaranteed drop);
+    // pacing to ~channel rate keeps every part inside per-hop ARQ cover.
+    this.sdu = opts.sdu || SDU;
+    this.pacingMs = opts.pacingMs || 0;
     this.done = false;
   }
 
@@ -355,8 +411,8 @@ export class ResourceSender {
 
     // Slice the encrypted whole into parts; fingerprint each to a 4-byte map hash.
     this.parts = [];
-    for (let off = 0; off < encrypted.length; off += SDU) {
-      this.parts.push(encrypted.subarray(off, off + SDU));
+    for (let off = 0; off < encrypted.length; off += this.sdu) {
+      this.parts.push(encrypted.subarray(off, off + this.sdu));
     }
     if (this.parts.length === 0) this.parts.push(new Uint8Array(0));
     this.totalParts = this.parts.length;
@@ -395,7 +451,11 @@ export class ResourceSender {
 
     for (; off + MAPHASH_LEN <= plaintext.length; off += MAPHASH_LEN) {
       const part = this.partByMapHash.get(hex(plaintext.subarray(off, off + MAPHASH_LEN)));
-      if (part) await this.send(CTX_RESOURCE, part, false);  // raw slice
+      if (!part) continue;
+      await this.send(CTX_RESOURCE, part, false);  // raw slice
+      if (this.pacingMs && !this.done) {
+        await new Promise((r) => setTimeout(r, this.pacingMs));
+      }
     }
 
     if (exhausted === HASHMAP_IS_EXHAUSTED && lastMapHash) {
