@@ -2571,6 +2571,11 @@ function startResourceReceive(link, adv) {
 
   link._resource = new ResourceReceiver(link, adv, {
     maxSize: isPage ? NN_MAX_RESOURCE : undefined,
+    // Slow-mesh shaping: cap the §10.10 window (the ALN node queues ~4
+    // frames — a bigger burst guarantees a dropped part) and arm the stall
+    // watchdog so a lost part re-requests instead of hanging forever.
+    maxWindow: announceClass(activeTransport) === 'lora' ? 4 : 16,
+    stallMs:   announceClass(activeTransport) === 'lora' ? 25000 : 12000,
     send: makeResourceSend(link),
     onProgress: (frac) => {
       if (isPage) nnSetStatus(`receiving page… ${Math.round(frac * 100)}%`);
@@ -3343,6 +3348,12 @@ async function sendLxmfOverLink(contact, content, title, fields, rowId = null) {
   await new Promise((resolve, reject) => {
     const sender = new ResourceSender(link, container, {
       send: makeResourceSend(link),
+      // Slow-mesh shaping: 192B slices keep each part packet (19B header +
+      // slice) inside the ALN 214B single-frame cutoff — no SAR per part —
+      // and pacing to ~channel rate stops a window burst from overrunning
+      // the node's shallow tx queues (that burst was the image-send hang).
+      sdu:      announceClass(activeTransport) === 'lora' ? 192 : undefined,
+      pacingMs: announceClass(activeTransport) === 'lora' ? 1200 : 0,
       onComplete: resolve,
       onError: (r) => reject(new Error(r)),
     });
