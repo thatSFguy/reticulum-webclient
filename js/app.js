@@ -44,10 +44,22 @@ const MSG_STATE_DELIVERED = 'delivered';  // inbound PROOF matched this packet h
 const MSG_STATE_FAILED    = 'failed';     // all retries exhausted
 
 const MSG_MAX_ATTEMPTS = 3;
-// Wait-for-ack schedule. Index is (attempts - 1): first entry is
-// the wait after the 1st send, second is after the 2nd retransmit,
-// etc. After MSG_MAX_ATTEMPTS attempts the row transitions to failed.
-const MSG_BACKOFF_MS = [5000, 15000, 60000];
+// Wait-for-ack schedule, per transport class. Index is (attempts - 1): first
+// entry is the wait after the 1st send, second after the 2nd retransmit, etc.
+// The lora schedule must exceed the mesh's REAL proof round-trip (~3-8s over
+// ALN with contention): the old flat 5s first-retry fired before the proof of
+// a SUCCESSFUL delivery could return, so nearly every message was transmitted
+// twice — doubling airtime on the slowest link in the system and queueing
+// behind itself at the node. A retry below the real RTT isn't insurance, it's
+// self-inflicted congestion (same lesson as the link-establishment patience).
+const MSG_BACKOFF_BY_CLASS = {
+  tcp:  [5000, 15000, 60000],
+  lora: [12000, 30000, 90000],
+};
+function msgBackoffMs(index) {
+  const sched = MSG_BACKOFF_BY_CLASS[announceClass(activeTransport)] || MSG_BACKOFF_BY_CLASS.tcp;
+  return sched[Math.min(index, sched.length - 1)];
+}
 const MSG_RETRY_TICK_MS = 5000;
 
 // ---- ALN/LoRa reliability knobs (2026-07-27 investigation §9) --------
@@ -62,7 +74,10 @@ const RATCHET_ROTATE_MS = 30 * 60 * 1000;
 // Minimum gaps between announce emissions: event bursts contend for the
 // ALN node's single outbound SAR slot and starve real traffic.
 const ANNOUNCE_MIN_GAP_MS = 60 * 1000;
-const PATH_RESPONSE_MIN_GAP_MS = 10 * 1000;   // solicited — allowed sooner
+const PATH_RESPONSE_MIN_GAP_MS = 5 * 1000;    // solicited — must fit inside the
+                                              // requester's PATH_REQUEST_WAIT_MS
+                                              // (5s) or their send stalls the
+                                              // full window and goes out pathless
 let lastAnnounceAt = 0;
 let lastPathResponseAt = 0;
 let lastRatchetRotateAt = (() => {
@@ -3488,10 +3503,9 @@ async function doOutboundSend(id) {
     // Re-read and don't downgrade it back to SENT.
     if ((await getMessageById(id))?.state === MSG_STATE_DELIVERED) return;
     const moreAttempts = attemptNumber < MSG_MAX_ATTEMPTS;
-    const sentBackoffIndex = Math.min(attemptNumber - 1, MSG_BACKOFF_MS.length - 1);
     await updateMessage(id, {
       state: MSG_STATE_SENT,
-      nextRetryAt: moreAttempts ? Date.now() + MSG_BACKOFF_MS[sentBackoffIndex] : 0,
+      nextRetryAt: moreAttempts ? Date.now() + msgBackoffMs(attemptNumber - 1) : 0,
       lastError: null,
     });
     if (!moreAttempts) {
@@ -3504,10 +3518,9 @@ async function doOutboundSend(id) {
     // while this attempt was failing — don't bury DELIVERED under FAILED.
     if ((await getMessageById(id))?.state === MSG_STATE_DELIVERED) return;
     const isFinal = attemptNumber >= MSG_MAX_ATTEMPTS;
-    const backoffIndex = Math.min(attemptNumber - 1, MSG_BACKOFF_MS.length - 1);
     await updateMessage(id, {
       state: isFinal ? MSG_STATE_FAILED : MSG_STATE_PENDING,
-      nextRetryAt: isFinal ? 0 : Date.now() + MSG_BACKOFF_MS[backoffIndex],
+      nextRetryAt: isFinal ? 0 : Date.now() + msgBackoffMs(attemptNumber - 1),
       lastError: e.message,
     });
   }
