@@ -109,7 +109,8 @@ export class ResourceReceiver {
     // transfer hang. 0 disables.
     this.maxWindow = opts.maxWindow || 16;
     this.stallMs = opts.stallMs || 0;
-    this.stallRetriesLeft = opts.stallRetries ?? 5;
+    this._stallRetries = opts.stallRetries ?? 5;
+    this.stallRetriesLeft = this._stallRetries;
     this._stallTimer = null;
 
     this.totalParts = adv.parts;
@@ -216,6 +217,11 @@ export class ResourceReceiver {
     const mh = (await sha256(concatBytes([sliceBytes, this.adv.randomHash]))).subarray(0, MAPHASH_LEN);
     const mhHex = hex(mh);
     if (!this.outstanding.has(mhHex)) return;  // unrequested / duplicate
+    // A requested part arrived = real progress. Replenish the stall budget so
+    // it only counts CONSECUTIVE silent periods (upstream's MAX_RETRIES is
+    // likewise no-progress-rounds) — a long transfer trickling over a slow
+    // far path must not exhaust a lifetime total and fail mid-way.
+    this.stallRetriesLeft = this._stallRetries;
 
     // Place into the first matching empty slot within the known hashmap.
     for (let i = 0; i < this.knownHashmap.length; i++) {

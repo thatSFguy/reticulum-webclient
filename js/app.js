@@ -1199,16 +1199,48 @@ async function handleData(pkt, rxInfo) {
 
   if (!matches) return;
 
-  log('info', '  Packet addressed to us — proving receipt, then attempting decrypt...');
+  log('info', '  Packet addressed to us — attempting decrypt...');
 
-  // Send the opportunistic delivery PROOF on RECEIPT, before decrypt —
-  // upstream RNS destinations run PROVE_ALL: Packet.prove() answers any
-  // packet addressed to us with a PROOF whose destHash is the first 16
-  // bytes of the packet's full SHA-256 and whose payload is an Ed25519
-  // signature over the full 32-byte hash. Proving only after a successful
-  // decrypt (the old order here) turned every receiver-side decrypt
-  // hiccup into sender-side retry congestion: the sender retransmitted
-  // the SAME undecryptable bytes on the full backoff schedule.
+  // Try the current ratchet, then the persisted retired-ratchet ring
+  // (senders on a stale announce — the normal case on a slow mesh —
+  // encrypt to a key we've already rotated past), then the long-term
+  // identity X25519 key for senders with no ratchet cached at all.
+  // Declared outside the try — the catch logs how many keys were tried.
+  const candidatePrivs = [
+    myIdentity.ratchetPrivKey,
+    ...myIdentity.prevRatchets,
+    myIdentity.encPrivKey,
+  ].filter(Boolean);
+
+  let plaintext;
+  try {
+    plaintext = await decrypt(pkt.payload, candidatePrivs, myIdentity.hash);
+  } catch (e) {
+    // NO proof on decrypt failure — upstream Transport.inbound only proves
+    // when Destination.receive() returned true, and receive() returns false
+    // when every key fails. Proving undecryptable bytes would mark the
+    // message DELIVERED on the sender while the user never sees it: silent
+    // loss. The sender retrying is the CORRECT outcome here — with the
+    // ratchet ring + long-term fallback above, a failure means a genuinely
+    // wrong key, and a retry after our next announce can succeed.
+    // On HMAC failure, log enough context to diagnose a stale-cache
+    // scenario: the sender's ephemeral pubkey (visible on the wire)
+    // plus the first bytes of OUR current pubkeys so the user can
+    // tell if Sideband encrypted to a ratchet we no longer have.
+    const ephPubHex = pkt.payload.length >= 32 ? toHex(pkt.payload.subarray(0, 32)).substring(0, 16) : '(short)';
+    const ratchetPubPrefix = myIdentity.ratchetPubKey ? toHex(myIdentity.ratchetPubKey).substring(0, 16) : '(none)';
+    const encPubPrefix = myIdentity.encPubKey ? toHex(myIdentity.encPubKey).substring(0, 16) : '(none)';
+    log('err', `  Decrypt failed: ${e.message}`);
+    log('info', `    sender eph pub: ${ephPubHex}...`);
+    log('info', `    our ratchet pub: ${ratchetPubPrefix}... enc pub: ${encPubPrefix}...`);
+    log('info', `    tried ${candidatePrivs.length} key(s). If sender has a stale contact, send an announce and ask them to retry.`);
+    return;
+  }
+
+  // Decrypt succeeded — send the opportunistic delivery PROOF now, BEFORE
+  // parsing the LXMF body (upstream order: LXMRouter.delivery_packet proves
+  // first, then parses async). A malformed body still proves, because
+  // "delivered" means decrypted-and-authenticated, not parsed.
   try {
     const packetHash  = await computePacketFullHash(pkt);
     const signature   = ed25519.sign(packetHash, myIdentity.sigPrivKey);
@@ -1226,33 +1258,11 @@ async function handleData(pkt, rxInfo) {
     log('info', `  Proof send failed: ${e.message}`);
   }
 
-  // Try the current ratchet, then the persisted retired-ratchet ring
-  // (senders on a stale announce — the normal case on a slow mesh —
-  // encrypt to a key we've already rotated past), then the long-term
-  // identity X25519 key for senders with no ratchet cached at all.
-  // Declared outside the try — the catch logs how many keys were tried.
-  const candidatePrivs = [
-    myIdentity.ratchetPrivKey,
-    ...myIdentity.prevRatchets,
-    myIdentity.encPrivKey,
-  ].filter(Boolean);
-
   try {
-    const plaintext = await decrypt(pkt.payload, candidatePrivs, myIdentity.hash);
     const msg = await unpackMessage(plaintext, myDestHash);
     await dispatchIncomingMessage(msg, rxInfo);
   } catch (e) {
-    // On HMAC failure, log enough context to diagnose a stale-cache
-    // scenario: the sender's ephemeral pubkey (visible on the wire)
-    // plus the first bytes of OUR current pubkeys so the user can
-    // tell if Sideband encrypted to a ratchet we no longer have.
-    const ephPubHex = pkt.payload.length >= 32 ? toHex(pkt.payload.subarray(0, 32)).substring(0, 16) : '(short)';
-    const ratchetPubPrefix = myIdentity.ratchetPubKey ? toHex(myIdentity.ratchetPubKey).substring(0, 16) : '(none)';
-    const encPubPrefix = myIdentity.encPubKey ? toHex(myIdentity.encPubKey).substring(0, 16) : '(none)';
-    log('err', `  Decrypt/parse failed: ${e.message}`);
-    log('info', `    sender eph pub: ${ephPubHex}...`);
-    log('info', `    our ratchet pub: ${ratchetPubPrefix}... enc pub: ${encPubPrefix}...`);
-    log('info', `    tried ${candidatePrivs.length} key(s). If sender has a stale contact, send an announce and ask them to retry.`);
+    log('err', `  Parse failed after successful decrypt: ${e.message}`);
   }
 }
 
