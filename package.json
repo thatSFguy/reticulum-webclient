@@ -1,6 +1,6 @@
 {
   "name": "reticulum-webclient",
-  "version": "0.33.4",
+  "version": "0.33.5",
   "description": "Browser-based Reticulum messaging client — encrypted LXMF chat and NomadNet browsing over an RNode LoRa modem (Web Bluetooth/Web Serial), rnsd via WebSocket/TCP, or an agnostic-LoRa-Net BLE mesh.",
   "type": "module",
   "private": true,

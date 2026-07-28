@@ -5,11 +5,6 @@
 import { ed25519, x25519 } from '@noble/curves/ed25519';
 import { TRUNCATED_HASHLENGTH, NAME_HASH_LENGTH } from './reticulum.js';
 
-// Retired-ratchet ring depth. 16 rotations × the 30-min rotation gate ≈ an
-// 8-hour decryptable window for senders on stale announces (upstream RNS
-// keeps 512, but its announces are rarer; 16 bounds the export blob size).
-export const RATCHET_RING_DEPTH = 16;
-
 // SHA-256 helper (returns Uint8Array)
 export async function sha256(data) {
   const hash = await crypto.subtle.digest('SHA-256', data);
@@ -30,14 +25,10 @@ export class Identity {
     this.sigPubKey = null;        // Ed25519 public key  (32 bytes)
     this.ratchetPrivKey = null;         // X25519 private key (32 bytes) — current ratchet
     this.ratchetPubKey = null;          // X25519 public key  (32 bytes)
-    this.prevRatchets = [];             // Retired ratchet privkeys, newest first, capped at
-                                        // RATCHET_RING_DEPTH and PERSISTED via exportPrivateKeys.
-                                        // The old 1-deep in-memory slot made the decryptable
-                                        // window ≈ 2 announces — and ONE after any reload —
-                                        // so senders holding a slightly stale announce (the
-                                        // normal case on a slow LoRa mesh) encrypted to keys
-                                        // we had already discarded: silent drop, no proof,
-                                        // sender retries forever. Upstream RNS keeps 512.
+    this.previousRatchetPrivKey = null; // X25519 private key (32 bytes) — last ratchet, kept
+                                        // in memory for the brief in-flight window between
+                                        // rotation and peers seeing the new announce. Not
+                                        // persisted; minimal 1-deep ring per SPEC §7.4.
     this.publicKey = null;        // Combined: encPub(32) + sigPub(32) = 64 bytes
     this.hash = null;             // Identity hash: SHA-256(publicKey)[0:16]
   }
@@ -61,7 +52,7 @@ export class Identity {
     this.hash = await truncatedHash(this.publicKey);
   }
 
-  async loadFromPrivateKeys(encPriv, sigPriv, ratchetPriv = null, prevRatchets = []) {
+  async loadFromPrivateKeys(encPriv, sigPriv, ratchetPriv = null) {
     this.encPrivKey = new Uint8Array(encPriv);
     this.sigPrivKey = new Uint8Array(sigPriv);
     this.encPubKey = x25519.getPublicKey(this.encPrivKey);
@@ -71,9 +62,6 @@ export class Identity {
       this.ratchetPrivKey = new Uint8Array(ratchetPriv);
       this.ratchetPubKey = x25519.getPublicKey(this.ratchetPrivKey);
     }
-    this.prevRatchets = (prevRatchets || [])
-      .slice(0, RATCHET_RING_DEPTH)
-      .map(k => new Uint8Array(k));
 
     this.publicKey = new Uint8Array(64);
     this.publicKey.set(this.encPubKey, 0);
@@ -90,19 +78,16 @@ export class Identity {
     this.ratchetPubKey = x25519.getPublicKey(this.ratchetPrivKey);
   }
 
-  // Rotate the ratchet: push the current ratchet privkey onto the retired
-  // ring (kept for decrypting in-flight traffic from senders that haven't
-  // seen the new announce yet), then generate a fresh ratchet. Long-term
-  // enc/sig keys, identity_hash and destination_hash are untouched so
-  // peers don't have to re-add us. Callers decide WHEN to rotate — see
-  // sendAnnounce's RATCHET_ROTATE_MS gate (rotating on every announce
-  // churned through the ring faster than peers could refresh their cache).
+  // Rotate the ratchet: move the current ratchet privkey into the
+  // 1-deep "previous" slot, then generate a fresh ratchet. Long-term
+  // enc/sig keys, identity_hash and destination_hash are untouched
+  // so peers don't have to re-add us. Required per SPEC §7.3 — most
+  // transit nodes dedupe announces on (destination_hash, ratchet_pub),
+  // so a ratchet that never rotates makes every announce after the
+  // first one in a session look like a duplicate and get dropped.
   rotateRatchet() {
     if (this.ratchetPrivKey) {
-      this.prevRatchets.unshift(this.ratchetPrivKey);
-      if (this.prevRatchets.length > RATCHET_RING_DEPTH) {
-        this.prevRatchets.length = RATCHET_RING_DEPTH;
-      }
+      this.previousRatchetPrivKey = this.ratchetPrivKey;
     }
     this.ratchetPrivKey = x25519.utils.randomPrivateKey();
     this.ratchetPubKey = x25519.getPublicKey(this.ratchetPrivKey);
@@ -134,9 +119,6 @@ export class Identity {
     };
     if (this.ratchetPrivKey) {
       out.ratchetPrivKey = Array.from(this.ratchetPrivKey);
-    }
-    if (this.prevRatchets.length) {
-      out.prevRatchets = this.prevRatchets.map(k => Array.from(k));
     }
     return out;
   }
