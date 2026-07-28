@@ -50,6 +50,26 @@ const MSG_MAX_ATTEMPTS = 3;
 const MSG_BACKOFF_MS = [5000, 15000, 60000];
 const MSG_RETRY_TICK_MS = 5000;
 
+// ---- ALN/LoRa reliability knobs (2026-07-27 investigation §9) --------
+// Ratchet rotation is TIME-gated, not per-announce. Rotating on every
+// announce (with event bursts of 4 in 12s observed) churned past the
+// ring faster than peers refresh their cached announce — their messages
+// arrived encrypted to discarded keys: silent drop, no proof, sender
+// retried forever. Upstream RNS rotates ~every 30 min; announces between
+// rotations reuse the current ratchet (each announce is still unique via
+// its random_hash, so transit dedupe does not eat them).
+const RATCHET_ROTATE_MS = 30 * 60 * 1000;
+// Minimum gaps between announce emissions: event bursts contend for the
+// ALN node's single outbound SAR slot and starve real traffic.
+const ANNOUNCE_MIN_GAP_MS = 60 * 1000;
+const PATH_RESPONSE_MIN_GAP_MS = 10 * 1000;   // solicited — allowed sooner
+let lastAnnounceAt = 0;
+let lastPathResponseAt = 0;
+let lastRatchetRotateAt = (() => {
+  try { return parseInt(localStorage.getItem('rlw.ratchetRotatedAt'), 10) || 0; }
+  catch (_) { return 0; }
+})();
+
 // Tap-back reaction quick palette — same six emoji, in the same order, as
 // reticulum-mobile-app's REACTION_PALETTE for cross-client consistency.
 // This seeds the picker's top row until the user builds up their own
@@ -327,7 +347,8 @@ async function initIdentity() {
     await myIdentity.loadFromPrivateKeys(
       new Uint8Array(stored.encPrivKey),
       new Uint8Array(stored.sigPrivKey),
-      stored.ratchetPrivKey ? new Uint8Array(stored.ratchetPrivKey) : null
+      stored.ratchetPrivKey ? new Uint8Array(stored.ratchetPrivKey) : null,
+      stored.prevRatchets || []          // persisted retired-ratchet ring
     );
     log('ok', 'Identity loaded from storage');
     // One-time migration for identities saved before the ratchet
@@ -1163,17 +1184,41 @@ async function handleData(pkt, rxInfo) {
 
   if (!matches) return;
 
-  log('info', '  Packet addressed to us — attempting decrypt...');
+  log('info', '  Packet addressed to us — proving receipt, then attempting decrypt...');
 
-  // Try current ratchet, then the previous one (in-memory 1-deep
-  // ring per SPEC §7.4 — covers messages already encrypted to the
-  // outgoing ratchet by senders that haven't seen the new announce
-  // yet), then the long-term identity X25519 key as the ultimate
-  // fallback for senders that have no ratchet cached at all.
+  // Send the opportunistic delivery PROOF on RECEIPT, before decrypt —
+  // upstream RNS destinations run PROVE_ALL: Packet.prove() answers any
+  // packet addressed to us with a PROOF whose destHash is the first 16
+  // bytes of the packet's full SHA-256 and whose payload is an Ed25519
+  // signature over the full 32-byte hash. Proving only after a successful
+  // decrypt (the old order here) turned every receiver-side decrypt
+  // hiccup into sender-side retry congestion: the sender retransmitted
+  // the SAME undecryptable bytes on the full backoff schedule.
+  try {
+    const packetHash  = await computePacketFullHash(pkt);
+    const signature   = ed25519.sign(packetHash, myIdentity.sigPrivKey);
+    const proofPacket = buildPacket({
+      headerType: HEADER_1,
+      destType:   DEST_SINGLE,
+      packetType: PACKET_PROOF,
+      destHash:   packetHash.subarray(0, 16),
+      context:    0x00,
+      payload:    signature,
+    });
+    await rnode.sendPacket(proofPacket);
+    log('info', `  Opportunistic PROOF sent, dest=${toHex(packetHash.subarray(0, 16))}`);
+  } catch (e) {
+    log('info', `  Proof send failed: ${e.message}`);
+  }
+
+  // Try the current ratchet, then the persisted retired-ratchet ring
+  // (senders on a stale announce — the normal case on a slow mesh —
+  // encrypt to a key we've already rotated past), then the long-term
+  // identity X25519 key for senders with no ratchet cached at all.
   // Declared outside the try — the catch logs how many keys were tried.
   const candidatePrivs = [
     myIdentity.ratchetPrivKey,
-    myIdentity.previousRatchetPrivKey,
+    ...myIdentity.prevRatchets,
     myIdentity.encPrivKey,
   ].filter(Boolean);
 
@@ -1181,33 +1226,6 @@ async function handleData(pkt, rxInfo) {
     const plaintext = await decrypt(pkt.payload, candidatePrivs, myIdentity.hash);
     const msg = await unpackMessage(plaintext, myDestHash);
     await dispatchIncomingMessage(msg, rxInfo);
-
-    // Send opportunistic delivery PROOF back so the sender (Sideband) sees
-    // the message as delivered and stops retransmitting. Upstream RNS
-    // Packet.prove() for opportunistic delivery builds a PROOF packet
-    // whose destHash is the first 16 bytes of the received packet's
-    // full SHA-256 hash, and whose payload is an Ed25519 signature over
-    // that full 32-byte hash (signed with our long-term identity
-    // signing key so the sender can verify against the sig_pub from
-    // our announce). We send on every successful decrypt — even for
-    // dupes — because the sender keeps retransmitting until it sees
-    // its own packet's proof come back.
-    try {
-      const packetHash  = await computePacketFullHash(pkt);
-      const signature   = ed25519.sign(packetHash, myIdentity.sigPrivKey);
-      const proofPacket = buildPacket({
-        headerType: HEADER_1,
-        destType:   DEST_SINGLE,
-        packetType: PACKET_PROOF,
-        destHash:   packetHash.subarray(0, 16),
-        context:    0x00,
-        payload:    signature,
-      });
-      await rnode.sendPacket(proofPacket);
-      log('info', `  Opportunistic PROOF sent, dest=${toHex(packetHash.subarray(0, 16))}`);
-    } catch (e) {
-      log('info', `  Proof send failed: ${e.message}`);
-    }
   } catch (e) {
     // On HMAC failure, log enough context to diagnose a stale-cache
     // scenario: the sender's ephemeral pubkey (visible on the wire)
@@ -1880,12 +1898,27 @@ async function closeAllLinks() {
 
 // ---- Initiator-side link establishment ------------------------------
 
+// Link-establishment patience, per transport class. The old flat 15s was
+// BELOW a healthy ALN handshake (the mobile app measured a 24.6s establish
+// RTT at 1 hop on SF11 and stretches its patience ×4 on the mesh) — so every
+// link timed out, and the re-establish retries congested the channel until
+// nothing got through. A timeout shorter than the real RTT doesn't fail
+// fast, it fails FOREVER. LoRa-class transports get hop-scaled patience;
+// ws/rnsd keeps the snappy default.
+function defaultLinkTimeoutMs(destHashHex) {
+  if (announceClass(activeTransport) !== 'lora') return 15000;
+  const info = pathTable.get(destHashHex);
+  const hops = info && Number.isFinite(info.hops) ? Math.max(1, info.hops) : 1;
+  return Math.min(180000, 60000 + (hops - 1) * 30000);
+}
+
 // Open an outbound Link to the given contact. Returns a Promise that
 // resolves to the active Link once the LRPROOF has verified and the
 // LRRTT has been emitted, or rejects with an Error on timeout or
 // signature failure. The caller then uses link.encrypt to wrap
-// payloads and routes them through sendViaLink.
-async function openLinkToContact(contact, timeoutMs = 15000) {
+// payloads and routes them through sendViaLink. timeoutMs null =
+// transport-appropriate default (defaultLinkTimeoutMs).
+async function openLinkToContact(contact, timeoutMs = null) {
   if (!radioOn) throw new Error('Radio not on');
   if (!contact || !contact.identity || !contact.identity.sigPubKey) {
     throw new Error('Contact has no known sig pub; need an announce first');
@@ -1901,6 +1934,9 @@ async function openLinkToContact(contact, timeoutMs = 15000) {
     log('info', `  No path known to ${toHex(contact.destHash).substring(0,16)}... — issuing path? preamble`);
     await requestPath(contact.destHash);
   }
+
+  // Resolve patience AFTER the preamble — a path response updates hops.
+  if (timeoutMs == null) timeoutMs = defaultLinkTimeoutMs(toHex(contact.destHash));
 
   const { link, requestData } = Link.createInitiator(
     contact.identity.sigPubKey,
@@ -2240,7 +2276,7 @@ async function pnIngestBlob(blob, wantedIds) {
     }
     const candidatePrivs = [
       myIdentity.ratchetPrivKey,
-      myIdentity.previousRatchetPrivKey,
+      ...myIdentity.prevRatchets,
       myIdentity.encPrivKey,
     ].filter(Boolean);
     const plaintext = await decrypt(blob.subarray(16), candidatePrivs, myIdentity.hash);
@@ -3550,14 +3586,25 @@ async function handleDeliveryProof(pkt) {
 async function sendAnnounce({ pathResponse = false } = {}) {
   if (!radioOn || !myIdentity) { log('err', 'Radio not on or identity not ready'); return; }
 
-  // Periodic / manual announces rotate the ratchet so transit nodes
-  // don't dedupe successive announces on (destHash, ratchet_pub) and
-  // silently drop them (SPEC §7.3). Path-response announces reuse the
-  // current ratchet so we don't burn through ratchets on bursts of
-  // path? requests.
-  if (!pathResponse) {
+  // Burst limiter — see ANNOUNCE_MIN_GAP_MS. Skipped announces are cheap:
+  // the periodic timer fires again, and peers keep our previous announce.
+  const now = Date.now();
+  if (pathResponse) {
+    if (now - lastPathResponseAt < PATH_RESPONSE_MIN_GAP_MS) {
+      log('info', '  Path-response announce suppressed (rate limit)'); return;
+    }
+  } else if (now - lastAnnounceAt < ANNOUNCE_MIN_GAP_MS) {
+    log('info', '  Announce suppressed (rate limit — last one <60s ago)'); return;
+  }
+
+  // Time-gated ratchet rotation (RATCHET_ROTATE_MS): the retired key goes
+  // into the persisted ring so in-flight traffic stays decryptable.
+  if (!pathResponse && now - lastRatchetRotateAt >= RATCHET_ROTATE_MS) {
     myIdentity.rotateRatchet();
+    lastRatchetRotateAt = now;
+    try { localStorage.setItem('rlw.ratchetRotatedAt', String(now)); } catch (_) { /* private mode */ }
     await saveIdentity(myIdentity.exportPrivateKeys());
+    log('info', '  Ratchet rotated (30-min cadence)');
   }
 
   const displayName = $('my-name').value.trim() || 'WebClient';
@@ -3588,6 +3635,8 @@ async function sendAnnounce({ pathResponse = false } = {}) {
   });
 
   await rnode.sendPacket(packet);
+  if (pathResponse) lastPathResponseAt = Date.now();
+  else lastAnnounceAt = Date.now();
   const label = pathResponse ? 'Path-response announce' : 'Announce';
   log('ok', `${label} sent as "${displayName}" [${toHex(destHash).substring(0,12)}...]${hasRatchet ? ' (ratchet)' : ''}`);
 }
@@ -4891,6 +4940,19 @@ async function connect(transportType) {
       upstreamTransportId = null;
       for (const [, p] of pendingPathRequests) clearTimeout(p.timer);
       pendingPathRequests.clear();
+      // §8.2.9: links died with the transport. Without this, the maps kept
+      // stale-ACTIVE links across a BLE drop/reconnect and the next send
+      // wedged on a session key the peer no longer has. In-flight
+      // establishments are rejected so their callers fail fast instead of
+      // waiting out the full patience window.
+      for (const [, e] of initiatorLinks) {
+        clearTimeout(e.timer);
+        e.reject(new Error('transport disconnected'));
+      }
+      initiatorLinks.clear();
+      links.clear();
+      nnState.link = null;
+      nnState.destHashHex = null;
       setConnectionState(false, 'Disconnected');
       $('btn-disconnect').classList.add('hidden');
       setConnectButtonsHidden(false);
@@ -5118,7 +5180,8 @@ async function importIdentityFile(file) {
   await incoming.loadFromPrivateKeys(
     new Uint8Array(obj.encPrivKey),
     new Uint8Array(obj.sigPrivKey),
-    obj.ratchetPrivKey ? new Uint8Array(obj.ratchetPrivKey) : null
+    obj.ratchetPrivKey ? new Uint8Array(obj.ratchetPrivKey) : null,
+    obj.prevRatchets || []               // ring survives export/import round-trips
   );
   if (!incoming.ratchetPrivKey) incoming.generateRatchet();   // pre-ratchet export
   const newDest = await computeDestinationHash('lxmf.delivery', incoming.hash);
