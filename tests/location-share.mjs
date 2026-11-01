@@ -2,20 +2,20 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { locationDetails, createLocationMessage, requestLocation, locationErrorMessage } from '../js/location-share.js';
 
-// Synthetic test coordinates only. No device location is requested by tests.
+// A public landmark fixture (Big Ben), never a device/user location.
 const position = {
-  coords: { latitude: 48.462071, longitude: 9.947084, accuracy: 7.4 },
+  coords: { latitude: 51.500729, longitude: -0.124625, accuracy: 7.4 },
   timestamp: Date.UTC(2026, 10, 1, 12, 0, 0),
 };
 
 test('message contains coordinates, rounded-up accuracy, timestamp and an HTTPS map link', () => {
   const text = createLocationMessage(position);
-  assert.equal(text, 'My location: 48.462071, 9.947084\nAccuracy: ±8 m\nRecorded: 2026-11-01T12:00:00.000Z\nhttps://www.openstreetmap.org/?mlat=48.462071&mlon=9.947084#map=16/48.462071/9.947084');
+  assert.equal(text, 'My location: 51.500729, -0.124625\nAccuracy: ±8 m\nRecorded: 2026-11-01T12:00:00.000Z\nhttps://www.openstreetmap.org/?mlat=51.500729&mlon=-0.124625#map=16/51.500729/-0.124625');
 });
 
 test('map link can be omitted without dropping location information', () => {
   const text = createLocationMessage(position, { includeMapLink: false });
-  assert.match(text, /My location: 48\.462071, 9\.947084/);
+  assert.match(text, /My location: 51\.500729, -0\.124625/);
   assert.match(text, /Accuracy: ±8 m/);
   assert.match(text, /Recorded:/);
   assert.doesNotMatch(text, /https?:/);
