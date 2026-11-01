@@ -1,0 +1,110 @@
+# HTTP-context example. Replace rns.example.org and paths before enabling.
+map $http_upgrade $rns_session_upgrade {
+    default upgrade;
+    '' close;
+}
+limit_conn_zone $binary_remote_addr zone=rns_session_connections:1m;
+limit_req_zone $binary_remote_addr zone=rns_session_login:1m rate=10r/m;
+limit_req_zone $binary_remote_addr zone=rns_session_status:1m rate=10r/s;
+log_format rns_session_safe '$remote_addr [$time_local] "$request_method $uri $server_protocol" $status $body_bytes_sent';
+
+server {
+    listen 443 ssl http2;
+    server_name rns.example.org;
+    ssl_certificate /etc/letsencrypt/live/rns.example.org/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/rns.example.org/privkey.pem;
+    root /var/www/reticulum-webclient;
+    index index.html;
+    auth_request /_rns_session;
+    access_log /var/log/nginx/rns-access.log rns_session_safe;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+    add_header X-Frame-Options DENY always;
+
+    location = /_rns_session {
+        internal;
+        auth_request off;
+        proxy_pass http://unix:/run/rns-web-auth/auth.sock:/verify;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header Authorization "";
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 5s;
+    }
+
+    location = /_rns_signin {
+        internal;
+        auth_request off;
+        alias /var/www/reticulum-webclient/login.html;
+        default_type text/html;
+        add_header Cache-Control no-store always;
+        add_header Referrer-Policy strict-origin-when-cross-origin always;
+        add_header X-Frame-Options DENY always;
+        add_header X-Content-Type-Options nosniff always;
+    }
+
+    location = /auth/login {
+        auth_request off;
+        auth_basic "Reticulum Bridge";
+        auth_basic_user_file /etc/nginx/.rns-users;
+        if ($request_method != POST) { return 405; }
+        if ($http_origin != "https://rns.example.org") { return 403; }
+        limit_req zone=rns_session_login burst=10 nodelay;
+        limit_req_status 429;
+        proxy_pass http://unix:/run/rns-web-auth/auth.sock:/issue;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Authenticated-User $remote_user;
+        proxy_set_header Authorization "";
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 5s;
+    }
+
+    location = /auth/status {
+        auth_request off;
+        limit_req zone=rns_session_status burst=20 nodelay;
+        limit_req_status 429;
+        proxy_pass http://unix:/run/rns-web-auth/auth.sock:/status;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header Authorization "";
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 5s;
+    }
+
+    location = /auth/logout {
+        auth_request off;
+        if ($request_method != POST) { return 405; }
+        if ($http_origin != "https://rns.example.org") { return 403; }
+        proxy_pass http://unix:/run/rns-web-auth/auth.sock:/logout;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header Authorization "";
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 5s;
+    }
+
+    location = /ws {
+        if ($http_origin != "https://rns.example.org") { return 403; }
+        limit_conn rns_session_connections 2;
+        limit_conn_status 429;
+        proxy_pass http://127.0.0.1:7878;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $rns_session_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header Authorization "";
+        proxy_set_header Cookie "";
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 90s;
+        proxy_send_timeout 90s;
+        proxy_buffering off;
+        client_max_body_size 256k;
+    }
+
+    location / {
+        error_page 401 /_rns_signin;
+        try_files $uri $uri/ =404;
+    }
+    location ~ /\. { deny all; }
+}
