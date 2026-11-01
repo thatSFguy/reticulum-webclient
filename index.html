@@ -159,6 +159,9 @@
           <div id="staged-attachment" class="staged-attachment hidden"></div>
           <button id="btn-attach" class="attach-btn" title="Attach a file or image" aria-label="Attach">📎</button>
           <input id="attach-input" type="file" accept="image/*,*/*" hidden>
+          <button id="btn-location" class="location-btn" type="button" title="Share your current location" aria-label="Share location">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s7-6.2 7-12a7 7 0 0 0-14 0c0 5.8 7 12 7 12Z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="9" r="2.5" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
+          </button>
           <textarea id="msg-content" placeholder="Type a message…" rows="1"></textarea>
           <button id="btn-send" class="send-btn" title="Send" aria-label="Send">
             <svg viewBox="0 0 16 16"><path d="M2 8l12-6-6 12V8H2z" fill="currentColor"/></svg>
@@ -705,6 +708,29 @@
     <div class="modal-actions"><span class="modal-hint">Scan the QR with another Reticulum app, or copy &amp; share the text.</span>
       <button id="my-card-copy" class="btn-secondary">Copy</button></div>
   </div>
+</div>
+
+<!-- Location stays out of the draft until explicitly reviewed and added. -->
+<div id="location-modal" class="modal-overlay hidden">
+  <section class="modal location-dialog" role="dialog" aria-modal="true" aria-labelledby="location-title" aria-describedby="location-privacy">
+    <h2 id="location-title" class="modal-title">Share current location</h2>
+    <p id="location-recipient" class="modal-text"></p>
+    <p id="location-privacy" class="modal-text">This requests your position once, not continuous tracking. The app will not send it until you press Send. Opening a map link shares that position with OpenStreetMap.</p>
+    <p id="location-status" class="modal-text" role="status" aria-live="polite"></p>
+    <dl id="location-details" class="location-details hidden">
+      <dt>Coordinates</dt><dd id="location-coordinates"></dd>
+      <dt>Accuracy</dt><dd id="location-accuracy"></dd>
+      <dt>Recorded</dt><dd><time id="location-recorded"></time></dd>
+    </dl>
+    <label class="location-link-option"><input id="location-include-link" type="checkbox" checked> Include an OpenStreetMap link</label>
+    <div class="modal-actions">
+      <button id="location-retry" type="button" class="btn-secondary">Try again</button>
+      <div class="modal-buttons">
+        <button id="location-cancel" type="button" class="btn-secondary">Cancel</button>
+        <button id="location-add" type="button" class="btn-primary" disabled>Add to message</button>
+      </div>
+    </div>
+  </section>
 </div>
 
 <!-- Destruct confirmation. Reuses the modal-overlay pattern. -->
