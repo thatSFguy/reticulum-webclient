@@ -75,8 +75,9 @@ jobs:
       - name: Install JS dependencies
         run: npm install
 
-      - name: Run JS unit tests (ALN tunnel, reply threading, propagation)
+      - name: Run JS unit tests (identity backup, ALN tunnel, reply threading, propagation)
         run: |
+          node tests/identity-backup.mjs
           node tests/aln.mjs
           node tests/reply.mjs
           node tests/propagation.mjs
