@@ -22,6 +22,15 @@
 <!-- Parallelize the ES-module graph: without these the browser can't
      discover noble-curves/msgpack until it has fetched and parsed app.js
      (a fetch waterfall that delayed first contentful paint). -->
+<!-- Resolve bare imports before cached modulepreloads can parse app.js. -->
+<script type="importmap">
+{
+  "imports": {
+    "@noble/curves/ed25519": "./lib/noble-curves-ed25519.js",
+    "@msgpack/msgpack": "./lib/msgpack.js"
+  }
+}
+</script>
 <link rel="modulepreload" href="js/app.js">
 <link rel="modulepreload" href="js/store.js">
 <link rel="modulepreload" href="lib/noble-curves-ed25519.js">
@@ -804,15 +813,6 @@
   </div>
 </div>
 
-<!-- Import map: resolve bare specifiers to self-hosted bundles in lib/ -->
-<script type="importmap">
-{
-  "imports": {
-    "@noble/curves/ed25519": "./lib/noble-curves-ed25519.js",
-    "@msgpack/msgpack": "./lib/msgpack.js"
-  }
-}
-</script>
 <script type="module" src="js/app.js"></script>
 </body>
 </html>

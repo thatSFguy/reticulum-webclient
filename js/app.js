@@ -8,6 +8,7 @@ import { RnsdInterface } from './rnsd-interface.js';
 import { AlnInterface } from './aln-interface.js';
 import { toHex } from './kiss.js';
 import { Identity, computeDestinationHash, computeNameHash, truncatedHash, sha256 } from './identity.js';
+import { ReconnectController } from './reconnect.js';
 import { parsePacket, buildPacket, PACKET_ANNOUNCE, PACKET_DATA, PACKET_LINKREQ, PACKET_PROOF, DEST_SINGLE, DEST_LINK, DEST_PLAIN, HEADER_1, HEADER_2, TRANSPORT_BROADCAST, TRANSPORT_TRANSPORT, PACKET_TYPE_NAMES } from './reticulum.js';
 import { parseAnnounce, validateAnnounce, buildAnnounce, extractDisplayName, concatBytes, arraysEqual } from './announce.js';
 import { encrypt, decrypt } from './crypto.js';
@@ -4992,9 +4993,65 @@ function tcpConnect() {
   connect('ws');
 }
 
-// Connect
+let transportGeneration = 0;
+
+function resetDisconnectedState() {
+  if (announceTimer) { clearInterval(announceTimer); announceTimer = null; }
+  if (outboundRetryTimer) { clearInterval(outboundRetryTimer); outboundRetryTimer = null; }
+  pnStopTimers();
+  pathTable.clear();
+  upstreamTransportId = null;
+  for (const [, p] of pendingPathRequests) clearTimeout(p.timer);
+  pendingPathRequests.clear();
+  for (const [, entry] of initiatorLinks) {
+    clearTimeout(entry.timer);
+    entry.reject(new Error('transport disconnected'));
+  }
+  initiatorLinks.clear();
+  links.clear();
+  nnState.link = null;
+  nnState.destHashHex = null;
+  setConnectionState(false, 'Disconnected');
+  $('btn-disconnect').classList.add('hidden');
+  setConnectButtonsHidden(false);
+  setConnectButtonsDisabled(false);
+  $('ws-url-row').classList.remove('hidden');
+  document.querySelector('.ws-security-warning')?.remove();
+  radioOn = false;
+  setRadioStatus('', false);
+}
+
+const wsReconnect = new ReconnectController({
+  connect: () => connectTransport('ws'),
+  disconnect: () => {
+    if (activeTransport !== 'ws') return;
+    transportGeneration++;
+    rnode._onDisconnect = null;
+    const closing = rnode.disconnect();
+    resetDisconnectedState();
+    return closing;
+  },
+  isConnected: () => activeTransport === 'ws' && rnode.connected,
+  checkSession: async () => true,
+  onState: (state, seconds) => {
+    if (state === 'connected') return;
+    const labels = { connecting: 'Reconnecting…', paused: 'Paused — reconnects on return',
+      offline: 'Offline — waiting for network', authentication: 'Sign in required', disconnected: 'Disconnected' };
+    setConnectionState(false, state === 'retry' ? `Reconnecting in ${seconds}s…` : labels[state] || 'Disconnected');
+  },
+});
+
+// Preserve explicit connection intent across visibility changes and refreshes.
 async function connect(transportType) {
+  if (transportType === 'ws') return wsReconnect.start();
+  wsReconnect.stop();
+  return connectTransport(transportType);
+}
+
+async function connectTransport(transportType) {
+  const generation = ++transportGeneration;
   try {
+    if (!myDestHash) throw new Error('Identity is still loading');
     setConnectButtonsDisabled(true);
     activeTransport = transportType;  // drives the per-transport announce cadence
 
@@ -5036,42 +5093,20 @@ async function connect(transportType) {
     }
     rnode._onLog = (msg) => log('info', msg);
     rnode._onPacket = onPacket;
+    const connectingInterface = rnode;
     rnode._onDisconnect = () => {
+      if (rnode !== connectingInterface || generation !== transportGeneration) return;
       log('err', 'Transport disconnected unexpectedly');
-      if (announceTimer) { clearInterval(announceTimer); announceTimer = null; }
-      if (outboundRetryTimer) { clearInterval(outboundRetryTimer); outboundRetryTimer = null; }
-      pnStopTimers();
-      // Routing state is per-interface — different rnsd has a different
-      // identity hash and a different mesh topology. Clear so a future
-      // reconnect rediscovers everything from the next batch of announces
-      // rather than acting on stale data.
-      pathTable.clear();
-      upstreamTransportId = null;
-      for (const [, p] of pendingPathRequests) clearTimeout(p.timer);
-      pendingPathRequests.clear();
-      // §8.2.9: links died with the transport. Without this, the maps kept
-      // stale-ACTIVE links across a BLE drop/reconnect and the next send
-      // wedged on a session key the peer no longer has. In-flight
-      // establishments are rejected so their callers fail fast instead of
-      // waiting out the full patience window.
-      for (const [, e] of initiatorLinks) {
-        clearTimeout(e.timer);
-        e.reject(new Error('transport disconnected'));
-      }
-      initiatorLinks.clear();
-      links.clear();
-      nnState.link = null;
-      nnState.destHashHex = null;
-      setConnectionState(false, 'Disconnected');
-      $('btn-disconnect').classList.add('hidden');
-      setConnectButtonsHidden(false);
-      $('ws-url-row').classList.remove('hidden');
-      document.querySelector('.ws-security-warning')?.remove();
-      radioOn = false;
-      setRadioStatus('', false);
+      resetDisconnectedState();
+      if (transportType === 'ws') wsReconnect.lost();
     };
 
-    await rnode.connect();
+    await connectingInterface.connect();
+    if (generation !== transportGeneration) {
+      connectingInterface._onDisconnect = null;
+      await connectingInterface.disconnect();
+      return false;
+    }
     hideBridgeModal();  // dismiss the helper if it was open
 
     setConnectionState(true, `Connected (${transportType.toUpperCase()})`);
@@ -5099,9 +5134,13 @@ async function connect(transportType) {
       log('ok', transportType === 'aln'
         ? `Connected to Reticulum network via ALN mesh`
         : `Connected to Reticulum network via WebSocket`);
+      // A new interface needs a fresh route even after a short phone lock.
+      if (transportType === 'ws') lastAnnounceAt = 0;
       markInterfaceReady();
     }
+    return true;
   } catch (e) {
+    if (generation !== transportGeneration) return false;
     log('err', 'Connect: ' + e.message);
     // A failed connection to a local bridge almost always means the
     // bridge isn't running — offer the one-click download + auto-retry.
@@ -5109,8 +5148,9 @@ async function connect(transportType) {
       const t = buildWsTarget();
       if (t.baseUrl && isLocalWs(t.baseUrl)) showBridgeModal(t.baseUrl, t.url);
     }
+    return false;
   } finally {
-    setConnectButtonsDisabled(false);
+    if (generation === transportGeneration) setConnectButtonsDisabled(false);
   }
 }
 
@@ -5159,6 +5199,11 @@ document.querySelectorAll('.js-connect-btn').forEach(b => {
 })();
 
 $('btn-disconnect').addEventListener('click', async () => {
+  if (activeTransport === 'ws') {
+    wsReconnect.stop();
+    log('info', 'Disconnected');
+    return;
+  }
   if (announceTimer) { clearInterval(announceTimer); announceTimer = null; }
   if (outboundRetryTimer) { clearInterval(outboundRetryTimer); outboundRetryTimer = null; }
   pnStopTimers();
@@ -5626,4 +5671,4 @@ try {
 
 // ---- Init ------------------------------------------------------------
 updateAvatars();
-initIdentity().catch(e => log('err', 'Identity init: ' + e.message));
+initIdentity().then(() => wsReconnect.restore()).catch(e => log('err', 'Identity init: ' + e.message));
