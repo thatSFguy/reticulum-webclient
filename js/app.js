@@ -8,6 +8,7 @@ import { RnsdInterface } from './rnsd-interface.js';
 import { AlnInterface } from './aln-interface.js';
 import { toHex } from './kiss.js';
 import { Identity, computeDestinationHash, computeNameHash, truncatedHash, sha256 } from './identity.js';
+import { initLocationSharing } from './location-share.js';
 import { parsePacket, buildPacket, PACKET_ANNOUNCE, PACKET_DATA, PACKET_LINKREQ, PACKET_PROOF, DEST_SINGLE, DEST_LINK, DEST_PLAIN, HEADER_1, HEADER_2, TRANSPORT_BROADCAST, TRANSPORT_TRANSPORT, PACKET_TYPE_NAMES } from './reticulum.js';
 import { parseAnnounce, validateAnnounce, buildAnnounce, extractDisplayName, concatBytes, arraysEqual } from './announce.js';
 import { encrypt, decrypt } from './crypto.js';
@@ -4231,6 +4232,7 @@ async function removeContact(hash) {
 }
 
 async function selectContact(hash) {
+  locationSharing.cancel();
   activeContactHash = hash;
   clearStagedAttachment();  // don't carry a staged file into a different conversation
   clearReplyState();        // …nor a pending reply target (§5.9.9)
@@ -5316,6 +5318,10 @@ $('import-id-input')?.addEventListener('change', (e) => {
 });
 
 // Messaging
+const locationSharing = initLocationSharing({
+  getRecipient: () => activeContactHash,
+  getRecipientName: () => contacts.get(activeContactHash)?.displayName || 'this contact',
+});
 $('btn-send').addEventListener('click', sendMessage);
 $('msg-content').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
