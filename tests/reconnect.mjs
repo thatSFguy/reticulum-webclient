@@ -8,7 +8,7 @@ function fixture({ remembered = false, session = true } = {}) {
   const navigator = { onLine: true };
   const saved = new Map(remembered ? [['rlw.wsKeepConnected', '1']] : []);
   const timers = new Map(); let nextTimer = 0;
-  const state = { connects: 0, disconnects: 0, connected: false, session, fail: false, states: [] };
+  const state = { connects: 0, disconnects: 0, connected: false, session, fail: false, states: [], time: 0 };
   const controller = new ReconnectController({
     connect: async () => { state.connects++; state.connected = !state.fail; return state.connected; },
     disconnect: () => { state.disconnects++; state.connected = false; },
@@ -16,7 +16,7 @@ function fixture({ remembered = false, session = true } = {}) {
     checkSession: async () => state.session,
     onState: (name, delay) => state.states.push([name, delay]),
     storage: { getItem: key => saved.get(key), setItem: (key, value) => saved.set(key, value) },
-    document, window, navigator, jitter: () => 0,
+    document, window, navigator, jitter: () => 0, now: () => state.time,
     setTimer: (fn, delay) => { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
     clearTimer: id => timers.delete(id),
   });
@@ -70,6 +70,18 @@ test('offline waits for online instead of retrying', async () => {
   assert.equal(f.timers.size, 0);
   f.navigator.onLine = true; f.window.dispatchEvent(new Event('online')); await flush();
   assert.equal(f.state.connects, 1);
+});
+
+test('rapid open/close flapping keeps backing off until a connection is stable', async () => {
+  const f = fixture(); await f.controller.start();
+  for (const delay of [1000, 2000, 4000]) {
+    f.state.connected = false; f.controller.lost();
+    const [id, timer] = [...f.timers][0]; assert.equal(timer.delay, delay);
+    f.timers.delete(id); timer.fn(); await flush();
+  }
+  f.state.time += 10000; f.state.connected = false; f.controller.lost();
+  assert.equal([...f.timers.values()][0].delay, 1000);
+  f.controller.stop();
 });
 
 test('expired login requests a single sign-in, not repeated authentication attempts', async () => {

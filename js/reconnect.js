@@ -5,15 +5,16 @@ export class ReconnectController {
   constructor({ connect, disconnect, isConnected, checkSession, onState,
     storage = globalThis.localStorage, document = globalThis.document, window = globalThis.window,
     navigator = globalThis.navigator, setTimer = (...args) => globalThis.setTimeout(...args),
-    clearTimer = id => globalThis.clearTimeout(id), jitter = Math.random }) {
+    clearTimer = id => globalThis.clearTimeout(id), jitter = Math.random, now = Date.now }) {
     Object.assign(this, { connect, disconnect, isConnected, checkSession, onState, storage,
-      document, window, navigator, setTimer, clearTimer, jitter });
+      document, window, navigator, setTimer, clearTimer, jitter, now });
     this.wanted = false;
     this.connecting = false;
     this.authPaused = false;
     this.generation = 0;
     this.failures = 0;
     this.timer = null;
+    this.connectedAt = null;
     this.document.addEventListener('visibilitychange', () => {
       if (this.document.hidden) this.pause('paused'); else this.resume();
     });
@@ -50,6 +51,8 @@ export class ReconnectController {
     this.generation++;
     if (this.timer !== null) this.clearTimer(this.timer);
     this.timer = null;
+    this.connectedAt = null;
+    this.failures = 0;
     if (this.wanted || state === 'disconnected') {
       Promise.resolve(this.disconnect()).catch(() => {});
       this.onState(state);
@@ -66,6 +69,9 @@ export class ReconnectController {
   }
 
   lost() {
+    // An upgrade followed immediately by a backend failure is not recovery.
+    if (this.connectedAt !== null && this.now() - this.connectedAt >= 10000) this.failures = 0;
+    this.connectedAt = null;
     if (!this.connecting) this.schedule();
   }
 
@@ -92,7 +98,7 @@ export class ReconnectController {
       const connected = await this.connect();
       if (!current()) return;
       if (connected && this.isConnected()) {
-        this.failures = 0;
+        this.connectedAt = this.now();
         this.onState('connected');
       } else failed = true;
     } catch (_) {
