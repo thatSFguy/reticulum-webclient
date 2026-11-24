@@ -25,6 +25,8 @@ import RNS
 from RNS import Identity, Packet
 from RNS import Stamps
 from RNS.Cryptography import X25519PrivateKey
+import LXMF
+from LXMF import LXStamper
 import hashlib
 
 OK = "\033[32mOK\033[0m"
@@ -82,6 +84,21 @@ def main():
         st = bytes.fromhex(s["stamp"])
         check(Stamps.stamp_valid(st, s["cost"], wb), f"LXMF stamp at cost {s['cost']} accepted by RNS")
         check(Stamps.stamp_value(wb, st) == s["value"], f"LXMF stamp value {s['value']} agrees")
+
+    print(f"{INFO} stamped LXMF message (LXMF {getattr(LXMF, '__version__', '?')})")
+    lm = v["lxmfMessage"]
+    RNS.Identity.remember(os.urandom(32), bytes.fromhex(lm["source"]), bytes.fromhex(lm["publicKey"]))
+    m = LXMF.LXMessage.unpack_from_bytes(bytes.fromhex(lm["pow"]["bytes"]))
+    check(m.message_id.hex() == lm["messageId"], "LXMF message_id matches the JS sender's", f"lxmf={m.message_id.hex()}")
+    check(m.signature_validated, "LXMF validates the signature of the stamped message")
+    check(m.stamp is not None and m.stamp.hex() == lm["pow"]["stamp"], "LXMF extracts the 32-byte stamp")
+    check(m.validate_stamp(lm["cost"]), f"LXMessage.validate_stamp({lm['cost']}) accepts the PoW stamp")
+    check(LXStamper.stamp_valid(m.stamp, lm["cost"], LXStamper.stamp_workblock(m.message_id)),
+          "stamp valid over the EXPANDED workblock (what LXMF <= 1.2 requires)")
+    t = LXMF.LXMessage.unpack_from_bytes(bytes.fromhex(lm["ticket"]["bytes"]))
+    check(t.signature_validated and t.message_id.hex() == lm["messageId"], "ticket-stamped message: id + signature")
+    check(t.validate_stamp(99, tickets=[bytes.fromhex(lm["ticket"]["ticket"])]) and t.stamp_value == LXMF.LXMessage.COST_TICKET,
+          "LXMessage.validate_stamp accepts the 16-byte ticket stamp")
 
     print(f"{INFO} stamped link-request key")
     k = v["keystamp"]
