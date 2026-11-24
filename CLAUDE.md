@@ -6,6 +6,14 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 **Never create, modify, or delete files outside this project directory (`reticulum-webclient/`).** Exception: may read files from the sibling `reticulum-*` projects for reference (see Sibling Projects below).
 
+## Open-PR Check Rule
+
+**Before starting any work of our own, check for open pull requests** (`gh pr list --state open`). Outside contributors open PRs against `master`; reviewing and integrating them first avoids building on a base that is about to change and avoids version-bump collisions.
+
+- Review every PR line by line for security before merging — this app holds users' private keys. Look for exfiltration (new network destinations, `fetch`/`WebSocket`/`sendBeacon` targets), unsafe DOM sinks (`innerHTML` with peer- or file-supplied data), credential or key handling, and changes to CI workflows.
+- Fork PRs from first-time contributors don't run CI until a maintainer approves them, so their "tests passed" claims are unverified. Integrate on a branch, open a PR so `verify.yml` runs, and merge with a merge commit (not squash) so GitHub records the original PRs as merged.
+- Resolve their version bumps into a single bump per the Version Bump Rule.
+
 ## Version Bump Rule
 
 **Every commit that ships user-facing changes (JS, HTML, CSS, or any file copied into `_site/` by the deploy workflow) must bump the patch version in `package.json`.** Bug fixes = patch bump (0.3.1 → 0.3.2). New features = minor bump (0.3.2 → 0.4.0). Breaking changes = major bump (0.4.x → 1.0.0). Docs-only, CI-only, tooling-only, and test-only commits do NOT require a bump.
