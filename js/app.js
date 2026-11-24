@@ -8,6 +8,7 @@ import { RnsdInterface } from './rnsd-interface.js';
 import { AlnInterface } from './aln-interface.js';
 import { toHex } from './kiss.js';
 import { Identity, computeDestinationHash, computeNameHash, truncatedHash, sha256 } from './identity.js';
+import { exportIdentityBackup, validateIdentityImport } from './identity-backup.js';
 import { parsePacket, buildPacket, PACKET_ANNOUNCE, PACKET_DATA, PACKET_LINKREQ, PACKET_PROOF, DEST_SINGLE, DEST_LINK, DEST_PLAIN, HEADER_1, HEADER_2, TRANSPORT_BROADCAST, TRANSPORT_TRANSPORT, PACKET_TYPE_NAMES } from './reticulum.js';
 import { parseAnnounce, validateAnnounce, buildAnnounce, extractDisplayName, parseLxmfAppData, concatBytes, arraysEqual } from './announce.js';
 import { generateStamp, stampValid, destinationStampMaterial, DESTINATION_COST, DESTINATION_VALUE, LR_COST, STAMPLENGTH } from './stamps.js';
@@ -5317,7 +5318,7 @@ $('btn-new-id').addEventListener('click', async () => {
   ensureDestStamp().catch(() => {});
 });
 $('btn-export-id').addEventListener('click', () => {
-  const data = JSON.stringify(myIdentity.exportPrivateKeys());
+  const data = JSON.stringify(exportIdentityBackup(myIdentity, $('my-name').value));
   const blob = new Blob([data], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -5327,19 +5328,6 @@ $('btn-export-id').addEventListener('click', () => {
   URL.revokeObjectURL(url);
   log('ok', 'Identity exported');
 });
-
-// Validate the shape of an exported-identity object: encPrivKey and
-// sigPrivKey are required 32-byte arrays; ratchetPrivKey is optional.
-// Returns null when valid, else a human-readable reason.
-function validateIdentityImport(obj) {
-  const is32 = (a) => Array.isArray(a) && a.length === 32 &&
-    a.every(n => Number.isInteger(n) && n >= 0 && n <= 255);
-  if (!obj || typeof obj !== 'object') return 'not a JSON object';
-  if (!is32(obj.encPrivKey)) return 'missing or invalid encPrivKey (need 32 bytes)';
-  if (!is32(obj.sigPrivKey)) return 'missing or invalid sigPrivKey (need 32 bytes)';
-  if (obj.ratchetPrivKey != null && !is32(obj.ratchetPrivKey)) return 'invalid ratchetPrivKey';
-  return null;
-}
 
 // Load an exported reticulum-identity-*.json back in. Validates, shows the
 // resulting address for confirmation (this REPLACES the current identity),
@@ -5374,6 +5362,7 @@ async function importIdentityFile(file) {
 
   const ok = confirm(
     `Import identity ${toHex(newDest)}?\n\n` +
+    (obj.displayName !== undefined ? `Display name: ${obj.displayName}\n\n` : '') +
     `This REPLACES your current identity (${toHex(myDestHash)}). ` +
     `Export the current one first if you want to keep it.\n\n` +
     `The app will reload after importing.`
@@ -5381,6 +5370,12 @@ async function importIdentityFile(file) {
   if (!ok) return;
 
   await saveIdentity(incoming.exportPrivateKeys());
+  // Missing metadata in legacy backups must not erase the current name.
+  if (obj.displayName !== undefined) {
+    localStorage.setItem(NAME_KEY, obj.displayName);
+    $('my-name').value = obj.displayName;
+    updateAvatars();
+  }
   log('ok', `Identity imported: ${toHex(newDest)} — reloading…`);
   setTimeout(() => location.reload(), 400);
 }
@@ -5549,7 +5544,7 @@ $('btn-back')?.addEventListener('click', () => {
 // and save on every keystroke so it's always up to date.
 const NAME_KEY = 'reticulum-display-name';
 const savedName = localStorage.getItem(NAME_KEY);
-if (savedName && $('my-name')) {
+if (savedName !== null && $('my-name')) {
   $('my-name').value = savedName;
 }
 $('my-name')?.addEventListener('input', () => {
