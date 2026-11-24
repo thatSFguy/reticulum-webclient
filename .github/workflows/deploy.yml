@@ -33,10 +33,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+  # Build and deploy are separate jobs (GitHub's documented Pages layout).
+  # With both in one job, deploy-pages queried the artifact list moments
+  # after upload-pages-artifact finished and intermittently saw zero
+  # artifacts ("No artifacts named github-pages"); re-running the failed
+  # job then uploaded a SECOND artifact into the same run and failed with
+  # "Multiple artifacts". The job boundary lets the upload settle, and a
+  # failed deploy can be re-run alone without re-uploading.
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -177,8 +181,18 @@ jobs:
         with:
           path: _site
 
+  deploy:
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
       - id: deployment
         uses: actions/deploy-pages@v5
+
+      # Checkout only for the tag step below (package.json version + git push).
+      - uses: actions/checkout@v5
 
       - name: Tag this deploy
         # Runs after a successful Pages publish, so the tag only
