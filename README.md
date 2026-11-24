@@ -54,6 +54,8 @@ Full walkthrough — running your own `rnsd`, TLS/`wss://`, the mixed-content ca
 
 To browse NomadNet, open the **Browser** view and pick a node from the directory (or paste a node hash).
 
+To share your current position, open a conversation and tap the **location pin** beside the attachment button. Allow browser location access, review the coordinates, reported accuracy and timestamp, optionally include a map link, then choose **Add to message** and **Send**. HTTPS is required. This requests one position only, never background tracking; no location is transmitted automatically. Opening the optional map link shares its coordinates with OpenStreetMap.
+
 ## Platform support
 
 | Platform            | Web Bluetooth | Web Serial | WebSocket (TCP via bridge) | Works? |

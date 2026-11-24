@@ -5,7 +5,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "node tests/identity-backup.mjs && node tests/aln.mjs && node tests/reply.mjs && node tests/propagation.mjs && node tests/roundtrip.mjs && python tests/run_tests.py && python tests/run_stamps.py"
+    "test": "node tests/location-share.mjs && node tests/identity-backup.mjs && node tests/aln.mjs && node tests/reply.mjs && node tests/propagation.mjs && node tests/roundtrip.mjs && python tests/run_tests.py && python tests/run_stamps.py"
   },
   "devDependencies": {
     "@msgpack/msgpack": "3.0.0-beta2",

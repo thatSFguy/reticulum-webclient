@@ -974,6 +974,7 @@ a { color: var(--accent); }
 
 .compose textarea {
   flex: 1;
+  min-width: 0;
   min-height: 38px;
   max-height: 120px;
   padding: 9px 14px;
@@ -2108,6 +2109,22 @@ textarea:focus {
   color: var(--text-2); align-self: flex-end;
 }
 .attach-btn:hover { color: var(--text); }
+.location-btn {
+  flex: 0 0 40px; min-height: 44px;
+  display: flex; align-items: center; justify-content: center;
+  border: none; border-radius: var(--radius-sm); background: none;
+  color: var(--text-2); cursor: pointer;
+}
+.location-btn:hover { color: var(--text); background: var(--surface-hover); }
+.location-btn svg { width: 21px; height: 21px; }
+.location-dialog { max-height: calc(100vh - 32px); max-height: calc(100dvh - 32px); overflow-y: auto; }
+.location-details {
+  display: grid; grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px 12px; margin: 14px 0; font-size: 13px;
+}
+.location-details dt { color: var(--text-2); }
+.location-details dd { margin: 0; overflow-wrap: anywhere; }
+.location-link-option { display: flex; align-items: center; gap: 8px; margin: 14px 0; font-size: 13px; }
 .att-image-link { display: block; }
 .att-image {
   max-width: 220px; max-height: 220px;

@@ -89,6 +89,7 @@ jobs:
       - name: Run JS unit tests (identity backup, ALN tunnel, reply threading, propagation)
         run: |
           node tests/identity-backup.mjs
+          node tests/location-share.mjs
           node tests/aln.mjs
           node tests/reply.mjs
           node tests/propagation.mjs
