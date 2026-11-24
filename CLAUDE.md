@@ -52,7 +52,11 @@ reticulum-webclient/
     reticulum.js            — Packet header encode/decode, constants
     identity.js             — Ed25519/X25519 keypair, identity/dest hashes
     crypto.js               — ECDH + HKDF + Token encrypt/decrypt
-    announce.js             — Build/parse/validate announces
+    announce.js             — Build/parse/validate announces (+ §4.7 stamp trailer)
+    stamps.js, stamp-worker.js
+                            — Proof-of-work stamps (RNS/Stamps.py port: fractional
+                              cost targets, LXMF workblocks, Web Worker search)
+    sha256.js               — Sync SHA-256/HMAC/HKDF with resumable midstate
     lxmf.js                 — LXMF message pack/unpack + signature
     link.js                 — Links: handshake, session crypto, keepalive
     resource.js             — Resource transfers over Links (send + receive)
@@ -95,6 +99,8 @@ All vendored into `lib/` (no CDN at runtime, no npm install needed):
 Everything from the original phased plan shipped long ago, plus a lot the plan deferred. In scope and working today:
 
 - Announces (send/receive/validate, ratchet field, display names, path responses)
+- **Announce stamps** (§4.7, RNS 1.6) — validate/strip the trailer and record the
+  peer's link-request cost; generate our own destination stamp once (persisted)
 - Opportunistic LXMF send/receive with delivery proofs and retries
 - **Ratchets** — encrypt to the peer's announced ratchet key; rotate our own
 - **Links** — handshake, session crypto, keepalive, LXMF-over-Link

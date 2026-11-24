@@ -9,7 +9,8 @@ import { AlnInterface } from './aln-interface.js';
 import { toHex } from './kiss.js';
 import { Identity, computeDestinationHash, computeNameHash, truncatedHash, sha256 } from './identity.js';
 import { parsePacket, buildPacket, PACKET_ANNOUNCE, PACKET_DATA, PACKET_LINKREQ, PACKET_PROOF, DEST_SINGLE, DEST_LINK, DEST_PLAIN, HEADER_1, HEADER_2, TRANSPORT_BROADCAST, TRANSPORT_TRANSPORT, PACKET_TYPE_NAMES } from './reticulum.js';
-import { parseAnnounce, validateAnnounce, buildAnnounce, extractDisplayName, concatBytes, arraysEqual } from './announce.js';
+import { parseAnnounce, validateAnnounce, buildAnnounce, extractDisplayName, parseLxmfAppData, concatBytes, arraysEqual } from './announce.js';
+import { generateStamp, stampValid, destinationStampMaterial, DESTINATION_COST, DESTINATION_VALUE, LR_COST, STAMPLENGTH } from './stamps.js';
 import { encrypt, decrypt } from './crypto.js';
 import { unpackMessage, unpackLinkMessage, verifyMessageSignature, packMessage } from './lxmf.js';
 import { Link, LINK_ACTIVE, LINK_CLOSED, computePacketFullHash } from './link.js';
@@ -392,6 +393,9 @@ async function initIdentity() {
   // path-response announce, otherwise peers can't message us once
   // their cached path expires.
   pathRequestDest = await truncatedHash(await computeNameHash('rnstransport.path.request'));
+  // Start the one-time announce-stamp PoW now so it's usually ready
+  // before the first announce goes out (SPEC §4.7).
+  ensureDestStamp().catch(() => {});
   setMyAddress(toHex(myDestHash));
   log('info', `LXMF address: ${toHex(myDestHash)}`);
 
@@ -559,7 +563,8 @@ async function handleAnnounce(pkt, rssi) {
   // ("ratdeck1") with a hex prefix on every minimal re-announce, then
   // restore it on the next fat announce — visible UI churn.
   // Priority: extracted > existing > idHashPrefix.
-  const extracted = extractDisplayName(announce.appData);
+  const lxmfData = parseLxmfAppData(announce.appData);
+  const extracted = lxmfData.name;
   const destHashHexForExisting = toHex(announce.destHash || pkt.destHash);
   const existing = contacts.get(destHashHexForExisting)?.displayName;
   const displayName = extracted || existing || idHash.substring(0, 8);
@@ -572,7 +577,7 @@ async function handleAnnounce(pkt, rssi) {
 
   // Validate signature
   const valid = validateAnnounce(announce, pkt.destHash);
-  log(valid ? 'ok' : 'err', `  Announce from "${displayName}" [${idHash.substring(0,12)}...] sig=${valid ? 'valid' : 'INVALID'}`);
+  log(valid ? 'ok' : 'err', `  Announce from "${displayName}" [${idHash.substring(0,12)}...] sig=${valid ? 'valid' : 'INVALID'}${describeAnnounceStamp(announce)}${lxmfData.stampCost ? ` msg-stamp-cost=${lxmfData.stampCost}` : ''}`);
 
   if (!valid) return;
 
@@ -615,6 +620,11 @@ async function handleAnnounce(pkt, rssi) {
     // of the long-term identity X25519 key. Falls back to the
     // identity key in sendMessage when this is null.
     ratchetPub: announce.ratchet ? Array.from(announce.ratchet) : null,
+    // SPEC §5.7.4: the PoW cost this peer requires on inbound LXMF
+    // messages (null = none). §4.7/§6.1.1: the cost it wants on link
+    // requests — only known when its announce stamp validated.
+    stampCost: lxmfData.stampCost,
+    lrCost: announce.stamp?.lrCost ?? null,
     displayName,
     userLabel: existingContact?.userLabel || null,
     pinned: !!existingContact?.pinned,
@@ -706,6 +716,8 @@ async function handleNonLxmfAnnounce(announce, pkt, rssi) {
     lat: Number.isFinite(lat) ? lat : null,
     lon: Number.isFinite(lon) ? lon : null,
     appDataHex: toHex(announce.appData),
+    // §4.7/§6.1.1 link-request cost (NomadNet nodes, propagation nodes).
+    lrCost: announce.stamp?.lrCost ?? null,
     lastSeen: Date.now(),
     rssi,
   };
@@ -3680,12 +3692,19 @@ async function sendAnnounce({ pathResponse = false } = {}) {
   }
 
   const displayName = $('my-name').value.trim() || 'WebClient';
-  // LXMF/Sideband format: msgpack([display_name_bytes, stamp_cost])
+  // LXMF 1.3 format (SPEC §4.3): [name(bin), ceil(cost)|nil, [SF_COMPRESSION], cost|nil].
+  // We require no inbound stamp, so both cost slots are nil.
   const nameBytes = new TextEncoder().encode(displayName);
-  const appData = new Uint8Array(msgpackEncode([nameBytes, 0]));
+  const appData = new Uint8Array(msgpackEncode([nameBytes, null, [SF_COMPRESSION], null]));
+
+  // SPEC §4.7: RNS 1.6 announces carry a destination stamp. It's computed
+  // once per identity (seconds of PoW) and persisted; until it exists we
+  // announce unstamped, which upstream still accepts by default.
+  const destStamp = await ensureDestStamp();
 
   const { destHash, payload, hasRatchet } = await buildAnnounce(
-    myIdentity, 'lxmf.delivery', appData, myIdentity.ratchetPubKey
+    myIdentity, 'lxmf.delivery', appData, myIdentity.ratchetPubKey,
+    destStamp, LR_COST
   );
 
   const packet = buildPacket({
@@ -3710,7 +3729,64 @@ async function sendAnnounce({ pathResponse = false } = {}) {
   if (pathResponse) lastPathResponseAt = Date.now();
   else lastAnnounceAt = Date.now();
   const label = pathResponse ? 'Path-response announce' : 'Announce';
-  log('ok', `${label} sent as "${displayName}" [${toHex(destHash).substring(0,12)}...]${hasRatchet ? ' (ratchet)' : ''}`);
+  log('ok', `${label} sent as "${displayName}" [${toHex(destHash).substring(0,12)}...]${hasRatchet ? ' (ratchet)' : ''}${destStamp ? ' (stamped)' : ' (unstamped)'}`);
+}
+
+// ---- Destination stamp (SPEC §4.7) ------------------------------------
+
+const SF_COMPRESSION = 0x00;            // LXMF supported-functionality flag
+const DSTAMP_KEY_PREFIX = 'rlw.dstamp.';
+let myDestStamp = null;                 // { destHex, stamp: Uint8Array(14) }
+let destStampJob = null;                // in-flight generation promise
+
+function describeAnnounceStamp(announce) {
+  const st = announce.stamp;
+  if (!st || !st.stamped) return '';
+  if (!st.valid) return ` stamp=insufficient(${st.value})`;
+  return ` stamp=${st.value} lr-cost=${st.lrCost}`;
+}
+
+// Returns our 14-byte destination stamp, or null while it's still being
+// generated (kicks generation off on first call). The stamp binds
+// dest_hash || public_key || name_hash, so it's keyed by dest hash and
+// re-validated on load; a different identity simply misses the cache.
+async function ensureDestStamp() {
+  if (!myIdentity || !myDestHash || !lxmfNameHash) return null;
+  const destHex = toHex(myDestHash);
+  if (myDestStamp?.destHex === destHex) return myDestStamp.stamp;
+  const material = destinationStampMaterial(myDestHash, myIdentity.publicKey, lxmfNameHash);
+  try {
+    const hex = localStorage.getItem(DSTAMP_KEY_PREFIX + destHex);
+    if (hex) {
+      const s = hexToBytes(hex);
+      if (s.length === STAMPLENGTH && stampValid(s, DESTINATION_COST, material)) {
+        myDestStamp = { destHex, stamp: s };
+        return s;
+      }
+    }
+  } catch (_) { /* storage unavailable — regenerate */ }
+  if (!destStampJob) {
+    const t0 = Date.now();
+    log('info', `Generating announce stamp (cost ${DESTINATION_VALUE}, one-time)…`);
+    destStampJob = generateStamp(material, DESTINATION_VALUE, { size: STAMPLENGTH })
+      .then((res) => {
+        destStampJob = null;
+        if (!res) return;
+        // Identity may have changed while we were working.
+        if (!myDestHash || toHex(myDestHash) !== destHex) return;
+        myDestStamp = { destHex, stamp: res.stamp };
+        try { localStorage.setItem(DSTAMP_KEY_PREFIX + destHex, toHex(res.stamp)); } catch (_) {}
+        log('ok', `Announce stamp ready: value ${res.value} after ${res.rounds.toLocaleString()} rounds in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+        // Re-announce so peers get the stamped form now, not in an hour
+        // (after the burst limiter's gap, if we announced unstamped just now).
+        if (radioOn) {
+          const wait = Math.max(0, ANNOUNCE_MIN_GAP_MS - (Date.now() - lastAnnounceAt)) + 1000;
+          setTimeout(() => { if (radioOn) sendAnnounce().catch(() => {}); }, wait);
+        }
+      })
+      .catch((e) => { destStampJob = null; log('err', `Announce stamp generation failed: ${e.message}`); });
+  }
+  return null;
 }
 
 // ---- UI rendering ----------------------------------------------------
@@ -5238,6 +5314,7 @@ $('btn-new-id').addEventListener('click', async () => {
   myDestHash = await computeDestinationHash('lxmf.delivery', myIdentity.hash);
   setMyAddress(toHex(myDestHash));
   log('ok', `New identity: ${toHex(myDestHash)}`);
+  ensureDestStamp().catch(() => {});
 });
 $('btn-export-id').addEventListener('click', () => {
   const data = JSON.stringify(myIdentity.exportPrivateKeys());

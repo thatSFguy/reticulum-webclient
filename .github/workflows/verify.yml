@@ -101,3 +101,12 @@ jobs:
         # js/announce.js, js/crypto.js, js/lxmf.js, or js/link.js
         # that changes the wire format will show up here.
         run: python tests/run_tests.py
+
+      - name: Run stamp conformance (tests/stamps.mjs via tests/run_stamps.py)
+        # Proof-of-work stamps (SPEC §4.7 announce, §5.7 LXMF, §6.1.1 link
+        # request, §7.1 path request). The JS generates each kind; RNS's
+        # own RNS.Stamps / validate_announce must accept them. Needs RNS
+        # >= 1.6 (RNS.Stamps did not exist before).
+        run: |
+          python -m pip install "rns>=1.6.1"
+          python tests/run_stamps.py

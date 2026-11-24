@@ -81,6 +81,11 @@ async function main() {
     "error-response detection wrong");
   ok(pnErrorName(0xf0).includes("NO_IDENTITY"), "0xf0 error name wrong");
   ok(pnErrorName(0x99).includes("0x99"), "unknown error code not surfaced");
+  // SPEC §5.8.2 (corrected 2026-08-19): values are not contiguous.
+  ok(pnErrorName(0xf6).includes("THROTTLED"), "0xf6 must be ERROR_THROTTLED");
+  ok(pnErrorName(0xf5).includes("INVALID_STAMP"), "0xf5 must be ERROR_INVALID_STAMP");
+  ok(pnErrorName(0xfd).includes("NOT_FOUND"), "0xfd must be ERROR_NOT_FOUND");
+  ok(pnErrorName(0xf2).includes("unknown"), "0xf2 is unallocated upstream");
 
   console.log(`propagation.mjs: ${pass} passed, ${fail} failed`);
   for (const e of errs) console.error(`  FAIL: ${e}`);
