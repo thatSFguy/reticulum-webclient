@@ -66,8 +66,12 @@ reticulum-webclient/
     transport-config.js     — Repeater config protocol (BLE GATT / Serial)
     transport-flasher-app.js— flasher.html controller
     store.js                — IndexedDB for identity, contacts, messages
+    identity-backup.js      — Identity export/import JSON (+ display name)
+    location-share.js       — One-shot, user-reviewed location into the draft
+    reconnect.js            — WebSocket auto-reconnect (resume/network/refresh)
   lib/                      — Vendored libraries (see Dependencies)
-  tools/                    — ws_bridge (Go + Python), RNS verify scripts
+  tools/                    — ws_bridge (Go + Python), RNS verify scripts,
+                              web_sessions/ (optional nginx cookie-login example)
   tests/                    — roundtrip harness (Node) validated against
                               the Python RNS reference by run_tests.py
 ```

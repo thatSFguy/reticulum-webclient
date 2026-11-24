@@ -5279,6 +5279,9 @@ document.querySelectorAll('.js-connect-btn').forEach(b => {
 
 $('btn-disconnect').addEventListener('click', async () => {
   if (activeTransport === 'ws') {
+    // Gracefully LINKCLOSE before the socket drops (SPEC §6.7.3), as the
+    // non-WS path below does; wsReconnect.stop() then tears the socket down.
+    if (radioOn) await closeAllLinks();
     wsReconnect.stop();
     log('info', 'Disconnected');
     return;
