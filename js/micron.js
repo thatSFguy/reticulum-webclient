@@ -177,7 +177,9 @@ function renderInline(line) {
         let j = i + 2, name = '';
         while (j < n && NAME_CHAR.test(line[j])) { name += line[j]; j++; }
         flush();
-        if (name) out += `<span id="${escapeHtml(name)}"></span>`;
+        // Namespaced: a remote page must not be able to plant an element
+        // whose id collides with (and clobbers) one of the app's own.
+        if (name) out += `<span id="mu-anchor-${escapeHtml(name)}" class="mu-anchor"></span>`;
         i = j; continue;
       }
 

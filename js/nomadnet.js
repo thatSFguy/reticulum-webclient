@@ -90,12 +90,25 @@ const HASH_RE = /^[0-9a-f]{32}$/;
 //   { kind: 'page', path }                 same-node navigation
 //   { kind: 'node', hash, path }           cross-node page fetch
 //   { kind: 'lxmf', hash }                 open a conversation (not a page)
+//   { kind: 'anchor', name }               in-page jump ('' = top)
+//   { kind: 'partial', ids }               partial refresh (not supported)
+//   { kind: 'rrc', raw }                   RRC chat room (not supported)
 //   { kind: 'unknown', raw }
 // Hashes are normalized to lowercase and strictly validated (no embedded
 // separators) to avoid cache-poisoning aliases.
 export function parseLinkTarget(target) {
   if (!target) return { kind: 'unknown', raw: target };
   let t = target.trim();
+
+  // SPEC §11.6.3: local actions are dispatched BEFORE destination parsing
+  // (NomadNet Browser.py) — run the hash parser first and a working
+  // `#rules` link reads as a malformed hash.
+  //   #name / bare #   in-document anchor jump (no request)
+  //   p:id[:id…]       refresh partial placeholders (no navigation)
+  //   rrc://… / rrc@… / rrc.hub.session@…   an RRC chat room, not a page
+  if (t.startsWith('#')) return { kind: 'anchor', name: t.slice(1) };
+  if (t.startsWith('p:')) return { kind: 'partial', ids: t.slice(2).split(':').filter(Boolean) };
+  if (t.startsWith('rrc://') || t.startsWith('rrc@') || t.startsWith('rrc.hub.session@')) return { kind: 'rrc', raw: t };
 
   // Shorthand `type@hash[:path]` (nnn → node, lxmf → conversation).
   const at = t.indexOf('@');

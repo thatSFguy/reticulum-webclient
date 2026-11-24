@@ -12,7 +12,7 @@ import { exportIdentityBackup, validateIdentityImport } from './identity-backup.
 import { initLocationSharing } from './location-share.js';
 import { ReconnectController } from './reconnect.js';
 import { parsePacket, buildPacket, PACKET_ANNOUNCE, PACKET_DATA, PACKET_LINKREQ, PACKET_PROOF, DEST_SINGLE, DEST_LINK, DEST_PLAIN, HEADER_1, HEADER_2, TRANSPORT_BROADCAST, TRANSPORT_TRANSPORT, PACKET_TYPE_NAMES } from './reticulum.js';
-import { parseAnnounce, validateAnnounce, buildAnnounce, extractDisplayName, parseLxmfAppData, concatBytes, arraysEqual } from './announce.js';
+import { parseAnnounce, validateAnnounce, buildAnnounce, extractDisplayName, parseLxmfAppData, parseDiscoveryAppData, concatBytes, arraysEqual } from './announce.js';
 import { generateStamp, stampValid, destinationStampMaterial, pathRequestStampMaterial, buildPathRequestPayload, stampWorkblock, LXMF_STAMP_SIZE, DESTINATION_COST, DESTINATION_VALUE, LR_COST, PR_VALUE, PR_STAMP_TIMEOUT_MS, STAMPLENGTH } from './stamps.js';
 import { encrypt, decrypt } from './crypto.js';
 import { unpackMessage, unpackLinkMessage, verifyMessageSignature, packMessage, attachStamp, audioDescriptor } from './lxmf.js';
@@ -549,6 +549,14 @@ rnode._onPacket = onPacket;
 // ---- Announce handling -----------------------------------------------
 
 async function handleAnnounce(pkt, rssi) {
+  // SPEC §4.5 ingress bounds (RNS >= 1.5.2 / 1.6): an announce frame over
+  // the 500-byte MTU, or a HEADER_1 one without 16 bytes of headroom
+  // (> 484), is a protocol violation; and the body must at least hold
+  // public_key || name_hash || random_hash (84 bytes).
+  if (pkt.raw.length > 500 || (pkt.headerType === HEADER_1 && pkt.raw.length > 484) || pkt.payload.length < 84) {
+    log('info', `  (announce rejected: ${pkt.raw.length}-byte frame / ${pkt.payload.length}-byte body outside §4.5 bounds)`);
+    return;
+  }
   const announce = await parseAnnounce(pkt.payload, pkt.contextFlag, pkt.destHash);
   if (!announce) {
     log('info', '  (announce rejected: malformed or dest_hash mismatch)');
@@ -634,7 +642,9 @@ async function handleAnnounce(pkt, rssi) {
     // on the contact row so sendMessage can encrypt to it instead
     // of the long-term identity X25519 key. Falls back to the
     // identity key in sendMessage when this is null.
-    ratchetPub: announce.ratchet ? Array.from(announce.ratchet) : null,
+    // §7.3: an announce without a ratchet doesn't retire the one we know —
+    // upstream keeps the last ratchet until it expires.
+    ratchetPub: announce.ratchet ? Array.from(announce.ratchet) : (existingContact?.ratchetPub ? Array.from(existingContact.ratchetPub) : null),
     // SPEC §5.7.4: the PoW cost this peer requires on inbound LXMF
     // messages (null = none). §4.7/§6.1.1: the cost it wants on link
     // requests — only known when its announce stamp validated.
@@ -651,7 +661,8 @@ async function handleAnnounce(pkt, rssi) {
 
   const identity = new Identity();
   await identity.loadFromPublicKey(announce.publicKey);
-  const ratchetPubBytes = announce.ratchet ? new Uint8Array(announce.ratchet) : null;
+  const ratchetPubBytes = announce.ratchet ? new Uint8Array(announce.ratchet)
+    : (existingContact?.ratchetPub ? new Uint8Array(existingContact.ratchetPub) : null);
   contacts.set(destHashHex, {
     ...contact, identity, destHash: destHashBytes, ratchetPub: ratchetPubBytes,
     // In-memory only — an announce must not eat an unread badge.
@@ -704,17 +715,30 @@ async function handleNonLxmfAnnounce(announce, pkt, rssi) {
   //   bat=3952;up=30;hpf=90720;...;lat=43.16;lon=-85.65;msl=280
   // For heartbeats or other destinations we may just get a name.
   // extractDisplayName already returns a usable string for both.
-  const displayName = extractDisplayName(announce.appData) || `${nameHashHex.substring(0, 8)} / ${idHash.substring(0, 8)}`;
-
-  // Parse telemetry out of displayName so nodes that carry lat/lon
-  // in their key=value payload can be plotted on the map.
-  const telemetry = parseTelemetry(displayName);
-  const lat = telemetry ? parseFloat(telemetry.lat) : NaN;
-  const lon = telemetry ? parseFloat(telemetry.lon) : NaN;
-
   // Identify the service from the 10-byte name_hash so the UI can
   // show "rlr.telemetry" etc. instead of the raw hex.
   const known = lookupDestination(announce.nameHash);
+
+  // Service-specific app_data that is NOT a display name: interface
+  // discovery (§4.8, binary info map — would render as garbage) and the
+  // blackhole publisher (§12.7, no app_data of its own).
+  let displayName, lat = NaN, lon = NaN, telemetry = null;
+  if (known?.name === 'rnstransport.discovery.interface') {
+    const d = parseDiscoveryAppData(announce.appData);
+    const where = d?.reachableOn ? ` @ ${d.reachableOn}${d.port ? ':' + d.port : ''}` : '';
+    displayName = d?.encrypted ? 'Discoverable interface (private network)'
+      : d ? `${d.name || 'Interface'}${d.type ? ` · ${d.type}` : ''}${where}` : 'Discoverable interface';
+    if (d && d.lat != null && d.lon != null) { lat = d.lat; lon = d.lon; }
+  } else if (known?.name === 'rnstransport.info.blackhole') {
+    displayName = `Blackhole list · ${idHash.substring(0, 8)}`;
+  } else {
+    displayName = extractDisplayName(announce.appData) || `${nameHashHex.substring(0, 8)} / ${idHash.substring(0, 8)}`;
+    // Parse telemetry out of displayName so nodes that carry lat/lon
+    // in their key=value payload can be plotted on the map.
+    telemetry = parseTelemetry(displayName);
+    lat = telemetry ? parseFloat(telemetry.lat) : NaN;
+    lon = telemetry ? parseFloat(telemetry.lon) : NaN;
+  }
 
   const node = {
     hash: destHashHex,
@@ -2395,7 +2419,7 @@ async function pnPickNode() {
 function pnNodeLabel(node) {
   const state = pnNodeState(node);
   const paused = state && !state.active ? ' (paused)' : '';
-  return `${(node.userLabel || node.hash.slice(0, 12) + '…')}${paused}`;
+  return `${(node.userLabel || state?.name || node.hash.slice(0, 12) + '…')}${paused}`;
 }
 
 // LINKIDENTIFY (§6.7.6): prove our long-term identity on the link so the
@@ -2963,12 +2987,25 @@ function nnRenderPage(rawText, destHashHex, path) {
       ev.preventDefault();
       const tgt = parseLinkTarget(a.dataset.target);
       const data = a.dataset.fields != null ? nnCollectFields(pageEl, a.dataset.fields) : null;
-      if (tgt.kind === 'page') nnNavigate(destHashHex, tgt.path, { data });
+      if (tgt.kind === 'anchor') nnJumpToAnchor(pageEl, tgt.name);
+      else if (tgt.kind === 'page') nnNavigate(destHashHex, tgt.path, { data });
       else if (tgt.kind === 'node') nnNavigate(tgt.hash, tgt.path, { data });
       else if (tgt.kind === 'lxmf') nnSetStatus(`link opens an LXMF conversation with ${tgt.hash.slice(0,12)}… (open it from Messages)`, 'info');
+      else if (tgt.kind === 'partial') nnSetStatus('this link refreshes part of the page (partials) — not supported in the web client yet', 'info');
+      else if (tgt.kind === 'rrc') nnSetStatus('this link opens an RRC chat room — not supported in the web client yet', 'info');
       else nnSetStatus('unsupported link target', 'err');
     });
   });
+}
+
+// §11.6.3 in-document anchor: no request is sent. Bare '#' goes to the top.
+// Anchor ids are namespaced by micron.js (mu-anchor-*) and looked up only
+// inside the page element.
+function nnJumpToAnchor(pageEl, name) {
+  if (!name) { pageEl.scrollTop = 0; pageEl.scrollIntoView?.({ block: 'start' }); return; }
+  const el = Array.from(pageEl.querySelectorAll('.mu-anchor')).find((a) => a.id === `mu-anchor-${name}`);
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  else nnSetStatus(`anchor #${name} not found on this page`, 'info');
 }
 
 // Build the request data dict for a form-submitting link. `fieldsSpec` is

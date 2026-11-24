@@ -187,6 +187,34 @@ export function parseLxmfAppData(appData) {
   return out;
 }
 
+// Parse an interface-discovery announce's app_data (SPEC §4.8.1/§4.8.2):
+//   flags(1) || msgpack(info) || stamp(32)        (flags & 0x02 → encrypted)
+// `info` is keyed by small integers. Returns { encrypted } or
+// { name, type, transport, reachableOn, port, lat, lon } — display only;
+// we don't auto-connect to discovered interfaces, so the discovery stamp
+// (§4.8.3) is not validated. Null if it doesn't parse.
+export function parseDiscoveryAppData(appData) {
+  if (!appData || appData.length < 2) return null;
+  const flags = appData[0];
+  if (flags & 0x02) return { encrypted: true };
+  let info;
+  try { info = decodeFirstMsgpack(appData.subarray(1)); } catch { return null; }
+  if (!info || typeof info !== 'object') return null;
+  const get = (k) => (info instanceof Map ? info.get(k) : (info[k] ?? info[String(k)]));
+  const str = (v) => (typeof v === 'string' ? v : v instanceof Uint8Array ? new TextDecoder().decode(v) : null);
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  return {
+    encrypted: false,
+    name: str(get(0xFF)),
+    type: str(get(0x00)),
+    transport: get(0x01) === true,
+    reachableOn: str(get(0x02)),
+    port: num(get(0x06)),
+    lat: num(get(0x03)),
+    lon: num(get(0x04)),
+  };
+}
+
 // Extract display name from announce app_data.
 // LXMF/Sideband announces app_data as msgpack, typically:
 //   [display_name_bytes, stamp_cost, ...]

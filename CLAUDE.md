@@ -142,6 +142,10 @@ Everything from the original phased plan shipped long ago, plus a lot the plan d
 - **IFAC** — interface authentication (IFAC-flagged packets are rejected at parse)
 - **GROUP destinations** — only SINGLE needed for point-to-point messaging
 - **Multi-segment Resources** (> 1 MiB per segment)
+- **Blackhole lists** (§12.7) — a transport-node feature (`publish_blackhole` /
+  `blackhole_sources`); we only label `rnstransport.info.blackhole` announces
+- **NomadNet partials and RRC rooms** — `p:` and `rrc` links are recognised (§11.6.3)
+  and reported as unsupported instead of failing as malformed hashes
 
 ## Reticulum Protocol Quick Reference
 
