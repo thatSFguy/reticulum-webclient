@@ -96,6 +96,7 @@ jobs:
           node tests/reply.mjs
           node tests/propagation.mjs
           node tests/resource.mjs
+          node tests/lxmf-receive.mjs
 
       - name: Set up Python
         uses: actions/setup-python@v5
