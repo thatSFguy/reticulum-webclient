@@ -95,6 +95,7 @@ jobs:
           node tests/aln.mjs
           node tests/reply.mjs
           node tests/propagation.mjs
+          node tests/resource.mjs
 
       - name: Set up Python
         uses: actions/setup-python@v5

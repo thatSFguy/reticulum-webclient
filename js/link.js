@@ -45,6 +45,32 @@ export function encodeSignalling(mtu, mode) {
   return new Uint8Array([(val >> 16) & 0xFF, (val >> 8) & 0xFF, val & 0xFF]);
 }
 
+// Monotonic milliseconds for RTT (SPEC §15.2) — wall-clock steps (NTP,
+// manual changes) must not corrupt the measured RTT / keepalive interval.
+export function monoNow() {
+  return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+}
+
+// Reticulum base MTU; the link runs at this when no signalling is exchanged.
+export const BASE_MTU = 500;
+
+// RNS Link keepalive timing (SPEC §6.7.1): RTT × (KEEPALIVE_MAX /
+// KEEPALIVE_MAX_RTT) clamped to [KEEPALIVE_MIN, KEEPALIVE_MAX] seconds;
+// stale after STALE_FACTOR × keepalive with no inbound traffic.
+export const KEEPALIVE_MAX = 360;
+export const KEEPALIVE_MIN = 5;
+export const KEEPALIVE_MAX_RTT = 1.75;
+export const STALE_FACTOR = 2;
+export function keepaliveSeconds(rtt) {
+  if (!(rtt > 0)) return KEEPALIVE_MAX;
+  return Math.max(Math.min(rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT), KEEPALIVE_MAX), KEEPALIVE_MIN);
+}
+
+// Resource part size on a link (SPEC §10.2 step 6): link.mtu −
+// HEADER_MAXSIZE(35) − IFAC_MIN_SIZE(1). Both ends derive the part count
+// from this, so a sender MUST NOT slice at anything else.
+export function resourceSdu(mtu) { return (mtu || BASE_MTU) - 36; }
+
 export function decodeSignalling(bytes) {
   const val = (bytes[0] << 16) | (bytes[1] << 8) | bytes[2];
   return { mtu: val & 0x1FFFFF, mode: (val >> 21) & 0x07 };
@@ -141,7 +167,11 @@ export class Link {
   //
   // Returns { link, proofData } on success where proofData is the raw
   // payload bytes to put into an LRPROOF packet. Throws on invalid input.
-  static async validateRequest(pkt, ourIdentity) {
+  //
+  // `maxMtu` clamps the peer's requested MTU to what our bearer carries —
+  // upstream does the same against the receiving interface's HW_MTU
+  // (SPEC §6.6), so the LRPROOF confirms min(requested, ours).
+  static async validateRequest(pkt, ourIdentity, maxMtu = BASE_MTU) {
     const data = pkt.payload;
     if (data.length !== ECPUBSIZE && data.length !== ECPUBSIZE + LINK_MTU_SIZE) {
       throw new Error(`Invalid LINKREQUEST payload size ${data.length}`);
@@ -150,11 +180,11 @@ export class Link {
     const peerX25519Pub  = data.subarray(0, 32);
     const peerEd25519Pub = data.subarray(32, 64);
 
-    let mtu  = 500;
+    let mtu  = Math.min(BASE_MTU, maxMtu);
     let mode = MODE_AES256_CBC;
     if (data.length === ECPUBSIZE + LINK_MTU_SIZE) {
       const sig = decodeSignalling(data.subarray(ECPUBSIZE, ECPUBSIZE + LINK_MTU_SIZE));
-      if (sig.mtu > 0) mtu = sig.mtu;
+      if (sig.mtu > 0) mtu = Math.min(sig.mtu, maxMtu);
       mode = sig.mode;
     }
     if (mode !== MODE_AES256_CBC) {
@@ -174,6 +204,8 @@ export class Link {
     link.mtu            = mtu;
     link.mode           = mode;
     link.ownerDestHash  = new Uint8Array(pkt.destHash);
+    link.createdAt      = Date.now();     // pending responder links age out (app.js watchdog)
+    link.createdMono    = monoNow();
 
     // ECDH + HKDF. Upstream Link::handshake uses salt=link_id, info=empty.
     const shared = x25519.getSharedSecret(link.ourX25519Priv, link.peerX25519Pub);
@@ -225,12 +257,18 @@ export class Link {
   // `stampedKey` ({ priv, pub } X25519, plus the Ed25519 pair it was bound
   // to) comes from createInitiatorStamped (SPEC §6.1.1); without it both
   // ephemerals are fresh random keys — an unstamped request.
-  static createInitiator(peerLongTermSigPub, peerDestHash, stampedKey = null) {
+  //
+  // `mtu` is the link MTU we ask for in the signalling bytes (§6.6). The
+  // responder confirms min(ours, its own), and both sides then size
+  // Resource parts from it (§10.2) — so a slow bearer asks for less.
+  static createInitiator(peerLongTermSigPub, peerDestHash, stampedKey = null, mtu = BASE_MTU) {
     const link = new Link();
     link.isInitiator = true;
     link.peerLongTermSigPub = new Uint8Array(peerLongTermSigPub);
     link.ownerDestHash = new Uint8Array(peerDestHash);
     link.createdAt = Date.now();
+    link.createdMono = monoNow();
+    link.mtu = mtu;
 
     // Ephemeral X25519 AND ephemeral Ed25519 on the initiator side.
     // The Ed25519 pub goes into the LINKREQUEST body as bytes 32..63
@@ -268,10 +306,10 @@ export class Link {
   // link; we instead fall back to an unstamped request, which responders
   // accept unless they enforce stamps. Resolves { link, requestData,
   // stamped, value, ms }.
-  static async createInitiatorStamped(peerLongTermSigPub, peerDestHash, lrCost, { timeoutMs = LINK_STAMP_TIMEOUT_MS } = {}) {
+  static async createInitiatorStamped(peerLongTermSigPub, peerDestHash, lrCost, { timeoutMs = LINK_STAMP_TIMEOUT_MS, mtu = BASE_MTU } = {}) {
     const cost = Number(lrCost);
     if (!(cost > 0) || cost > LINK_COST_CAP) {
-      return { ...Link.createInitiator(peerLongTermSigPub, peerDestHash), stamped: false, value: null, ms: 0 };
+      return { ...Link.createInitiator(peerLongTermSigPub, peerDestHash, null, mtu), stamped: false, value: null, ms: 0 };
     }
     const t0 = Date.now();
     const sigPriv = ed25519.utils.randomPrivateKey();
@@ -280,9 +318,9 @@ export class Link {
     const key = await generateStampedKey(material, cost, { timeoutMs });
     const ms = Date.now() - t0;
     if (!key) {
-      return { ...Link.createInitiator(peerLongTermSigPub, peerDestHash), stamped: false, value: null, ms };
+      return { ...Link.createInitiator(peerLongTermSigPub, peerDestHash, null, mtu), stamped: false, value: null, ms };
     }
-    const r = Link.createInitiator(peerLongTermSigPub, peerDestHash, { priv: key.priv, pub: key.pub, sigPriv, sigPub });
+    const r = Link.createInitiator(peerLongTermSigPub, peerDestHash, { priv: key.priv, pub: key.pub, sigPriv, sigPub }, mtu);
     return { ...r, stamped: true, value: key.value, ms };
   }
 
@@ -324,16 +362,21 @@ export class Link {
     const signature = data.subarray(0, SIGLENGTH);
     const peerX25519Pub = data.subarray(SIGLENGTH, SIGLENGTH + 32);
 
-    let mtu = this.mtu;
+    // SPEC §6.6.5: a 96-byte proof carries no signalling, so the responder
+    // signed link_id || x25519 || sig_pub with NOTHING after it, and the
+    // link runs at the base MTU. Reusing our own request's signalling here
+    // would fail verification against any responder that omits it.
+    let mtu = BASE_MTU;
     let mode = this.mode;
-    let signallingFromProof = this.signallingBytes;
+    let signallingFromProof = new Uint8Array(0);
     if (data.length === SIGLENGTH + 32 + LINK_MTU_SIZE) {
       const sigBytes = data.subarray(SIGLENGTH + 32, SIGLENGTH + 32 + LINK_MTU_SIZE);
       const decoded = decodeSignalling(sigBytes);
       if (decoded.mode !== this.mode) {
         return { ok: false, reason: `LRPROOF mode 0x${decoded.mode.toString(16)} does not match requested` };
       }
-      if (decoded.mtu > 0) mtu = decoded.mtu;
+      // The responder may confirm less than we asked for, never more.
+      mtu = decoded.mtu > 0 ? Math.min(decoded.mtu, this.mtu) : this.mtu;
       signallingFromProof = new Uint8Array(sigBytes);
     }
 
@@ -370,7 +413,7 @@ export class Link {
     this.derivedKey = await hkdfDerive(shared, this.linkId, new Uint8Array(0), LINK_KEYSIZE);
     this.status = LINK_ACTIVE;
     this.establishedAt = Date.now();
-    this.rtt = (this.establishedAt - this.createdAt) / 1000;
+    this.rtt = (monoNow() - (this.createdMono ?? monoNow())) / 1000;
 
     // Build the LRRTT packet data: Token-encrypted msgpack of the RTT.
     // Caller wraps this in a PACKET_DATA with context=LRRTT addressed
