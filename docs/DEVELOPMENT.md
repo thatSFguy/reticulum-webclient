@@ -50,29 +50,41 @@ reticulum-webclient/
     reticulum.js           Reticulum packet header encode/decode + constants
     identity.js            Ed25519 + X25519 keypair, identity hash, destination hash, ratchet
     crypto.js              ECDH + HKDF + Token (AES-256-CBC + HMAC-SHA256)
-    announce.js            Build, parse, and validate Reticulum announces (incl. ratchet)
+    announce.js            Build, parse, and validate Reticulum announces (incl. ratchet
+                           and the RNS 1.6 stamp trailer)
+    stamps.js              Proof-of-work stamps (port of RNS/Stamps.py): fractional cost
+                           targets, LXMF workblocks, announce / link-request / path-request
+                           / message stamps; search fans out over Web Workers
+    stamp-worker.js        Web Worker body for the stamp search
+    sha256.js              Synchronous SHA-256 / HMAC / HKDF with resumable midstate
     link.js                Reticulum Link: responder validation, initiator handshake,
                            LRPROOF build/verify, link_id derivation, signalling encoding,
                            Token encrypt/decrypt over the derived link key
     resource.js            Resource transfer (multi-packet): send + receive, proofs
                            (attachments, large messages, NomadNet pages/files)
-    lxmf.js                LXMF message pack/unpack + signature
+    lxmf.js                LXMF message pack/unpack + signature, stamp attachment
+    propagation.js         Propagation-node /get wire shapes (offline-message retrieval)
     nomadnet.js            NomadNet REQUEST/RESPONSE protocol + link-target parsing
     micron.js              Micron markup → HTML (headings, styling, links, fields, tables)
     known-destinations.js  Well-known destination hash labels
     store.js               IndexedDB for identity, contacts, messages, nodes, bookmarks
+    identity-backup.js     Identity export/import JSON (keys + display name)
+    location-share.js      One-shot, user-reviewed location sharing
+    reconnect.js           WebSocket auto-reconnect (resume / network / refresh)
     app.js                 UI controller and state management
     (transport-config.js, transport-flasher-app.js, dfu.js power the repeater flasher page)
 
   lib/                     Vendored libraries (@noble/curves, @msgpack/msgpack, bz2,
                            Leaflet, qrcode-generator) — no CDN at runtime
   hubs.json                Curated public RNS hubs prefilled into the TCP connect field
-  tools/                   Go + Python WS bridges, Python RNS-based offline verifiers
-  test/, tests/            In-browser self-test page + round-trip harness vs RNS reference
+  tools/                   Go + Python WS bridges, Python RNS-based offline verifiers,
+                           web_sessions/ (optional nginx cookie-login for hosted bridges)
+  test/, tests/            In-browser self-test page; Node unit tests; round-trip and
+                           stamp harnesses validated against the RNS / LXMF reference
   docs/PROTOCOL_NOTES.md   Reticulum / LXMF interop findings reference
 ```
 
-Web Crypto handles AES-CBC, HMAC, HKDF, and SHA-256 natively.
+Web Crypto handles AES-CBC, HMAC, HKDF, and SHA-256 natively; `js/sha256.js` adds a synchronous SHA-256 only where proof-of-work needs a resumable hash state.
 
 ## Diagnostic tools and bridge
 

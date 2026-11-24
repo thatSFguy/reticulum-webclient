@@ -6,6 +6,8 @@ A browser-based Reticulum messaging client. Connects either directly to an [RNod
 
 Nothing to install for the app itself — it's a static page. Your identity, contacts, and messages stay in your browser; only encrypted packets ever leave it.
 
+**Compatible with current Reticulum:** RNS 1.6 / LXMF 1.3, including the proof-of-work **stamps** those versions introduced on announces, link requests, path requests, and messages. Peers that require a stamp to message them get one automatically.
+
 ## Screenshots
 
 | Messages | Nodes |
@@ -22,12 +24,14 @@ The Go WebSocket bridge (`tools/ws_bridge.go`) bridging a browser to a public `r
 
 ## Features
 
-- **End-to-end encrypted messaging** with Sideband, MeshChat, NomadNet, and any other LXMF client — text, file and image attachments, emoji reactions, and reply threading. Per-message delivery states (sending → sent ✓ → delivered ✓✓).
+- **End-to-end encrypted messaging** with Sideband, MeshChat, NomadNet, and any other LXMF client — text, file and image attachments, emoji reactions, and reply threading. Per-message delivery states (sending → sent ✓ → delivered ✓✓), with automatic retries and a *failed* state.
+- **Offline messages** — fetches mail that a propagation node held for you while you were away, on connect and every 15 minutes.
+- **Location sharing** — send your current position once, after reviewing it (never background tracking).
 - **Three ways onto the network:** an RNode LoRa modem over Bluetooth or USB (no internet, no server), any `rnsd` daemon over a small WebSocket bridge (works in every browser, including iOS), or an agnostic-LoRa-Net BLE mesh node.
 - **NomadNet browser** — pages, links, forms, tables, and file downloads, with bookmarks and history.
 - **Nodes view** — everything announcing on the mesh (repeaters, telemetry beacons, other clients), with a map for nodes that broadcast a position.
 - **Contact sharing** — QR code, contact-card text, or a bare destination hash (the app fetches the peer's key from the network automatically).
-- **Your identity is yours** — generated in the browser, stored locally, exportable/importable as a file. No accounts, no server, no phone number.
+- **Your identity is yours** — generated in the browser, stored locally, exportable/importable as a file (including your display name). No accounts, no server, no phone number.
 
 ## Getting started
 
@@ -45,11 +49,11 @@ Works everywhere — including Safari, Firefox, and iOS — by joining the netwo
 
 Full walkthrough — running your own `rnsd`, TLS/`wss://`, the mixed-content caveat, and troubleshooting — in **[docs/TCP-BRIDGE.md](docs/TCP-BRIDGE.md)**.
 
-After you choose WebSocket Connect, the client remembers that intent: it reconnects after network loss, when returning to the foreground, and after refreshing the page. Choosing **Disconnect** disables this behavior, including across refreshes. Retries back off while the server is unavailable and pause while the page is hidden or the device is offline. This does not keep iOS running while locked, and cannot make the browser retain HTTP Basic credentials; authenticated hosting may need a secure remembered-login session.
+After you choose WebSocket Connect, the client remembers that intent: it reconnects after network loss, when returning to the foreground, and after refreshing the page. Choosing **Disconnect** disables this behavior, including across refreshes. Retries back off while the server is unavailable and pause while the page is hidden or the device is offline. This does not keep iOS running while locked, and cannot make the browser retain HTTP Basic credentials; if you host the app and bridge behind a password, **[tools/web_sessions](tools/web_sessions/README.md)** is an optional nginx setup that keeps you signed in with a secure cookie.
 
 ### First steps once connected
 
-1. **Set your display name** and click **Send Announce** — this tells the network how to reach you. Your address is under *Your Identity*.
+1. **Set your display name** and click **Send Announce** — this tells the network how to reach you. Your address is under *Your Identity*. On first launch the app spends a few seconds (longer on a phone) computing a one-time announce stamp in the background; until it's ready your announces go out unstamped, which current Reticulum still accepts.
 2. **Wait for announces** — other nodes appear in the contact list and Nodes view as they announce.
 3. **Open a conversation** — click a contact, type, hit Enter. Or add a contact directly from their QR code / contact card / destination hash via **+ Add / Share**.
 4. **Back up your identity** — *Export Identity* saves your keys as a file. Treat it like a password; anyone with the file can impersonate you.
@@ -72,13 +76,14 @@ WebSocket works everywhere, which is the practical way to use the client from Sa
 
 ## What it does not do (yet)
 
-- **No store-and-forward** (propagation nodes): both parties must be on the network at the same time.
+- **No sending via propagation nodes**: offline messages are *retrieved* from a propagation node, but your own messages are only delivered directly, so the recipient must be reachable when you send (the app keeps retrying while it's open).
+- **No inbound stamp requirement**: you can't require senders to stamp messages to you, and the app doesn't hand out tickets.
 - **No multi-hop transport routing**: this is a leaf node, not a relay.
 - Some NomadNet corners: server-side includes render as placeholders; no identify-on-connect for auth-gated pages.
 
 ## Privacy and security in brief
 
-- Message content is end-to-end encrypted (Reticulum's standard ECDH + HKDF + AES-256-CBC + HMAC scheme, with ratchet rotation on every announce). Bridges, daemons, and relays only ever see encrypted packets.
+- Message content is end-to-end encrypted (Reticulum's standard ECDH + HKDF + AES-256-CBC + HMAC scheme, with forward-secrecy ratchets rotated at most every 30 minutes). Bridges, daemons, and relays only ever see encrypted packets.
 - Your private keys live **unencrypted in the browser's IndexedDB**, and the exported identity file is unencrypted JSON — protect both like passwords.
 - Reticulum metadata (destination hashes, your display name, announce timing) is visible to network observers by protocol design, even though content is not.
 - Use `wss://` rather than `ws://` for any bridge connection beyond localhost.
