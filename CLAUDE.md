@@ -116,6 +116,9 @@ Everything from the original phased plan shipped long ago, plus a lot the plan d
 - **Link-request stamps** (§6.1.1) — stamped ephemeral X25519 key when the destination
   announced a cost (falls back to unstamped on timeout); **stamped path requests**
   (§7.1, 64-byte form with ephemeral transport_id); inbound path? lengths per §7.2.1
+- **LXMF stamps** (§5.7) — proof-of-work stamp on outbound messages/reactions to peers
+  that announce a stamp cost; 16-byte ticket stamps when a peer gave us a ticket
+  (fields[0x0C]); stamped-message message_id taken from the wire prefix (§5.6.1)
 - Opportunistic LXMF send/receive with delivery proofs and retries
 - **Ratchets** — encrypt to the peer's announced ratchet key; rotate our own
 - **Links** — handshake, session crypto, keepalive, LXMF-over-Link
@@ -130,7 +133,8 @@ Everything from the original phased plan shipped long ago, plus a lot the plan d
 
 - **Propagation-node submission** — the outbound `PROPAGATED` method (handing our own sends to a node for offline recipients); we only retrieve
 - **Multi-hop transport** — full routing table (we are a leaf; the §2.3 HEADER_2 conversion + upstream transport_id is sufficient)
-- **LXMF stamps** — proof-of-work (skip unless target network requires it)
+- **Inbound LXMF stamp enforcement / issuing tickets** — we announce no inbound
+  stamp cost, so we neither validate peers' stamps nor hand out tickets
 - **IFAC** — interface authentication (IFAC-flagged packets are rejected at parse)
 - **GROUP destinations** — only SINGLE needed for point-to-point messaging
 - **Multi-segment Resources** (> 1 MiB per segment)

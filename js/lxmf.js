@@ -8,7 +8,9 @@
 //   source_hash(16) + signature(64) + msgpack(payload)
 //
 // Payload msgpack array: [timestamp, title_bytes, content_bytes, fields_dict]
-// Optional 5th element: stamp (proof-of-work, ignored for now)
+// Optional 5th element: stamp (SPEC §5.7) — 32-byte proof-of-work or a
+// 16-byte ticket stamp. It is NOT covered by the signature or message_id;
+// attachStamp() appends it after signing.
 
 'use strict';
 
@@ -94,7 +96,16 @@ export async function unpackMessage(data, destHash) {
   //     drifts from ours (non-minimal ints, str-vs-bin, float width).
   //   - stamped (5-element array): element [4] dropped, first four
   //     re-packed canonically (== strippedMsgpack here).
-  const msgpackForId = payload.length === 4 ? msgpackData : strippedMsgpack;
+  //
+  // For the stamped case, upstream re-packs with umsgpack. A conformant
+  // stamped sender MUST already emit canonical msgpack (§5.6.1), so the
+  // wire prefix patched to fixarray-4 IS that re-pack — whereas our own
+  // re-encode (strippedMsgpack) is not: the bundled decoder turns int
+  // field keys into strings, so it diverges whenever `fields` is non-empty
+  // and reactions/replies targeting stamped messages would miss.
+  const msgpackForId = payload.length === 4
+    ? msgpackData
+    : (hashedPrefix ? hashedPrefix.subarray(destHash.length + sourceHash.length) : strippedMsgpack);
   const messageId    = await sha256(concatBytes([destHash, sourceHash, msgpackForId]));
 
   return {
@@ -269,6 +280,21 @@ export async function packMessage(sourceIdentity, destHash, sourceHash, title, c
     payload: concatBytes([sourceHash, signature, msgpackData]),
     messageId: messageHash,
   };
+}
+
+// Append a stamp (SPEC §5.7.1) to a packed, signed LXMF payload
+// (source_hash || signature || msgpack 4-array, as returned by
+// packMessage): the array becomes 5 elements with the stamp as `bin`.
+// The signature and message_id stay valid — both cover only the first 4.
+export function attachStamp(payload, stamp) {
+  const off = TRUNCATED_HASHLENGTH + SIGNATURE_LENGTH;
+  if (payload[off] !== 0x94) throw new Error('attachStamp: payload is not an unstamped 4-element LXMF array');
+  return concatBytes([
+    payload.subarray(0, off),
+    new Uint8Array([0x95]),
+    payload.subarray(off + 1),
+    new Uint8Array(msgpackEncode(stamp)),
+  ]);
 }
 
 // ---- Helpers ---------------------------------------------------------

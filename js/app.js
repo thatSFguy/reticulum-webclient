@@ -13,9 +13,9 @@ import { initLocationSharing } from './location-share.js';
 import { ReconnectController } from './reconnect.js';
 import { parsePacket, buildPacket, PACKET_ANNOUNCE, PACKET_DATA, PACKET_LINKREQ, PACKET_PROOF, DEST_SINGLE, DEST_LINK, DEST_PLAIN, HEADER_1, HEADER_2, TRANSPORT_BROADCAST, TRANSPORT_TRANSPORT, PACKET_TYPE_NAMES } from './reticulum.js';
 import { parseAnnounce, validateAnnounce, buildAnnounce, extractDisplayName, parseLxmfAppData, concatBytes, arraysEqual } from './announce.js';
-import { generateStamp, stampValid, destinationStampMaterial, pathRequestStampMaterial, buildPathRequestPayload, DESTINATION_COST, DESTINATION_VALUE, LR_COST, PR_VALUE, PR_STAMP_TIMEOUT_MS, STAMPLENGTH } from './stamps.js';
+import { generateStamp, stampValid, destinationStampMaterial, pathRequestStampMaterial, buildPathRequestPayload, stampWorkblock, LXMF_STAMP_SIZE, DESTINATION_COST, DESTINATION_VALUE, LR_COST, PR_VALUE, PR_STAMP_TIMEOUT_MS, STAMPLENGTH } from './stamps.js';
 import { encrypt, decrypt } from './crypto.js';
-import { unpackMessage, unpackLinkMessage, verifyMessageSignature, packMessage } from './lxmf.js';
+import { unpackMessage, unpackLinkMessage, verifyMessageSignature, packMessage, attachStamp } from './lxmf.js';
 import { Link, LINK_ACTIVE, LINK_CLOSED, computePacketFullHash } from './link.js';
 import { lookupDestination } from './known-destinations.js';
 import { ed25519 } from '@noble/curves/ed25519';
@@ -1594,6 +1594,8 @@ async function dispatchIncomingMessage(msg, rxInfo) {
         const result = verifyMessageSignature(msg, c.identity);
         if (result.ok) {
           log('ok', `  Signature: valid (${result.variant})`);
+          const ticketEntry = getField(msg.fields, FIELD_TICKET);
+          if (ticketEntry) rememberTicket(hash, ticketEntry);
         } else {
           log('err', `  Signature: INVALID (both stripped and original failed)`);
         }
@@ -3057,10 +3059,11 @@ async function sendMessage() {
     // Pack LXMF message. LXMF's source_hash field is the sender's
     // LXMF delivery *destination* hash, not the identity hash —
     // receivers key their contact table on destination hashes.
-    const { payload: lxmfPayload, messageId: outMessageId } = await packMessage(
+    const { payload: unstampedPayload, messageId: outMessageId } = await packMessage(
       myIdentity, sendContact.destHash, myDestHash,
       '', content, outFields
     );
+    const lxmfPayload = await stampOutbound(sendContact, unstampedPayload, outMessageId);
 
     // Encrypt for recipient. Prefer their current ratchet pubkey
     // (learned from a ratchet-bearing announce) so the recipient's
@@ -3299,7 +3302,8 @@ async function sendReaction(targetMsg, emoji) {
     if (radioOn && !pathTable.has(toHex(contact.destHash))) {
       await requestPath(contact.destHash);
     }
-    const { payload } = await packMessage(myIdentity, contact.destHash, myDestHash, '', '', fields);
+    const { payload: unstamped, messageId: reactionId } = await packMessage(myIdentity, contact.destHash, myDestHash, '', '', fields);
+    const payload = await stampOutbound(contact, unstamped, reactionId);
     const recipientPub = contact.ratchetPub || contact.identity.encPubKey;
     const encrypted = await encrypt(payload, recipientPub, contact.identity.hash);
 
@@ -3402,13 +3406,77 @@ async function resizeImage(file, maxDim = 512, quality = 0.5) {
   return { bytes, ext: 'jpg', dataUrl: await blobToDataUrl(blob) };
 }
 
+// ---- LXMF stamps & tickets (SPEC §5.7) --------------------------------
+
+const FIELD_TICKET = 0x0C;
+const TICKETS_KEY = 'rlw.lxmfTickets';     // { destHex: { expires, ticket: hex } }
+const LXMF_STAMP_TIMEOUT_MS = 60000;
+
+function loadTickets() {
+  try { return JSON.parse(localStorage.getItem(TICKETS_KEY) || '{}') || {}; }
+  catch (_) { return {}; }
+}
+
+// §5.7.3: a peer hands us a ticket in fields[0x0C] = [expires, ticket(16)]
+// so we can skip proof-of-work when messaging it. Upstream only remembers
+// it when the carrying message's signature validated — callers must too.
+function rememberTicket(sourceHex, entry) {
+  if (!Array.isArray(entry) || entry.length < 2) return;
+  const expires = Number(entry[0]);
+  const ticket = entry[1];
+  if (!(ticket instanceof Uint8Array) || ticket.length !== 16) return;
+  if (!(expires * 1000 > Date.now())) return;
+  const all = loadTickets();
+  for (const [k, v] of Object.entries(all)) if (!(v.expires * 1000 > Date.now())) delete all[k];
+  all[sourceHex] = { expires, ticket: toHex(ticket) };
+  try { localStorage.setItem(TICKETS_KEY, JSON.stringify(all)); } catch (_) {}
+  log('info', `  Ticket received from ${sourceHex.substring(0, 12)}… (valid until ${new Date(expires * 1000).toLocaleString()})`);
+}
+
+function outboundTicket(destHex) {
+  const t = loadTickets()[destHex];
+  return t && t.expires * 1000 > Date.now() ? hexToBytes(t.ticket) : null;
+}
+
+// Stamp an outbound LXMF payload if the recipient requires one (§5.7.4):
+// a 16-byte ticket stamp when we hold a valid ticket, else proof-of-work
+// at the cost from the peer's announce. Returns the (possibly 5-element)
+// payload. The stamp is computed once, before encryption, so retries
+// reuse it. If PoW can't finish we send unstamped — accepted by every
+// peer that doesn't enforce stamps.
+async function stampOutbound(contact, payload, messageId) {
+  const destHex = toHex(contact.destHash);
+  const ticket = outboundTicket(destHex);
+  if (ticket) {
+    const stamp = (await sha256(concatBytes([ticket, messageId]))).subarray(0, 16);
+    log('info', '  LXMF stamp: using ticket');
+    return attachStamp(payload, stamp);
+  }
+  const cost = contact.stampCost ?? contacts.get(destHex)?.stampCost ?? null;
+  if (!cost) return payload;
+  const t0 = Date.now();
+  log('info', `  LXMF stamp: generating (cost ${cost})…`);
+  try {
+    const res = await generateStamp(stampWorkblock(messageId), cost, { size: LXMF_STAMP_SIZE, timeoutMs: LXMF_STAMP_TIMEOUT_MS });
+    if (res) {
+      log('info', `  LXMF stamp: value ${res.value} after ${res.rounds.toLocaleString()} rounds in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      return attachStamp(payload, res.stamp);
+    }
+    log('err', `  LXMF stamp (cost ${cost}) not found in ${LXMF_STAMP_TIMEOUT_MS / 1000}s — sending unstamped; a peer that enforces stamps will drop it`);
+  } catch (e) {
+    log('err', `  LXMF stamp failed: ${e.message} — sending unstamped`);
+  }
+  return payload;
+}
+
 // Send a packed LXMF (with optional attachment fields) to a contact over a
 // Link. Returns true if confirmed delivered (Resource proof), false if sent
 // as a single packet (delivery proof, if any, arrives async). Throws on error.
 async function sendLxmfOverLink(contact, content, title, fields, rowId = null) {
   if (!radioOn) throw new Error('Radio is off');
   const link = await openLinkToContact(contact);
-  const { payload: packed, messageId } = await packMessage(myIdentity, contact.destHash, myDestHash, title || '', content || '', fields || new Map());
+  const { payload: unstamped, messageId } = await packMessage(myIdentity, contact.destHash, myDestHash, title || '', content || '', fields || new Map());
+  const packed = await stampOutbound(contact, unstamped, messageId);
   // Persist the canonical message_id so an inbound reaction/reply that
   // targets this message can be matched back to the row (§5.9.8/9).
   if (rowId != null) {

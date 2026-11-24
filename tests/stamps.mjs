@@ -27,6 +27,7 @@ import {
   DESTINATION_VALUE, DESTINATION_COST, LR_COST, PR_VALUE, STAMPLENGTH,
 } from "../js/stamps.js";
 import { Link } from "../js/link.js";
+import { packMessage, unpackMessage, verifyMessageSignature, attachStamp } from "../js/lxmf.js";
 import { Identity, computeDestinationHash, computeNameHash } from "../js/identity.js";
 import { buildAnnounce, parseAnnounce, validateAnnounce, extractDisplayName, parseLxmfAppData } from "../js/announce.js";
 import { parsePnAppData } from "../js/propagation.js";
@@ -137,6 +138,40 @@ async function vectors() {
     if (!res) throw new Error(`LXMF stamp generation failed at cost ${cost}`);
     ok(stampValid(res.stamp, cost, wb), `own LXMF stamp invalid at cost ${cost}`);
     out.lxmf.push({ messageId: toHex(messageId), cost, stamp: toHex(res.stamp), value: res.value });
+  }
+
+  // Stamped LXMF messages (§5.7): PoW and ticket. The fields map is
+  // non-empty on purpose — that's the case where the old message_id
+  // re-encode diverged (int keys decoded as strings).
+  {
+    const alice = new Identity();
+    await alice.generate();
+    const aliceDest = await computeDestinationHash("lxmf.delivery", alice.hash);
+    const bobDest = rnd(16);
+    const fields = new Map([[0x30, rnd(32)]]);
+    const { payload, messageId } = await packMessage(alice, bobDest, aliceDest, "", "hello, stamped", fields);
+    const cost = 8;
+    const pow = await generateStamp(stampWorkblock(messageId), cost, { size: 32 });
+    if (!pow) throw new Error("LXMF PoW stamp generation failed");
+    const stamped = attachStamp(payload, pow.stamp);
+    const u = await unpackMessage(stamped, bobDest);
+    ok(u.payloadElementCount === 5, "attachStamp did not produce a 5-element payload");
+    ok(toHex(u.messageId) === toHex(messageId), "stamped message_id differs from the sender's (re-encode bug)");
+    ok(verifyMessageSignature(u, alice).ok, "signature no longer verifies after attachStamp");
+    ok(toHex(u.stamp) === toHex(pow.stamp), "stamp not recovered from payload");
+
+    const ticket = rnd(16);
+    const tstamp = sha256Sync(new Uint8Array([...ticket, ...messageId])).subarray(0, 16);
+    const tstamped = attachStamp(payload, tstamp);
+    const tu = await unpackMessage(tstamped, bobDest);
+    ok(toHex(tu.messageId) === toHex(messageId) && tu.stamp.length === 16, "ticket-stamped message misparsed");
+
+    out.lxmfMessage = {
+      publicKey: toHex(alice.publicKey), source: toHex(aliceDest), dest: toHex(bobDest),
+      messageId: toHex(messageId), cost,
+      pow: { bytes: toHex(new Uint8Array([...bobDest, ...stamped])), stamp: toHex(pow.stamp) },
+      ticket: { bytes: toHex(new Uint8Array([...bobDest, ...tstamped])), ticket: toHex(ticket) },
+    };
   }
 
   // Stamped link-request key (§6.1.1): material = dest_hash || ed25519_pub.
