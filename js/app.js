@@ -2,7 +2,7 @@
 
 'use strict';
 
-import { encode as msgpackEncode } from '@msgpack/msgpack';
+import { encode as msgpackEncode, decode as msgpackDecodeFirst } from '@msgpack/msgpack';
 import { RNode } from './rnode.js';
 import { RnsdInterface } from './rnsd-interface.js';
 import { AlnInterface } from './aln-interface.js';
@@ -16,7 +16,7 @@ import { parseAnnounce, validateAnnounce, buildAnnounce, extractDisplayName, par
 import { generateStamp, stampValid, destinationStampMaterial, pathRequestStampMaterial, buildPathRequestPayload, stampWorkblock, LXMF_STAMP_SIZE, DESTINATION_COST, DESTINATION_VALUE, LR_COST, PR_VALUE, PR_STAMP_TIMEOUT_MS, STAMPLENGTH } from './stamps.js';
 import { encrypt, decrypt } from './crypto.js';
 import { unpackMessage, unpackLinkMessage, verifyMessageSignature, packMessage, attachStamp } from './lxmf.js';
-import { Link, LINK_ACTIVE, LINK_CLOSED, computePacketFullHash } from './link.js';
+import { Link, LINK_ACTIVE, LINK_CLOSED, computePacketFullHash, keepaliveSeconds, STALE_FACTOR, BASE_MTU, resourceSdu } from './link.js';
 import { lookupDestination } from './known-destinations.js';
 import { ed25519 } from '@noble/curves/ed25519';
 import { CTX_REQUEST, CTX_RESPONSE, NN_DEFAULT_PATH, buildRequest, parseResponse, responseToText, stripPageHeaders, parseLinkTarget } from './nomadnet.js';
@@ -280,6 +280,16 @@ const ANNOUNCE_INTERVAL_MIN = 1;    // minutes — floor (keeps us above the 60s
 const ANNOUNCE_INTERVAL_MAX = 720;  // minutes — ceiling (12 h; covers the manual's ~6 h guidance)
 
 // Which announce-interval class a transport id falls into.
+// Link MTU we ask for / accept (SPEC §6.6). Both ends size Resource parts
+// from the negotiated link MTU (§10.2), so this is how a slow bearer gets
+// small parts: 228 → 192-byte parts, whose 211-byte link packets fit the
+// ALN mesh's 214-byte single-frame cutoff (no SAR per part — v0.33.3).
+// Upstream responders honour a smaller requested MTU (they take the min).
+const LORA_LINK_MTU = 228;
+function linkMtuForTransport() {
+  return announceClass(activeTransport) === 'lora' ? LORA_LINK_MTU : BASE_MTU;
+}
+
 function announceClass(transport) {
   return transport === 'ws' ? 'tcp' : 'lora';
 }
@@ -523,7 +533,9 @@ async function onPacket(data, rssi, snr) {
       await handleInitiatorLinkProof(pkt);
     } else if (pkt.context === CTX_RESOURCE_PRF) {
       // Proof that a Resource we SENT was received intact (§10.8).
-      links.get(toHex(pkt.destHash))?._resourceSender?.handleProof(pkt.payload);
+      const prfLink = links.get(toHex(pkt.destHash));
+      if (prfLink) prfLink.lastInbound = Date.now();
+      prfLink?._resourceSender?.handleProof(pkt.payload);
     } else if (pkt.destType === DEST_LINK) {
       await handleLinkDeliveryProof(pkt);
     } else {
@@ -1730,7 +1742,7 @@ async function handleLinkRequest(pkt) {
     log('info', `  LR header type=${pkt.headerType === HEADER_1 ? 'H1' : 'H2'} flags=0x${pkt.flags.toString(16).padStart(2,'0')} hops=${pkt.hops} ctx=0x${pkt.context.toString(16).padStart(2,'0')}`);
     log('info', `  LR data(${pkt.payload.length})=${toHex(pkt.payload)}`);
 
-    const { link, proofData } = await Link.validateRequest(pkt, myIdentity);
+    const { link, proofData } = await Link.validateRequest(pkt, myIdentity, linkMtuForTransport());
     const linkIdHex = toHex(link.linkId);
 
     // If we've already accepted this exact request, just resend the
@@ -1772,6 +1784,7 @@ async function handleLinkData(pkt, rxInfo) {
     return;
   }
   link._rxInfo = rxInfo;  // remembered for an LXMF resource's onComplete dispatch
+  link.lastInbound = Date.now();   // §6.7: any inbound traffic refreshes staleness
 
   try {
     switch (pkt.context) {
@@ -1818,7 +1831,10 @@ async function handleLinkData(pkt, rxInfo) {
       case CTX_LRRTT: {
         // Decrypting it is how we confirm the initiator successfully
         // verified our LRPROOF; the RTT value itself is not useful here.
-        await link.decrypt(pkt.payload);
+        // The LRRTT body is the initiator's measured RTT (msgpack float);
+        // it sets our keepalive interval for this link (§6.7.1).
+        const rttPlain = await link.decrypt(pkt.payload);
+        try { const r = Number(msgpackDecodeFirst(rttPlain)); if (r > 0 && r < 3600) link.rtt = r; } catch (_) { /* keep default */ }
         link.status = LINK_ACTIVE;
         link.establishedAt = Date.now();
         log('ok', `  Link ${linkIdHex.substring(0,12)}... ACTIVE (RTT ack received)`);
@@ -1828,8 +1844,7 @@ async function handleLinkData(pkt, rxInfo) {
         const plaintext = await link.decrypt(pkt.payload);
         if (plaintext.length === link.linkId.length &&
             arraysEqual(plaintext, link.linkId)) {
-          link.status = LINK_CLOSED;
-          links.delete(linkIdHex);
+          onLinkClosed(link, 'link closed by peer');
           log('info', `  Link ${linkIdHex.substring(0,12)}... closed by peer`);
         } else {
           log('err', `  LINKCLOSE payload did not match link_id, ignoring`);
@@ -1890,7 +1905,9 @@ async function handleLinkData(pkt, rxInfo) {
         break;
       }
       case CTX_RESOURCE_ICL: {
-        if (link._resource) link._resource.cancel('sender cancelled the resource');
+        // Body is the cancelled resource's hash (§10.9) — only cancel that one.
+        const rh = await link.decrypt(pkt.payload);
+        if (link._resource && arraysEqual(rh, link._resource.adv.hash)) link._resource.cancel('sender cancelled the resource');
         break;
       }
       case CTX_RESOURCE_REQ: {
@@ -1900,7 +1917,10 @@ async function handleLinkData(pkt, rxInfo) {
         break;
       }
       case CTX_RESOURCE_RCL: {
-        if (link._resourceSender) link._resourceSender.cancel('peer rejected the resource');
+        const rh = await link.decrypt(pkt.payload);
+        if (link._resourceSender && link._resourceSender.hash && arraysEqual(rh, link._resourceSender.hash)) {
+          link._resourceSender.cancel('peer rejected the resource');
+        }
         break;
       }
       default: {
@@ -1941,8 +1961,70 @@ async function closeLink(link) {
   } catch (e) {
     log('info', `  LINKCLOSE send failed for ${linkIdHex.substring(0,12)}...: ${e.message}`);
   } finally {
-    link.status = LINK_CLOSED;
-    links.delete(linkIdHex);
+    onLinkClosed(link, 'link closed');
+  }
+}
+
+// Every way a link ends (our LINKCLOSE, the peer's, the stale watchdog)
+// goes through here so nothing keeps waiting on a dead link (§6.7.3 step
+// 6): in-flight Resources in either direction are cancelled — which
+// settles sendLxmfOverLink's promise — and the browser drops its link.
+function onLinkClosed(link, reason) {
+  const linkIdHex = toHex(link.linkId);
+  link.status = LINK_CLOSED;
+  links.delete(linkIdHex);
+  if (link._resource) { link._resource.cancel(reason); link._resource = null; }
+  if (link._resourceSender) { link._resourceSender.cancel(reason); link._resourceSender = null; }
+  if (nnState.link === link) { nnState.link = null; nnState.destHashHex = null; }
+}
+
+// ---- Link watchdog (SPEC §6.7.1 / §6.7.2) -----------------------------
+//
+// Initiators ping (0xFF) once `keepalive` passes with no inbound traffic;
+// any side tears a link down after STALE_FACTOR × keepalive of silence,
+// sending LINKCLOSE so the peer doesn't wait out its own watchdog.
+// Responder links that never received LRRTT are aged out, and the link
+// table is bounded (§16.4).
+const LINK_WATCHDOG_MS = 5000;
+const LINK_PENDING_MAX_MS = 180000;   // ≥ the slowest LoRa establish patience
+const LINKS_MAX = 64;
+let linkWatchdogTimer = null;
+
+function startLinkWatchdog() {
+  if (linkWatchdogTimer) return;
+  linkWatchdogTimer = setInterval(() => { linkWatchdogTick().catch(() => {}); }, LINK_WATCHDOG_MS);
+}
+
+async function linkWatchdogTick() {
+  if (!radioOn) return;
+  const now = Date.now();
+  for (const link of Array.from(links.values())) {
+    if (link.status !== LINK_ACTIVE) {
+      if (now - (link.createdAt || now) > LINK_PENDING_MAX_MS) {
+        onLinkClosed(link, 'link never activated');
+      }
+      continue;
+    }
+    const keepaliveMs = keepaliveSeconds(link.rtt) * 1000;
+    const quietMs = now - (link.lastInbound || link.establishedAt || now);
+    if (quietMs >= keepaliveMs * STALE_FACTOR) {
+      log('info', `  Link ${toHex(link.linkId).substring(0,12)}... stale (${Math.round(quietMs / 1000)}s silent) — closing`);
+      await closeLink(link);
+      continue;
+    }
+    if (link.isInitiator && quietMs >= keepaliveMs && now - (link._lastPingAt || 0) >= keepaliveMs) {
+      link._lastPingAt = now;
+      try {
+        await rnode.sendPacket(buildPacket({
+          headerType: HEADER_1, destType: DEST_LINK, packetType: PACKET_DATA,
+          destHash: link.linkId, context: CTX_KEEPALIVE, payload: new Uint8Array([0xFF]),
+        }));
+      } catch (_) { /* transport hiccup — the stale check still applies */ }
+    }
+  }
+  if (links.size > LINKS_MAX) {
+    const byAge = Array.from(links.values()).sort((a, b) => (a.lastInbound || a.createdAt || 0) - (b.lastInbound || b.createdAt || 0));
+    for (const l of byAge.slice(0, links.size - LINKS_MAX)) await closeLink(l);
   }
 }
 
@@ -2011,7 +2093,7 @@ async function openLinkToContact(contact, timeoutMs = null) {
   let link, requestData;
   if (lrCost && lrStampGaveUp.get(destHex) !== lrCost) {
     log('info', `  Stamping link request (cost ${lrCost})…`);
-    const r = await Link.createInitiatorStamped(contact.identity.sigPubKey, contact.destHash, lrCost);
+    const r = await Link.createInitiatorStamped(contact.identity.sigPubKey, contact.destHash, lrCost, { mtu: linkMtuForTransport() });
     ({ link, requestData } = r);
     if (r.stamped) {
       log('info', `  Link request stamped: value ${r.value} in ${(r.ms / 1000).toFixed(1)}s`);
@@ -2021,7 +2103,7 @@ async function openLinkToContact(contact, timeoutMs = null) {
     }
     if (!radioOn) throw new Error('Radio not on');
   } else {
-    ({ link, requestData } = Link.createInitiator(contact.identity.sigPubKey, contact.destHash));
+    ({ link, requestData } = Link.createInitiator(contact.identity.sigPubKey, contact.destHash, null, linkMtuForTransport()));
   }
 
   // SPEC §2.3 originator HEADER_1 → HEADER_2 conversion, identical to the
@@ -2140,6 +2222,7 @@ async function handleInitiatorLinkProof(pkt) {
   clearTimeout(entry.timer);
   initiatorLinks.delete(linkIdHex);
   // Keep the link itself reachable so sendViaLink can find it by id.
+  entry.link.lastInbound = Date.now();
   links.set(linkIdHex, entry.link);
 
   entry.resolve(entry.link);
@@ -2175,7 +2258,20 @@ async function sendViaLink(link, packedLxmf) {
 // packet's full 32-byte hash. We store only the first 16 bytes on
 // the row, so match on the prefix.
 async function handleLinkDeliveryProof(pkt) {
-  if (pkt.payload.length < 32) return;
+  // §6.5: a link packet proof is packet_hash(32) || Ed25519 sig(64) over
+  // that hash, by the PEER's link signing key — its long-term key when it
+  // is the responder, its ephemeral link key when it initiated. Link
+  // PROOFs travel unencrypted, so without this check anyone could forge a
+  // delivery receipt.
+  const link = links.get(toHex(pkt.destHash));
+  if (!link || pkt.payload.length < 96) return;
+  link.lastInbound = Date.now();
+  const ph = pkt.payload.subarray(0, 32);
+  const sig = pkt.payload.subarray(32, 96);
+  const key = link.isInitiator ? link.peerLongTermSigPub : link.peerEd25519Pub;
+  let ok = false;
+  try { ok = !!key && ed25519.verify(sig, ph, key); } catch { ok = false; }
+  if (!ok) { log('err', `  Link delivery proof failed signature check — ignored`); return; }
   const packetHashPrefixHex = toHex(pkt.payload.subarray(0, 16));
   const rows = await getAllMessages();
   for (const row of rows) {
@@ -2296,21 +2392,16 @@ async function sendLinkIdentify(link) {
 // the round in the timeout error so failures are diagnosable.
 async function pnRequest(link, data, timeoutMs = 30000, label = 'request') {
   const body = await buildRequest(PN_GET_PATH, data);
-  const enc = await link.encrypt(body);
-  const packet = buildPacket({
-    headerType: HEADER_1, destType: DEST_LINK, packetType: PACKET_DATA,
-    destHash: link.linkId, context: CTX_REQUEST, payload: enc,
-  });
-  const fullHash = await computePacketFullHash(parsePacket(packet));
+  const req = await prepareLinkRequest(link, body);
   return new Promise((resolve, reject) => {
     link._pnPending = {
-      expectedId: fullHash.subarray(0, 16),
+      expectedId: req.expectedId,
       resolve, reject,
       timer: setTimeout(() => {
         if (link._pnPending) { link._pnPending = null; reject(new Error(`${label} timed out`)); }
       }, timeoutMs),
     };
-    rnode.sendPacket(packet).catch((e) => {
+    req.send().catch((e) => {
       if (link._pnPending) { clearTimeout(link._pnPending.timer); link._pnPending = null; }
       reject(e);
     });
@@ -2624,6 +2715,13 @@ const NN_MAX_RESOURCE = 64 * 1024 * 1024;
 
 // Create and start a Resource receiver for an inbound advertisement.
 function startResourceReceive(link, adv) {
+  // §10.4: an upstream sender re-sends the advertisement (up to 4×) when
+  // our REQ was lost. Same resource hash → keep the transfer and re-request;
+  // only a DIFFERENT resource supersedes the running one.
+  if (link._resource && !link._resource.done && arraysEqual(link._resource.adv.hash, adv.hash)) {
+    link._resource.handleReadvertisement();
+    return;
+  }
   if (link._resource) { link._resource.abort('superseded'); }
 
   // Three kinds of inbound Resource: a propagation-node /get RESPONSE, a
@@ -2761,18 +2859,44 @@ function nnSaveFileResponse(path, response) {
 
 // Send a NomadNet page request over an active link. `data` is null for a
 // plain GET or a {field_/var_ → value} dict for a form submit (§11.6.2).
+// Build a §11.1 REQUEST for `link`. It rides one link packet when it fits
+// the negotiated link MTU — request_id = truncated hash of that packet —
+// and otherwise a Resource flagged as a request (u), with request_id =
+// SHA-256(packed_request)[:16] carried in the advertisement's q field.
+// Returns { expectedId, viaResource, send() }.
+async function prepareLinkRequest(link, body) {
+  const enc = await link.encrypt(body);
+  if (19 + enc.length <= (link.mtu || BASE_MTU)) {
+    const packet = buildPacket({
+      headerType: HEADER_1, destType: DEST_LINK, packetType: PACKET_DATA,
+      destHash: link.linkId, context: CTX_REQUEST, payload: enc,
+    });
+    const fullHash = await computePacketFullHash(parsePacket(packet));
+    return { expectedId: fullHash.subarray(0, 16), viaResource: false, send: () => rnode.sendPacket(packet) };
+  }
+  const expectedId = (await sha256(body)).subarray(0, 16);
+  const lora = announceClass(activeTransport) === 'lora';
+  return {
+    expectedId, viaResource: true,
+    send: () => new Promise((resolve, reject) => {
+      const sender = new ResourceSender(link, body, {
+        send: makeResourceSend(link), requestId: expectedId, isRequest: true,
+        pacingMs: lora ? 1200 : 0, advTimeoutMs: lora ? 45000 : 15000, timeoutMs: lora ? 240000 : 60000,
+        onComplete: resolve, onError: (r) => reject(new Error(r)),
+      });
+      link._resourceSender = sender;
+      sender.start().catch(reject);
+    }),
+  };
+}
+
 async function nnSendRequest(link, path, data = null) {
   const body = await buildRequest(path, data);
-  const enc = await link.encrypt(body);
-  const packet = buildPacket({
-    headerType: HEADER_1, destType: DEST_LINK, packetType: PACKET_DATA,
-    destHash: link.linkId, context: CTX_REQUEST, payload: enc,
-  });
-  // request_id = SHA-256(request packet's hashable part)[:16] (§11.1).
-  const fullHash = await computePacketFullHash(parsePacket(packet));
-  link._nnRequest = { expectedId: fullHash.subarray(0, 16), path };
-  nnSetStatus(`requesting ${path}…`);
-  await rnode.sendPacket(packet);
+  const req = await prepareLinkRequest(link, body);
+  link._nnRequest = { expectedId: req.expectedId, path };
+  nnSetStatus(req.viaResource ? `sending request for ${path}…` : `requesting ${path}…`);
+  await req.send();
+  if (req.viaResource) nnSetStatus(`requesting ${path}…`);
 }
 
 // Navigate to a node/path: ensure link, send request. `push` records
@@ -3486,8 +3610,9 @@ async function sendLxmfOverLink(contact, content, title, fields, rowId = null) {
   const destBytes = contact.destHash instanceof Uint8Array ? contact.destHash : new Uint8Array(contact.destHash);
   const container = concatBytes([destBytes, packed]);  // link form keeps the dest hash
   const encrypted = await link.encrypt(container);
-  // Conservative single-link-packet content cap (token overhead + header).
-  if (encrypted.length <= 380) {
+  // One link packet if it fits the NEGOTIATED link MTU (HEADER_1 19 bytes +
+  // token) — the same bound upstream's link MDU gives — else a Resource.
+  if (19 + encrypted.length <= (link.mtu || BASE_MTU)) {
     await sendViaLink(link, container);
     return false;
   }
@@ -3497,12 +3622,13 @@ async function sendLxmfOverLink(contact, content, title, fields, rowId = null) {
     await new Promise((resolve, reject) => {
       const sender = new ResourceSender(link, container, {
         send: makeResourceSend(link),
-        // Slow-mesh shaping: 192B slices keep each part packet (19B header +
-        // slice) inside the ALN 214B single-frame cutoff — no SAR per part —
-        // and pacing to ~channel rate stops a window burst from overrunning
-        // the node's shallow tx queues (that burst was the image-send hang).
-        sdu:      announceClass(activeTransport) === 'lora' ? 192 : undefined,
-        pacingMs: announceClass(activeTransport) === 'lora' ? 1200 : 0,
+        // Slow-mesh shaping: part size follows the link MTU (small on LoRa,
+        // see linkMtuForTransport); pacing to ~channel rate stops a window
+        // burst from overrunning the node's shallow tx queues (that burst
+        // was the image-send hang). Timeouts scale with the bearer.
+        pacingMs:     announceClass(activeTransport) === 'lora' ? 1200 : 0,
+        advTimeoutMs: announceClass(activeTransport) === 'lora' ? 45000 : 15000,
+        timeoutMs:    announceClass(activeTransport) === 'lora' ? 240000 : 60000,
         onProgress: (sent, total, bytes, totalBytes) => {
           const elapsed = (Date.now() - startedAt) / 1000;
           const rate = elapsed > 0 ? bytes / elapsed : 0;
@@ -5352,6 +5478,7 @@ function markInterfaceReady() {
   const intervalMs = startAnnounceTimer();
   log('info', `Periodic announce every ${Math.round(intervalMs / 60000)} min (${announceClass(activeTransport).toUpperCase()})`);
   if (outboundRetryTimer) clearInterval(outboundRetryTimer);
+  startLinkWatchdog();
   outboundRetryTimer = setInterval(() => {
     outboundRetryTick().catch(e => log('info', `Retry tick error: ${e.message}`));
   }, MSG_RETRY_TICK_MS);

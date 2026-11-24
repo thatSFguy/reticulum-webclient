@@ -121,8 +121,12 @@ Everything from the original phased plan shipped long ago, plus a lot the plan d
   (fields[0x0C]); stamped-message message_id taken from the wire prefix (§5.6.1)
 - Opportunistic LXMF send/receive with delivery proofs and retries
 - **Ratchets** — encrypt to the peer's announced ratchet key; rotate our own
-- **Links** — handshake, session crypto, keepalive, LXMF-over-Link
-- **Resources** — send and receive over Links (attachments, NomadNet pages)
+- **Links** — handshake, session crypto, LXMF-over-Link; link MTU negotiated per bearer
+  (228 on LoRa-class, 500 otherwise); keepalive pings + stale watchdog (§6.7);
+  verified link delivery proofs (§6.5)
+- **Resources** — send and receive over Links (attachments, NomadNet pages, oversized
+  REQUESTs); part size follows the link MTU (§10.2); ADV retransmit, re-advertisement
+  tolerance, empty-hashmap (RNS 1.6) and HMU boundary handling
 - NomadNet page browsing (micron renderer, forms, file downloads)
 - Reactions (SPEC §5.9.8) and reply-to threading (SPEC §5.9.9), group-chat-relay compliant
 - Path requests (§7.1/§7.2.6 leaf duties) and HEADER_2 originator conversion (§2.3)

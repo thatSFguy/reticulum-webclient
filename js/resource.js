@@ -1,9 +1,10 @@
-// js/resource.js — receiver side of the Reticulum Resource protocol (SPEC §10).
+// js/resource.js — the Reticulum Resource protocol (SPEC §10), both halves.
 //
-// A Resource carries a payload too large for one Link packet (~360 bytes) —
-// i.e. essentially every NomadNet page. We only implement the RECEIVE half:
-// advertisement → request part windows → collect parts → reassemble →
-// decrypt → decompress → verify → emit proof.
+// A Resource carries a payload too large for one Link packet — NomadNet
+// pages, propagation /get bundles, attachments. Receive: advertisement →
+// request part windows → collect parts → reassemble → decrypt → decompress
+// → verify → emit proof. Send: encrypt whole → slice at the link's SDU →
+// advertise → serve requested parts / hashmap updates → await proof.
 //
 // Wire contexts (all on an active Link):
 //   RESOURCE_ADV 0x02  in   msgpack dict (§10.4), link-encrypted
@@ -21,6 +22,7 @@ import { decode as msgpackDecode, encode as msgpackEncode } from '@msgpack/msgpa
 import { sha256 } from './identity.js';
 import { concatBytes, arraysEqual } from './announce.js';
 import { bunzip2 } from '../lib/bz2.js';
+import { resourceSdu } from './link.js';
 
 export const CTX_RESOURCE     = 0x01;
 export const CTX_RESOURCE_ADV = 0x02;
@@ -34,6 +36,7 @@ const MAPHASH_LEN = 4;
 const RANDOM_HASH_SIZE = 4;
 const HASHMAP_IS_NOT_EXHAUSTED = 0x00;
 const HASHMAP_IS_EXHAUSTED = 0xFF;
+const HASHMAP_IS_EMPTY = 0xFE;   // RNS >= 1.6: adv carried no map hashes (§10.5)
 const INITIAL_WINDOW = 4;
 
 // Default per-resource cap. NomadNet pages and /get blobs are small; this
@@ -114,16 +117,15 @@ export class ResourceReceiver {
     this._stallTimer = null;
 
     this.totalParts = adv.parts;
-    this.parts = new Array(this.totalParts).fill(null);
+    this.parts = null;             // allocated in start() once n is bounds-checked
     this.receivedCount = 0;
+    this.receivedBytes = 0;
     this.knownHashmap = [];        // array of 4-byte Uint8Array map hashes
     this.outstanding = new Set();  // map-hash hex currently requested
     this.window = INITIAL_WINDOW;
     this.done = false;
     this.waitingHMU = false;
-
-    // Seed the hashmap from the advertisement fragment.
-    this._ingestHashmap(adv.hashmapFragment);
+    this._lastReq = null;          // last REQ body, for re-sending on a re-advertisement
   }
 
   _armStall() {
@@ -150,8 +152,9 @@ export class ResourceReceiver {
 
   // Kick off the transfer (caps check + first request).
   start() {
-    if (this.adv.transferSize > this.maxSize || this.adv.dataSize > this.maxSize) {
-      this._fail(`resource too large (t=${this.adv.transferSize}, d=${this.adv.dataSize}, cap=${this.maxSize})`);
+    const t = this.adv.transferSize;
+    if (t > this.maxSize || this.adv.dataSize > this.maxSize) {
+      this._fail(`resource too large (t=${t}, d=${this.adv.dataSize}, cap=${this.maxSize})`);
       return;
     }
     if (this.adv.split && this.adv.totalSegments > 1) {
@@ -159,8 +162,32 @@ export class ResourceReceiver {
       this._fail('multi-segment resources not supported');
       return;
     }
-    if (this.totalParts <= 0) { this._fail('resource has no parts'); return; }
+    // §10.4 / §16.9: bound `n` BEFORE allocating per-part state. Every part
+    // is at least 1 byte and at most one link packet, so a sane advertiser
+    // has ceil(t / mtu) <= n <= t. A hostile n would otherwise make us
+    // allocate an arbitrarily large array.
+    const mtu = this.link?.mtu || 500;
+    if (!(this.totalParts > 0) || t <= 0 || this.totalParts > t || this.totalParts < Math.ceil(t / mtu)) {
+      this._fail(`implausible part count n=${this.totalParts} for t=${t}`);
+      return;
+    }
+    this.parts = new Array(this.totalParts).fill(null);
+    this._ingestHashmap(this.adv.hashmapFragment);
     this._requestNext();
+  }
+
+  // The sender re-sent the advertisement for THIS resource — upstream does
+  // that (up to 4×) when our first REQ was lost. It must not restart or
+  // abort the transfer (which would put RCL on the wire and kill it): just
+  // re-issue the request we're waiting on.
+  handleReadvertisement() {
+    if (this.done || !this.parts) return;
+    if (this._lastReq) {
+      this.send(CTX_RESOURCE_REQ, this._lastReq, false);
+      this._armStall();
+    } else {
+      this._requestNext();
+    }
   }
 
   _ingestHashmap(bytes) {
@@ -171,9 +198,24 @@ export class ResourceReceiver {
     }
   }
 
+  _sendReq(body) {
+    this._lastReq = body;
+    this.send(CTX_RESOURCE_REQ, body, false);
+    this._armStall();
+  }
+
   // Receiver requests the next window of parts it doesn't yet have (§10.5).
   _requestNext() {
     if (this.done) return;
+
+    // RNS >= 1.6: the advertisement came with an empty hashmap (it didn't
+    // fit the link MDU). Ask for segment 0 with HASHMAP_IS_EMPTY — no
+    // last_map_hash, no parts (§10.5).
+    if (this.knownHashmap.length === 0) {
+      this.waitingHMU = true;
+      this._sendReq(concatBytes([new Uint8Array([HASHMAP_IS_EMPTY]), this.adv.hash]));
+      return;
+    }
 
     const requested = [];
     for (let i = 0; i < this.knownHashmap.length && requested.length < this.window; i++) {
@@ -188,8 +230,7 @@ export class ResourceReceiver {
         this.adv.hash,
         ...requested,
       ]);
-      this.send(CTX_RESOURCE_REQ, body, false);
-      this._armStall();
+      this._sendReq(body);
       return;
     }
 
@@ -204,8 +245,7 @@ export class ResourceReceiver {
         this.adv.hash,
       ]);
       this.waitingHMU = true;
-      this.send(CTX_RESOURCE_REQ, body, false);
-      this._armStall();
+      this._sendReq(body);
     }
     // else: everything known and requested — completion is driven by handlePart.
   }
@@ -217,6 +257,8 @@ export class ResourceReceiver {
     const mh = (await sha256(concatBytes([sliceBytes, this.adv.randomHash]))).subarray(0, MAPHASH_LEN);
     const mhHex = hex(mh);
     if (!this.outstanding.has(mhHex)) return;  // unrequested / duplicate
+    // A part is one link packet's payload at most; anything bigger is junk.
+    if (sliceBytes.length > (this.link?.mtu || 500)) return;
     // A requested part arrived = real progress. Replenish the stall budget so
     // it only counts CONSECUTIVE silent periods (upstream's MAX_RETRIES is
     // likewise no-progress-rounds) — a long transfer trickling over a slow
@@ -228,6 +270,7 @@ export class ResourceReceiver {
       if (this.parts[i] === null && arraysEqual(this.knownHashmap[i], mh)) {
         this.parts[i] = sliceBytes;
         this.receivedCount++;
+        this.receivedBytes += sliceBytes.length;
         break;
       }
     }
@@ -250,8 +293,11 @@ export class ResourceReceiver {
     if (!arraysEqual(rh, this.adv.hash)) return;  // not ours
     // §10.7 HMU hardening (RNS >= 1.3.9): ignore HMUs we didn't ask for.
     if (!this.waitingHMU) return;
-    const [, hashmapBytes] = msgpackDecode(plaintext.subarray(32));
+    const [segIndex, hashmapBytes] = msgpackDecode(plaintext.subarray(32));
     const seg = u8(hashmapBytes);
+    // Place by segment index (§10.7): segment k starts at k × HASHMAP_MAX_LEN.
+    // A stale/duplicate HMU for a segment we already hold is ignored.
+    if (Number(segIndex) * HASHMAP_MAX_LEN !== this.knownHashmap.length) return;
     // §10.7: an HMU carrying zero map hashes cancels the transfer. Without
     // this we'd re-send the exhausted REQ and loop forever against a sender
     // that answers it with another empty HMU.
@@ -282,6 +328,10 @@ export class ResourceReceiver {
   async _assemble() {
     try {
       // Concatenate all parts and decrypt the whole once (§10.8 / §10.12).
+      if (this.receivedBytes !== this.adv.transferSize) {
+        this._fail(`received ${this.receivedBytes} bytes, advertised ${this.adv.transferSize} (CORRUPT)`);
+        return;
+      }
       const whole = concatBytes(this.parts);
       let blob;
       if (this.adv.encrypted) {
@@ -352,13 +402,10 @@ function randomBytes(n) {
   return b;
 }
 
-// Part slice size: must fit a HEADER_1 link DATA packet (19B header) within
-// MTU 500. RNS uses mtu - HEADER_MAXSIZE - IFAC_MIN_SIZE; 464 is the same
-// conservative bound and is sender-internal (the receiver reassembles by
-// hashmap order regardless).
-const SDU = 464;
-// Map hashes that fit in the first advertisement (rest via RESOURCE_HMU).
+// Map hashes per hashmap segment: the first rides in the advertisement,
+// later ones in RESOURCE_HMU (§10.7).
 const HASHMAP_MAX_LEN = 74;
+const MAX_ADV_RETRIES = 4;     // RNS Resource.MAX_ADV_RETRIES
 
 // Sender side of the Resource protocol (SPEC §10.2–10.8). We send
 // UNCOMPRESSED (flag c=0) so no bz2 *compressor* is needed. The payload is
@@ -381,17 +428,23 @@ export class ResourceSender {
     this.isRequest = !!opts.isRequest;
     this.onComplete = opts.onComplete || (() => {});
     this.onError = opts.onError || (() => {});
-    // Slow-transport knobs (caller sets these for lora-class transports):
-    // sdu — part slice size. The default 464 (RNS MTU maths) makes each part
-    // a ~484B packet that the ALN node must SAR-fragment; 192 keeps the whole
-    // link DATA packet (19B header + slice) inside the mesh's 214B single-
-    // frame cutoff — the same change that made texts fast. Sender-internal:
-    // the receiver reassembles by hashmap order whatever the slice size.
+    // Part size is NOT a sender choice: an upstream receiver computes the
+    // part count as ceil(t / sdu) from the link's negotiated MTU (§10.2 step
+    // 6), so slicing at anything else breaks the transfer. Slow bearers get
+    // small parts by negotiating a small link MTU instead (app.js).
+    this.sdu = resourceSdu(link.mtu);
     // pacingMs — inter-part gap when serving a window. Firing a window
-    // back-to-back overran the node's shallow queues (guaranteed drop);
+    // back-to-back overran the ALN node's shallow queues (guaranteed drop);
     // pacing to ~channel rate keeps every part inside per-hop ARQ cover.
-    this.sdu = opts.sdu || SDU;
     this.pacingMs = opts.pacingMs || 0;
+    // advTimeoutMs — re-send the advertisement if no REQ arrives (it, or our
+    // first REQ, was lost), up to MAX_ADV_RETRIES. timeoutMs — give up when
+    // the receiver goes silent mid-transfer or the proof never comes.
+    this.advTimeoutMs = opts.advTimeoutMs || 15000;
+    this.timeoutMs = opts.timeoutMs || 60000;
+    this._advRetries = 0;
+    this._gotRequest = false;
+    this._timer = null;
     // onProgress(servedParts, totalParts, servedBytes, totalBytes) — fired
     // after each part goes out. Counts DISTINCT parts (a re-requested part
     // doesn't move the bar), so the fraction is honest under stall recovery.
@@ -403,19 +456,13 @@ export class ResourceSender {
 
   async start() {
     const data = this.data;
-    this.randomHash = randomBytes(RANDOM_HASH_SIZE);  // adv.r — integrity/hashmap salt
 
     // §10.2: a fresh 4-byte throwaway prefix travels inside the encrypted
     // blob (distinct from randomHash); receiver strips & discards it.
     const blob = concatBytes([randomBytes(RANDOM_HASH_SIZE), data]);
     const encrypted = await this.link.encrypt(blob);
 
-    // Hash/proof are over the ORIGINAL plaintext + randomHash (not the prefix,
-    // not the encrypted form) so both sides agree (§10.2 step 5 / §10.8).
-    this.hash = await sha256(concatBytes([data, this.randomHash]));
-    this.expectedProof = await sha256(concatBytes([data, this.hash]));
-
-    // Slice the encrypted whole into parts; fingerprint each to a 4-byte map hash.
+    // Slice the encrypted whole into parts.
     this.parts = [];
     for (let off = 0; off < encrypted.length; off += this.sdu) {
       this.parts.push(encrypted.subarray(off, off + this.sdu));
@@ -424,13 +471,31 @@ export class ResourceSender {
     this.totalParts = this.parts.length;
     this.transferSize = encrypted.length;   // wire bytes, for progress/rate
 
-    this.mapHashes = [];
-    this.partByMapHash = new Map();
-    for (let i = 0; i < this.totalParts; i++) {
-      const mh = (await sha256(concatBytes([this.parts[i], this.randomHash]))).subarray(0, MAPHASH_LEN);
-      this.mapHashes.push(mh);
-      this.partByMapHash.set(hex(mh), this.parts[i]);
+    // Fingerprint each part to a 4-byte map hash salted with randomHash
+    // (adv.r). §10.2 step 7 collision guard: two parts with the same map
+    // hash would be indistinguishable to the receiver, so on any collision
+    // pick a new randomHash and redo the map (we guard the whole map, which
+    // is stricter than upstream's 2×WINDOW_MAX+74 window).
+    for (let attempt = 0; ; attempt++) {
+      this.randomHash = randomBytes(RANDOM_HASH_SIZE);
+      this.mapHashes = [];
+      this.partByMapHash = new Map();
+      let collided = false;
+      for (let i = 0; i < this.totalParts; i++) {
+        const mh = (await sha256(concatBytes([this.parts[i], this.randomHash]))).subarray(0, MAPHASH_LEN);
+        const k = hex(mh);
+        if (this.partByMapHash.has(k)) { collided = true; break; }
+        this.mapHashes.push(mh);
+        this.partByMapHash.set(k, this.parts[i]);
+      }
+      if (!collided) break;
+      if (attempt >= 16) throw new Error('resource: could not build a collision-free hashmap');
     }
+
+    // Hash/proof are over the ORIGINAL plaintext + randomHash (not the prefix,
+    // not the encrypted form) so both sides agree (§10.2 step 5 / §10.8).
+    this.hash = await sha256(concatBytes([data, this.randomHash]));
+    this.expectedProof = await sha256(concatBytes([data, this.hash]));
 
     let f = FLAG_ENCRYPTED;
     if (this.isRequest) f |= FLAG_IS_REQUEST;
@@ -442,7 +507,37 @@ export class ResourceSender {
       h: this.hash, r: this.randomHash, o: this.hash, i: 1, l: 1,
       q: this.requestId, f, m: concatBytes(this.mapHashes.slice(0, firstCount)),
     };
-    await this.send(CTX_RESOURCE_ADV, new Uint8Array(msgpackEncode(adv)), false);
+    this._advBody = new Uint8Array(msgpackEncode(adv));
+    await this.send(CTX_RESOURCE_ADV, this._advBody, false);
+    this._arm();
+  }
+
+  // One timer drives both retry paths: before the first REQ it re-sends the
+  // advertisement (up to MAX_ADV_RETRIES), after it it is an inactivity
+  // timeout — no REQ/proof for timeoutMs means the receiver is gone.
+  _arm() {
+    if (this.done) return;
+    clearTimeout(this._timer);
+    this._timer = setTimeout(() => this._onTimer(), this._gotRequest ? this.timeoutMs : this.advTimeoutMs);
+  }
+
+  async _onTimer() {
+    if (this.done) return;
+    if (!this._gotRequest && this._advRetries < MAX_ADV_RETRIES) {
+      this._advRetries++;
+      try { await this.send(CTX_RESOURCE_ADV, this._advBody, false); } catch { /* retried on next tick */ }
+      this._arm();
+      return;
+    }
+    this._finish(this._gotRequest ? 'receiver went silent (transfer timed out)' : 'no response to resource advertisement', true);
+  }
+
+  _finish(reason, sendCancel) {
+    if (this.done) return;
+    this.done = true;
+    clearTimeout(this._timer);
+    if (sendCancel) { try { this.send(CTX_RESOURCE_ICL, this.hash, false); } catch { /* best effort */ } }
+    if (reason) this.onError(reason); else this.onComplete();
   }
 
   // RESOURCE_REQ (0x03): serve the requested parts, and the next hashmap
@@ -455,6 +550,15 @@ export class ResourceSender {
     if (exhausted === HASHMAP_IS_EXHAUSTED) { lastMapHash = plaintext.subarray(off, off + MAPHASH_LEN); off += MAPHASH_LEN; }
     const resHash = plaintext.subarray(off, off + 32); off += 32;
     if (!arraysEqual(resHash, this.hash)) return;  // not ours
+    this._gotRequest = true;
+    this._arm();
+
+    // RNS >= 1.6 HASHMAP_IS_EMPTY: the receiver holds no map hashes yet;
+    // answer with segment 0 (no boundary check, no parts) (§10.5).
+    if (exhausted === HASHMAP_IS_EMPTY) {
+      await this._sendHashmapSegment(0);
+      return;
+    }
 
     for (; off + MAPHASH_LEN <= plaintext.length; off += MAPHASH_LEN) {
       const mhHex = hex(plaintext.subarray(off, off + MAPHASH_LEN));
@@ -473,40 +577,40 @@ export class ResourceSender {
 
     if (exhausted === HASHMAP_IS_EXHAUSTED && lastMapHash) {
       const idx = this.mapHashes.findIndex((m) => arraysEqual(m, lastMapHash));
-      if (idx >= 0) {
-        const segStart = idx + 1;
-        const seg = this.mapHashes.slice(segStart, segStart + HASHMAP_MAX_LEN);
-        if (seg.length) {
-          const body = concatBytes([this.hash, new Uint8Array(msgpackEncode([Math.floor(segStart / HASHMAP_MAX_LEN), concatBytes(seg)]))]);
-          await this.send(CTX_RESOURCE_HMU, body, false);
-        } else {
-          // §10.7 (RNS >= 1.3.9): no hashmap left to continue with means the
-          // receiver's request sequencing is broken — cancel instead of
-          // emitting an empty HMU (or, pre-fix, silently stalling the peer).
-          this.done = true;
-          try { await this.send(CTX_RESOURCE_ICL, this.hash, false); } catch { /* best effort */ }
-          this.onError('exhausted REQ past end of hashmap — cancelling (SPEC §10.7)');
-        }
+      // §10.7 boundary check: an exhausted REQ must name the LAST hash of a
+      // whole segment; anything else is broken request sequencing.
+      if (idx < 0 || (idx + 1) % HASHMAP_MAX_LEN !== 0) {
+        this._finish('exhausted REQ not at a hashmap segment boundary — cancelling (SPEC §10.7)', true);
+        return;
       }
+      await this._sendHashmapSegment((idx + 1) / HASHMAP_MAX_LEN);
     }
+  }
+
+  async _sendHashmapSegment(segIndex) {
+    const segStart = segIndex * HASHMAP_MAX_LEN;
+    const seg = this.mapHashes.slice(segStart, segStart + HASHMAP_MAX_LEN);
+    if (!seg.length) {
+      // §10.7 (RNS >= 1.3.9): no hashmap left to continue with means the
+      // receiver's request sequencing is broken — cancel instead of
+      // emitting an empty HMU (or, pre-fix, silently stalling the peer).
+      this._finish('exhausted REQ past end of hashmap — cancelling (SPEC §10.7)', true);
+      return;
+    }
+    const body = concatBytes([this.hash, new Uint8Array(msgpackEncode([segIndex, concatBytes(seg)]))]);
+    await this.send(CTX_RESOURCE_HMU, body, false);
   }
 
   // RESOURCE_PRF (0x05): resource_hash(32) || full_proof(32).
   handleProof(proofData) {
     if (this.done) return;
     if (!arraysEqual(proofData.subarray(0, 32), this.hash)) return;  // not ours
-    if (arraysEqual(proofData.subarray(32, 64), this.expectedProof)) {
-      this.done = true;
-      this.onComplete();
-    } else {
-      this.done = true;
-      this.onError('resource proof mismatch');
-    }
+    if (arraysEqual(proofData.subarray(32, 64), this.expectedProof)) this._finish(null, false);
+    else this._finish('resource proof mismatch', false);
   }
 
+  // Peer rejected (RCL) or the link went away — no ICL echo.
   cancel(reason = 'cancelled') {
-    if (this.done) return;
-    this.done = true;
-    this.onError(reason);
+    this._finish(reason, false);
   }
 }
