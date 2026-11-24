@@ -773,52 +773,25 @@ validation.
 
 ## 18. Known gaps and deferred work
 
-### Ratchet emission on outbound announces
+### Resolved since this section was first written
 
-We **parse** ratchet fields on inbound announces so the signature
-verifier doesn't mis-align on the following bytes, but we do **not**
-emit a ratchet in our own announces. The `context_flag` bit of our
-outbound flag byte is always 0. Every node tested so far accepts
-ratchet-less announces for backward compatibility, but a peer running
-strict ratchet-only validation would reject us. Doing this properly
-means generating and persisting an ephemeral X25519 ratchet keypair
-alongside the identity, including its public half in the announce
-(and in the signed data), setting `context_flag=1`, and teaching the
-opportunistic decrypt path to fall back from the identity X25519 key
-to the ratchet key. Non-trivial but well-scoped.
+Every gap originally listed here has since shipped. Kept as a short
+record so older references to "§18" still make sense:
 
-### Link initiation (we are responder-only)
+| Former gap | Where it lives now |
+|---|---|
+| Ratchet emission on outbound announces | `js/announce.js` `buildAnnounce(..., ratchetPub)` sets `context_flag=1` and signs the ratchet; rotation + persistence in `js/app.js`; decrypt falls back across held ratchets in `js/crypto.js` |
+| Link initiation (responder-only) | `js/link.js` implements both roles (ephemeral X25519+Ed25519, LRPROOF verify, LRRTT); used for LXMF-over-Link, NomadNet, and propagation `/get` |
+| Resources over Link | `js/resource.js`, send and receive (attachments, NomadNet pages) |
+| Outbound retry queue | `js/app.js` message states `pending` → … → `failed`, driven by the outbound retry tick with bearer-aware backoff |
+| GitHub Actions CI | `.github/workflows/verify.yml`: `verify_lrproof.py`, `rns_responder.py`, `verify_announce.py` smoke tests, plus the `tests/roundtrip.mjs` JS-vs-RNS harness via `tests/run_tests.py` |
 
-We cannot open a Link to another peer. Messages we originate are
-always delivered opportunistically, which means they fail silently
-for any message larger than roughly 250–300 bytes of content. The
-initiator side of Link uses a different state machine (we generate
-the X25519+Ed25519 ephemerals on our side, wait for an LRPROOF, verify
-it, send an LRRTT, etc.) that is roughly the same amount of code as
-the responder side but with no shared surface.
+### Still open
 
-### Resources (multi-packet transfers over Link)
-
-Neither we nor the responder side handle Resource framing, so
-messages larger than ~415 bytes via Link delivery fail. In practice
-this is fine for text, breaks for anything with an attachment.
-
-### Outbound retry queue
-
-When a send fails (radio off, no path, delivery timeout with no
-proof), we mark the row as "outgoing" in IndexedDB and move on. There
-is no outbound queue, no retry, no "failed" state in the UI.
-
-### GitHub Actions CI
-
-A minimal workflow that installs `rns` and runs
-`python tools/verify_lrproof.py` phase-1 self test would be a useful
-smoke test against RNS upstream drift. The next iteration would
-synthesize a LINKREQUEST with `rns_responder.py`, feed it into
-`js/link.js` under Node (the module only imports `@noble/curves`, no
-browser APIs), and round-trip the resulting LRPROOF back through
-`RNS.Link.validate_proof` to catch any regression in either wire
-direction.
+The authoritative list of deliberately deferred work is the
+"Deferred (Not In Scope)" section of `CLAUDE.md`: propagation-node
+*submission* (we only retrieve), multi-hop transport, LXMF stamps,
+IFAC, GROUP destinations, and multi-segment (> 1 MiB) Resources.
 
 ---
 
