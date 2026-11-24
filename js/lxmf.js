@@ -297,6 +297,21 @@ export function attachStamp(payload, stamp) {
   ]);
 }
 
+// FIELD_AUDIO mode byte (SPEC §5.9.3) → how we can present it. Opus modes
+// (0x10–0x19) are OGG-contained and play natively; Codec2 (0x01–0x09)
+// has no browser decoder, so it's offered as a download instead of a
+// silent broken player. AM_CUSTOM (0xFF): sniff for an OGG header.
+export function audioDescriptor(mode, bytes) {
+  const isOgg = bytes.length >= 4 && bytes[0] === 0x4f && bytes[1] === 0x67 && bytes[2] === 0x67 && bytes[3] === 0x53;  // "OggS"
+  if ((mode >= 0x10 && mode <= 0x19) || (mode === 0xff && isOgg)) {
+    return { kind: 'audio', name: 'voice.ogg', mime: 'audio/ogg', bytes };
+  }
+  if (mode >= 0x01 && mode <= 0x09) {
+    return { kind: 'file', name: `voice-codec2-mode${mode}.c2`, mime: 'application/octet-stream', bytes, note: 'Codec2 voice message (not playable in the browser)' };
+  }
+  return { kind: 'file', name: 'voice.bin', mime: 'application/octet-stream', bytes };
+}
+
 // ---- Helpers ---------------------------------------------------------
 
 function decodeField(val) {

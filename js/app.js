@@ -15,7 +15,7 @@ import { parsePacket, buildPacket, PACKET_ANNOUNCE, PACKET_DATA, PACKET_LINKREQ,
 import { parseAnnounce, validateAnnounce, buildAnnounce, extractDisplayName, parseLxmfAppData, concatBytes, arraysEqual } from './announce.js';
 import { generateStamp, stampValid, destinationStampMaterial, pathRequestStampMaterial, buildPathRequestPayload, stampWorkblock, LXMF_STAMP_SIZE, DESTINATION_COST, DESTINATION_VALUE, LR_COST, PR_VALUE, PR_STAMP_TIMEOUT_MS, STAMPLENGTH } from './stamps.js';
 import { encrypt, decrypt } from './crypto.js';
-import { unpackMessage, unpackLinkMessage, verifyMessageSignature, packMessage, attachStamp } from './lxmf.js';
+import { unpackMessage, unpackLinkMessage, verifyMessageSignature, packMessage, attachStamp, audioDescriptor } from './lxmf.js';
 import { Link, LINK_ACTIVE, LINK_CLOSED, computePacketFullHash, keepaliveSeconds, STALE_FACTOR, BASE_MTU, resourceSdu } from './link.js';
 import { lookupDestination } from './known-destinations.js';
 import { ed25519 } from '@noble/curves/ed25519';
@@ -47,7 +47,7 @@ const MSG_STATE_SENT      = 'sent';       // TX completed, awaiting delivery rec
 const MSG_STATE_DELIVERED = 'delivered';  // inbound PROOF matched this packet hash
 const MSG_STATE_FAILED    = 'failed';     // all retries exhausted
 
-const MSG_MAX_ATTEMPTS = 3;
+const MSG_MAX_ATTEMPTS = 5;        // upstream LXMRouter.MAX_DELIVERY_ATTEMPTS
 // Wait-for-ack schedule, per transport class. Index is (attempts - 1): first
 // entry is the wait after the 1st send, second after the 2nd retransmit, etc.
 // The lora schedule must exceed the mesh's REAL proof round-trip (~3-8s over
@@ -1572,29 +1572,19 @@ async function dispatchIncomingMessage(msg, rxInfo) {
 
   log('info', `  LXMF payload: elements=${msg.payloadElementCount} raw_msgpack=${msg.msgpackData.length}B stripped=${msg.msgpackForHash.length}B destHashInBody=${toHex(msg.destHash).substring(0, 16)}...`);
 
-  // Tap-back reaction (FIELD_REACTION 0x40, SPEC §5.9.8). A reaction is a
-  // standalone empty-body LXMF — it MUST be aggregated onto its target
-  // message, not rendered as its own (empty) bubble. Handle it before the
-  // content dedupe (reactions carry empty content and would collide).
-  const reaction = parseReaction(msg.fields);
-  if (reaction) {
-    await handleIncomingReaction(reaction, sourceHashHex);
+  // §5.2: a link-delivered (or propagated) container names its destination
+  // inside the ciphertext. Anything not addressed to our delivery
+  // destination isn't ours to display.
+  if (myDestHash && msg.destHash && !arraysEqual(msg.destHash, myDestHash)) {
+    log('err', `  LXMF addressed to ${toHex(msg.destHash).substring(0, 16)}..., not us — dropped`);
     return;
   }
 
-  // Session-level dedupe. On a duplicate, increment the count on
-  // the already-saved row and re-render so the user sees "×2", "×3",
-  // etc. but no new bubble appears.
-  const dedupeKey = messageDedupeKey(sourceHashHex, msg.content, msg.timestamp);
-  const existing = recentMessageMap.get(dedupeKey);
-  if (existing) {
-    existing.dupeCount++;
-    log('info', `  Duplicate #${existing.dupeCount} from ${sourceHashHex.substring(0, 12)}... (hops=${rxInfo.hops} RSSI=${rxInfo.rssi})`);
-    await updateMessage(existing.dbId, { dupeCount: existing.dupeCount });
-    if (activeContactHash) await renderMessages(activeContactHash);
-    return;
-  }
-
+  // Resolve the sender and check the signature FIRST (SPEC §5.6, receive
+  // flow step 10): everything below — reactions, tickets, the UI trust
+  // marker — depends on it. sigStatus: 'valid' | 'invalid' | 'unverified'
+  // (sender's key not known yet — upstream's SOURCE_UNKNOWN).
+  let sigStatus = 'unverified';
   for (const [hash, c] of contacts) {
     if (c.identityHash === sourceHashHex || hash === sourceHashHex) {
       senderName = c.displayName;
@@ -1605,10 +1595,12 @@ async function dispatchIncomingMessage(msg, rxInfo) {
       if (c.identity) {
         const result = verifyMessageSignature(msg, c.identity);
         if (result.ok) {
+          sigStatus = 'valid';
           log('ok', `  Signature: valid (${result.variant})`);
           const ticketEntry = getField(msg.fields, FIELD_TICKET);
           if (ticketEntry) rememberTicket(hash, ticketEntry);
         } else {
+          sigStatus = 'invalid';
           log('err', `  Signature: INVALID (both stripped and original failed)`);
         }
       } else {
@@ -1616,6 +1608,37 @@ async function dispatchIncomingMessage(msg, rxInfo) {
       }
       break;
     }
+  }
+
+  // Tap-back reaction (FIELD_REACTION 0x40, SPEC §5.9.8). A reaction is a
+  // standalone empty-body LXMF — it MUST be aggregated onto its target
+  // message, not rendered as its own (empty) bubble. Its reactor IS the
+  // carrying message's signer, so it is only applied with a valid
+  // signature: otherwise anyone could add reactions as anyone.
+  const reaction = parseReaction(msg.fields);
+  if (reaction) {
+    if (sigStatus !== 'valid') {
+      log('info', `  Reaction ignored — signature ${sigStatus}`);
+      return;
+    }
+    await handleIncomingReaction(reaction, sourceHashHex);
+    return;
+  }
+
+  // Session-level dedupe on the LXMF message_id (upstream dedups on the
+  // message hash). On a duplicate, increment the count on the
+  // already-saved row and re-render so the user sees "×2", "×3", etc.
+  // but no new bubble appears.
+  const dedupeKey = msg.messageId
+    ? `id:${toHex(msg.messageId)}`
+    : messageDedupeKey(sourceHashHex, msg.content, msg.timestamp);
+  const existing = recentMessageMap.get(dedupeKey);
+  if (existing) {
+    existing.dupeCount++;
+    log('info', `  Duplicate #${existing.dupeCount} from ${sourceHashHex.substring(0, 12)}... (hops=${rxInfo.hops} RSSI=${rxInfo.rssi})`);
+    await updateMessage(existing.dbId, { dupeCount: existing.dupeCount });
+    if (activeContactHash) await renderMessages(activeContactHash);
+    return;
   }
 
   // No matching contact — auto-create a placeholder so the sidebar
@@ -1690,12 +1713,16 @@ async function dispatchIncomingMessage(msg, rxInfo) {
     // Retrieved from a propagation node (not heard on air) — rendered
     // as "synced" in the bubble meta instead of a hops label.
     propagated: rxInfo.propagated || undefined,
+    sigStatus,
     dupeCount: 1,
   };
-  // Pull out any image/file/audio attachment for rendering.
+  // Pull out image/file/audio attachments for rendering. `attachment` keeps
+  // the first (older code paths read it); `attachments` holds all of them —
+  // FIELD_FILE_ATTACHMENTS is a LIST (§5.9.7) and Sideband sends several.
   try {
-    const att = await attachmentFromFields(msg.fields);
-    if (att) savedMsg.attachment = att;
+    const atts = await attachmentsFromFields(msg.fields);
+    if (atts.length) savedMsg.attachment = atts[0];
+    if (atts.length > 1) savedMsg.attachments = atts;
   } catch (e) { log('info', `  (attachment parse failed: ${e.message})`); }
   const dbId = await saveMessage(savedMsg);
   conversedHashes.add(savedMsg.contactHash);  // surface this thread in Messages
@@ -3283,6 +3310,7 @@ async function sendMessage() {
     await updateMessage(id, {
       packetHash: packetHashHex,
       rawPacket: Array.from(packet),
+      lxmfPlain: Array.from(lxmfPayload),   // re-encrypted on each retry
       messageId: toHex(outMessageId),  // canonical id, for matching inbound reactions
     });
 
@@ -3464,7 +3492,7 @@ async function sendReaction(targetMsg, emoji) {
       contactHash: targetMsg.contactHash, direction: 'outgoing',
       content: '', title: '', timestamp: Date.now(),
       state: radioOn ? MSG_STATE_SENDING : MSG_STATE_PENDING,
-      packetHash: packetHashHex, rawPacket: Array.from(packet),
+      packetHash: packetHashHex, rawPacket: Array.from(packet), lxmfPlain: Array.from(payload),
       isReaction: true, attempts: 0, nextRetryAt: 0,
     };
     const id = await saveMessage(row);
@@ -3720,30 +3748,41 @@ function renderStagedAttachment() {
   $('staged-remove')?.addEventListener('click', clearStagedAttachment);
 }
 
-// Extract a renderable attachment descriptor from a decoded LXMF fields map.
-async function attachmentFromFields(fields) {
+// Extract renderable attachment descriptors from a decoded LXMF fields map:
+// the image (§5.9.2), EVERY entry of FIELD_FILE_ATTACHMENTS (§5.9.7 — a
+// list, not one file), and audio (§5.9.3).
+async function attachmentsFromFields(fields) {
+  const out = [];
+  const toBytes = (v) => (v instanceof Uint8Array ? v : new Uint8Array(v || []));
   const img = getField(fields, 0x06);
   if (Array.isArray(img) && img.length >= 2) {
     const ext = typeof img[0] === 'string' ? img[0] : new TextDecoder().decode(img[0] || new Uint8Array());
-    const bytes = img[1] instanceof Uint8Array ? img[1] : new Uint8Array(img[1] || []);
+    const bytes = toBytes(img[1]);
     const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
-    return { kind: 'image', name: `image.${ext || 'jpg'}`, mime, size: bytes.length, dataUrl: await blobToDataUrl(new Blob([bytes], { type: mime })) };
+    out.push({ kind: 'image', name: `image.${ext || 'jpg'}`, mime, size: bytes.length, dataUrl: await blobToDataUrl(new Blob([bytes], { type: mime })) });
   }
   const files = getField(fields, 0x05);
-  if (Array.isArray(files) && files.length && Array.isArray(files[0])) {
-    const [rawName, rawBytes] = files[0];
-    const name = sanitizeFilename(typeof rawName === 'string' ? rawName : new TextDecoder().decode(rawName || new Uint8Array()));
-    const bytes = rawBytes instanceof Uint8Array ? rawBytes : new Uint8Array(rawBytes || []);
-    return { kind: 'file', name, mime: 'application/octet-stream', size: bytes.length, dataUrl: await blobToDataUrl(new Blob([bytes])) };
+  if (Array.isArray(files)) {
+    for (const entry of files.slice(0, 32)) {
+      if (!Array.isArray(entry) || entry.length < 2) continue;
+      const [rawName, rawBytes] = entry;
+      const name = sanitizeFilename(typeof rawName === 'string' ? rawName : new TextDecoder().decode(rawName || new Uint8Array()));
+      const bytes = toBytes(rawBytes);
+      out.push({ kind: 'file', name, mime: 'application/octet-stream', size: bytes.length, dataUrl: await blobToDataUrl(new Blob([bytes])) });
+    }
   }
   const audio = getField(fields, 0x07);
   if (Array.isArray(audio) && audio.length >= 2) {
-    // Audio receive is best-effort: wrap the bytes and let the browser try.
-    const bytes = audio[1] instanceof Uint8Array ? audio[1] : new Uint8Array(audio[1] || []);
-    return { kind: 'audio', name: 'audio', mime: 'audio/ogg', size: bytes.length, dataUrl: await blobToDataUrl(new Blob([bytes], { type: 'audio/ogg' })) };
+    const a = audioDescriptor(Number(audio[0]), toBytes(audio[1]));
+    out.push({ ...a, size: a.bytes.length, dataUrl: await blobToDataUrl(new Blob([a.bytes], { type: a.mime })), bytes: undefined });
   }
-  return null;
+  return out;
 }
+
+async function attachmentFromFields(fields) {
+  return (await attachmentsFromFields(fields))[0] || null;
+}
+
 
 // Compute the 16-byte truncated SHA-256 of the hashable part of a
 // newly-built outbound packet. The dest_hash field of any inbound
@@ -3770,6 +3809,31 @@ async function computeOutboundPacketHashTruncated(packet) {
 // (sent + nextRetryAt on success, pending or failed on error).
 // Invoked from sendMessage for a fresh row and from the retry tick
 // for a row whose nextRetryAt has passed.
+// Encrypt a packed LXMF payload for `contact` and frame it as one
+// opportunistic DATA packet, with the same §2.3 HEADER_1/HEADER_2 choice
+// sendMessage makes. Used for retries: upstream LXMF builds a NEW packet
+// per attempt (LXMessage.__as_packet → fresh ephemeral key, new packet
+// hash). Re-sending identical bytes is dropped by every relay that saw
+// the first copy (Transport.packet_filter), so a lost proof could never
+// be regenerated across an upstream transport node.
+async function buildOpportunisticPacket(contact, lxmfPayload) {
+  const recipientPub = contact.ratchetPub || contact.identity.encPubKey;
+  const encrypted = await encrypt(lxmfPayload, recipientPub, contact.identity.hash);
+  const pathInfo = pathTable.get(toHex(contact.destHash));
+  if (pathInfo && pathInfo.hops >= 1 && upstreamTransportId) {
+    return buildPacket({
+      headerType: HEADER_2, transportType: TRANSPORT_TRANSPORT,
+      destType: DEST_SINGLE, packetType: PACKET_DATA,
+      destHash: contact.destHash, transportId: upstreamTransportId,
+      context: 0x00, payload: encrypted,
+    });
+  }
+  return buildPacket({
+    headerType: HEADER_1, destType: DEST_SINGLE, packetType: PACKET_DATA,
+    destHash: contact.destHash, context: 0x00, payload: encrypted,
+  });
+}
+
 async function doOutboundSend(id) {
   const row = await getMessageById(id);
   if (!row) return;
@@ -3785,7 +3849,26 @@ async function doOutboundSend(id) {
     await renderMessages(activeContactHash);
   }
 
-  const packet = new Uint8Array(row.rawPacket);
+  let packet = new Uint8Array(row.rawPacket);
+  // Retries: fresh encryption → new packet hash (see buildOpportunisticPacket).
+  // Earlier attempts' hashes are kept so a late proof for any of them still
+  // matches. Rows from before this change (no lxmfPlain) resend as before.
+  if (attemptNumber > 1 && row.lxmfPlain && contact?.identity) {
+    try {
+      const fresh = await buildOpportunisticPacket(contact, new Uint8Array(row.lxmfPlain));
+      if (fresh.length <= 500) {
+        packet = fresh;
+        const prior = [row.packetHash, ...(row.packetHashes || [])].filter(Boolean).slice(0, MSG_MAX_ATTEMPTS);
+        await updateMessage(id, {
+          packetHash: toHex(await computeOutboundPacketHashTruncated(packet)),
+          packetHashes: prior,
+          rawPacket: Array.from(packet),
+        });
+      }
+    } catch (e) {
+      log('info', `  Re-encrypt for retry failed (${e.message}) — resending previous packet`);
+    }
+  }
   try {
     log('info', `Sending to "${label}"${attemptNumber > 1 ? ` (attempt ${attemptNumber})` : ''}...`);
     await rnode.sendPacket(packet);
@@ -3805,7 +3888,7 @@ async function doOutboundSend(id) {
     // FAILED, since on a bridged/multi-hop mesh the reverse-path proof
     // can be lost even when the message did arrive.
     // The PROOF can arrive on the inbound path *during* this send (it
-    // matches on packetHash, which is identical across retransmits), so
+    // matches this attempt's or any earlier attempt's packet hash), so
     // handleDeliveryProof may have already flipped the row to DELIVERED.
     // Re-read and don't downgrade it back to SENT.
     if ((await getMessageById(id))?.state === MSG_STATE_DELIVERED) return;
@@ -3821,7 +3904,7 @@ async function doOutboundSend(id) {
     }
   } catch (e) {
     log('err', `Send failed: ${e.message}`);
-    // A proof for an earlier identical-bytes retransmit may have landed
+    // A proof for an earlier attempt may have landed
     // while this attempt was failing — don't bury DELIVERED under FAILED.
     if ((await getMessageById(id))?.state === MSG_STATE_DELIVERED) return;
     const isFinal = attemptNumber >= MSG_MAX_ATTEMPTS;
@@ -3886,7 +3969,7 @@ async function handleDeliveryProof(pkt) {
   const outgoing = rows.filter(r => r.direction === 'outgoing' && r.packetHash);
   log('info', `  Checking ${outgoing.length} outbound row(s) with stored packetHash`);
   for (const row of outgoing) {
-    if (row.packetHash !== hashHex) continue;
+    if (row.packetHash !== hashHex && !(row.packetHashes || []).includes(hashHex)) continue;
     if (row.state === MSG_STATE_DELIVERED) return;
     await updateMessage(row.id, { state: MSG_STATE_DELIVERED });
     const preview = (row.content || '').substring(0, 24);
@@ -4612,7 +4695,10 @@ async function renderMessages(contactHash, { scrollToNew = false } = {}) {
     const quote = renderReplyPreview(msg, byMessageId);
     const body = msg.content ? `<div class="message-text">${linkifyEscaped(msg.content)}</div>` : '';
     const reactions = renderReactions(msg.reactions);
-    div.innerHTML = `${quote}${renderAttachment(msg.attachment)}${body}${reactions}<div class="meta">${time}${stateIcon}${rxMeta}${newPill}</div>`;
+    const atts = (msg.attachments && msg.attachments.length ? msg.attachments : [msg.attachment]).map(renderAttachment).join('');
+    const trust = renderSignatureBadge(msg);
+    if (msg.sigStatus === 'invalid') div.classList.add('msg-untrusted');
+    div.innerHTML = `${quote}${atts}${body}${reactions}<div class="meta">${time}${stateIcon}${rxMeta}${trust}${newPill}</div>`;
     // Tap-back affordance — only on incoming messages that carry a
     // canonical id to target (mirrors the mobile app: no self-reactions,
     // and rows received before reaction support have no messageId).
@@ -4790,6 +4876,16 @@ function openReactionPicker(anchorEl, targetMsg) {
   };
 }
 
+// Signature trust marker for incoming bubbles (SPEC §5.6). Invalid = the
+// signature didn't verify against the sender's announced key — possibly
+// forged. Unverified = we don't have the sender's key yet.
+function renderSignatureBadge(msg) {
+  if (msg.direction !== 'incoming') return '';
+  if (msg.sigStatus === 'invalid') return ' <span class="sig-badge sig-invalid" title="The signature did not verify against this sender’s key — the message may be forged">⚠ signature invalid</span>';
+  if (msg.sigStatus === 'unverified') return ' <span class="sig-badge sig-unverified" title="Sender’s key not known yet (no announce heard), so the signature could not be checked">unverified</span>';
+  return '';
+}
+
 // Render an attachment descriptor (image preview, file download, or audio
 // player) as HTML inside a message bubble. dataUrl is a self-contained
 // data: URI so nothing is fetched from the network.
@@ -4802,7 +4898,8 @@ function renderAttachment(att) {
   if (att.kind === 'audio') {
     return `<audio class="att-audio" controls src="${att.dataUrl}"></audio>`;
   }
-  return `<a class="att-file" href="${att.dataUrl}" download="${escapeHtml(att.name)}">📎 ${escapeHtml(att.name)}${kb}</a>`;
+  const note = att.note ? ` title="${escapeHtml(att.note)}"` : '';
+  return `<a class="att-file" href="${att.dataUrl}" download="${escapeHtml(att.name)}"${note}>📎 ${escapeHtml(att.name)}${kb}</a>`;
 }
 
 // Render aggregated tap-back reactions (SPEC §5.9.8) as small `👍 2` chips
