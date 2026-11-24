@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · Reticulum</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 0; padding: 32px 20px; min-height: 80vh; display: grid; place-items: center; }
+  main { max-width: 420px; line-height: 1.6; }
+  button { font: inherit; padding: 12px 22px; cursor: pointer; border-radius: 8px; }
+  small { display: block; margin-top: 24px; opacity: .75; }
+</style>
+<main>
+  <h1>Reticulum webclient</h1>
+  <p>Sign in with your existing web username and password. This browser will stay signed in for seven days using a secure cookie.</p>
+  <form action="/auth/login" method="post"><button type="submit">Sign in</button></form>
+  <small>Use a regular tab. Private browsing or clearing cookies can remove your login. iOS pauses messaging while the phone is locked; reconnect on return if your client does not do so automatically.</small>
+</main>
+</html>

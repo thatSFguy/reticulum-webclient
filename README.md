@@ -45,6 +45,8 @@ Works everywhere — including Safari, Firefox, and iOS — by joining the netwo
 
 Full walkthrough — running your own `rnsd`, TLS/`wss://`, the mixed-content caveat, and troubleshooting — in **[docs/TCP-BRIDGE.md](docs/TCP-BRIDGE.md)**.
 
+After you choose WebSocket Connect, the client remembers that intent: it reconnects after network loss, when returning to the foreground, and after refreshing the page. Choosing **Disconnect** disables this behavior, including across refreshes. Retries back off while the server is unavailable and pause while the page is hidden or the device is offline. This does not keep iOS running while locked, and cannot make the browser retain HTTP Basic credentials; authenticated hosting may need a secure remembered-login session.
+
 ### First steps once connected
 
 1. **Set your display name** and click **Send Announce** — this tells the network how to reach you. Your address is under *Your Identity*.
@@ -53,6 +55,8 @@ Full walkthrough — running your own `rnsd`, TLS/`wss://`, the mixed-content ca
 4. **Back up your identity** — *Export Identity* saves your keys as a file. Treat it like a password; anyone with the file can impersonate you.
 
 To browse NomadNet, open the **Browser** view and pick a node from the directory (or paste a node hash).
+
+To share your current position, open a conversation and tap the **location pin** beside the attachment button. Allow browser location access, review the coordinates, reported accuracy and timestamp, optionally include a map link, then choose **Add to message** and **Send**. HTTPS is required. This requests one position only, never background tracking; no location is transmitted automatically. Opening the optional map link shares its coordinates with OpenStreetMap.
 
 ## Platform support
 

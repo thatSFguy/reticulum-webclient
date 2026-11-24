@@ -26,7 +26,7 @@
 <body>
 <main>
   <h1>Privacy Statement</h1>
-  <p class="muted">Reticulum LoRa Web Client and the <code>ws_bridge</code> tool · last updated 2026-06-22</p>
+  <p class="muted">Reticulum LoRa Web Client and the <code>ws_bridge</code> tool · last updated 2026-11-24</p>
 
   <p class="lead"><strong>We do not collect any personal information.</strong> This is a static,
   serverless web application. There are no accounts, no analytics, no cookies, no tracking, and no
@@ -64,6 +64,11 @@
     <li><strong>Firmware version check</strong> — the optional RNode firmware flasher page queries the
     public GitHub API (<code>api.github.com</code>) for the latest firmware release. No identifiers
     beyond a standard web request are sent.</li>
+    <li><strong>Location sharing</strong> — only when you press the location pin in a conversation,
+    the browser asks for your position once (never continuous tracking). You review it, and it is added to
+    your message draft as text; nothing is sent until you press Send, and then only to that recipient,
+    end-to-end encrypted. If you include the optional map link, the recipient opening it shares those
+    coordinates with OpenStreetMap.</li>
     <li><strong>Bridge download</strong> — downloading the <code>ws_bridge</code> binary is a normal
     file download from this site (GitHub Pages).</li>
   </ul>
