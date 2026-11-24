@@ -24,12 +24,13 @@ The Go WebSocket bridge (`tools/ws_bridge.go`) bridging a browser to a public `r
 
 ## Features
 
-- **End-to-end encrypted messaging** with Sideband, MeshChat, NomadNet, and any other LXMF client — text, file and image attachments, emoji reactions, and reply threading. Per-message delivery states (sending → sent ✓ → delivered ✓✓), with automatic retries and a *failed* state.
+- **End-to-end encrypted messaging** with Sideband, MeshChat, NomadNet, and any other LXMF client — text, file and image attachments (several per message), voice messages (Opus), emoji reactions, and reply threading. Per-message delivery states (sending → sent ✓ → delivered ✓✓), with automatic retries and a *failed* state.
+- **Signature checks you can see** — a message whose signature doesn't match the sender's key is flagged *⚠ signature invalid*; one from a sender whose key hasn't been heard yet is tagged *unverified*.
 - **Offline messages** — fetches mail that a propagation node held for you while you were away, on connect and every 15 minutes.
 - **Location sharing** — send your current position once, after reviewing it (never background tracking).
 - **Three ways onto the network:** an RNode LoRa modem over Bluetooth or USB (no internet, no server), any `rnsd` daemon over a small WebSocket bridge (works in every browser, including iOS), or an agnostic-LoRa-Net BLE mesh node.
 - **NomadNet browser** — pages, links, forms, tables, and file downloads, with bookmarks and history.
-- **Nodes view** — everything announcing on the mesh (repeaters, telemetry beacons, other clients), with a map for nodes that broadcast a position.
+- **Nodes view** — everything announcing on the mesh (repeaters, telemetry beacons, propagation nodes, discoverable interfaces, other clients), with a map for nodes that broadcast a position.
 - **Contact sharing** — QR code, contact-card text, or a bare destination hash (the app fetches the peer's key from the network automatically).
 - **Your identity is yours** — generated in the browser, stored locally, exportable/importable as a file (including your display name). No accounts, no server, no phone number.
 
@@ -79,7 +80,8 @@ WebSocket works everywhere, which is the practical way to use the client from Sa
 - **No sending via propagation nodes**: offline messages are *retrieved* from a propagation node, but your own messages are only delivered directly, so the recipient must be reachable when you send (the app keeps retrying while it's open).
 - **No inbound stamp requirement**: you can't require senders to stamp messages to you, and the app doesn't hand out tickets.
 - **No multi-hop transport routing**: this is a leaf node, not a relay.
-- Some NomadNet corners: server-side includes render as placeholders; no identify-on-connect for auth-gated pages.
+- Some NomadNet corners: partials (`p:` links and `{…}` includes) and RRC chat rooms aren't supported (the links say so instead of failing); no identify-on-connect for auth-gated pages.
+- Codec2 voice messages can be downloaded but not played in the browser.
 
 ## Privacy and security in brief
 
