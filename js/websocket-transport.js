@@ -16,6 +16,7 @@ export class WebSocketTransport {
     this._onReceive = null;
     this._onDisconnect = null;
     this._onLog = null;
+    this._abortConnect = null;
   }
 
   get connected() {
@@ -33,6 +34,8 @@ export class WebSocketTransport {
 
     this._log(`Opening WebSocket to ${this.url}...`);
 
+    await this.disconnect();
+
     return new Promise((resolve, reject) => {
       let ws;
       try {
@@ -43,7 +46,24 @@ export class WebSocketTransport {
       }
       ws.binaryType = 'arraybuffer';
 
+      let opened = false;
+      const timeout = setTimeout(() => {
+        if (this.ws !== ws || opened) return;
+        this.ws = null;
+        this._abortConnect = null;
+        ws.close();
+        reject(new Error('WebSocket connection timed out'));
+      }, 12000);
+      this._abortConnect = () => {
+        clearTimeout(timeout);
+        reject(new Error('WebSocket connection cancelled'));
+      };
+
       ws.addEventListener('open', () => {
+        clearTimeout(timeout);
+        if (this.ws !== ws) { ws.close(); return; }
+        opened = true;
+        this._abortConnect = null;
         this._log(`WebSocket connected`);
         resolve();
       }, { once: true });
@@ -52,7 +72,9 @@ export class WebSocketTransport {
         // The error event does not carry a detailed message in most
         // browsers. If the WS closes before open we reject here;
         // once open, errors become disconnects handled below.
-        if (!this.connected) {
+        if (this.ws !== ws) return;
+        if (!opened) {
+          clearTimeout(timeout);
           reject(new Error('WebSocket error before open'));
         } else {
           this._log('WebSocket error');
@@ -60,6 +82,7 @@ export class WebSocketTransport {
       });
 
       ws.addEventListener('message', (evt) => {
+        if (this.ws !== ws) return;
         if (!this._onReceive) return;
         // WebSocket can deliver Blob or ArrayBuffer depending on the
         // binaryType and the send side. We requested ArrayBuffer;
@@ -76,9 +99,13 @@ export class WebSocketTransport {
       });
 
       ws.addEventListener('close', () => {
+        clearTimeout(timeout);
+        if (this.ws !== ws) return;
         this._log('WebSocket disconnected');
         this.ws = null;
-        if (this._onDisconnect) this._onDisconnect();
+        this._abortConnect = null;
+        if (!opened) reject(new Error('WebSocket closed before opening'));
+        else if (this._onDisconnect) this._onDisconnect();
       });
 
       this.ws = ws;
@@ -86,10 +113,11 @@ export class WebSocketTransport {
   }
 
   async disconnect() {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.close();
-    }
+    const ws = this.ws;
     this.ws = null;
+    this._abortConnect?.();
+    this._abortConnect = null;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) ws.close();
   }
 
   async write(data) {

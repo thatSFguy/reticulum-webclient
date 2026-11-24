@@ -90,6 +90,8 @@ jobs:
         run: |
           node tests/identity-backup.mjs
           node tests/location-share.mjs
+          node tests/reconnect.mjs
+          node tests/websocket-transport.mjs
           node tests/aln.mjs
           node tests/reply.mjs
           node tests/propagation.mjs
