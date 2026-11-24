@@ -19,6 +19,18 @@
 <link rel="stylesheet" href="css/style.css">
 <!-- Leaflet CSS is injected lazily by ensureLeaflet() when the Nodes-view
      map is first opened, so it never blocks the initial paint. -->
+<!-- Import map: resolve bare specifiers to self-hosted bundles in lib/.
+     MUST precede every modulepreload / module script: per the HTML spec an
+     import map is rejected once any module fetch has started (Firefox
+     enforces this; Chrome merges late maps, which hid the bug). -->
+<script type="importmap">
+{
+  "imports": {
+    "@noble/curves/ed25519": "./lib/noble-curves-ed25519.js",
+    "@msgpack/msgpack": "./lib/msgpack.js"
+  }
+}
+</script>
 <!-- Parallelize the ES-module graph: without these the browser can't
      discover noble-curves/msgpack until it has fetched and parsed app.js
      (a fetch waterfall that delayed first contentful paint). -->
@@ -804,15 +816,6 @@
   </div>
 </div>
 
-<!-- Import map: resolve bare specifiers to self-hosted bundles in lib/ -->
-<script type="importmap">
-{
-  "imports": {
-    "@noble/curves/ed25519": "./lib/noble-curves-ed25519.js",
-    "@msgpack/msgpack": "./lib/msgpack.js"
-  }
-}
-</script>
 <script type="module" src="js/app.js"></script>
 </body>
 </html>
