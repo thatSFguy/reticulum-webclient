@@ -27,7 +27,7 @@
 'use strict';
 
 import { Sha256, compress, sha256Sync, hkdfSha256Sync, writeLen64 } from './sha256.js';
-import { x25519 } from '../lib/noble-curves-ed25519.js';
+import { x25519, ed25519 } from '../lib/noble-curves-ed25519.js';
 
 // ---- Constants (RNS/Transport.py, RNS/Identity.py, LXMF/LXStamper.py) ----
 
@@ -45,6 +45,11 @@ export const EXTPAYLOADLENGTH    = 18;     // marker + flags + stamp(14) + cost(
 export const WORKBLOCK_EXPAND_ROUNDS    = 3000;
 export const WORKBLOCK_EXPAND_ROUNDS_PN = 1000;
 export const COST_TICKET         = 0x100;
+export const LINK_STAMP_TIMEOUT_MS = 15000;  // RNS Transport.LINK_STAMP_TIMEOUT
+export const PR_STAMP_TIMEOUT_MS   = 15000;  // RNS Transport.PR_STAMP_TIMEOUT
+// Hash-mode searches up to this cost finish in well under a second on one
+// core; spinning up Workers would cost more than it saves.
+const INLINE_HASH_MAX_COST = 18;
 
 const MANTISSA_BITS = 33n;
 const COST_FP_BITS  = 8;
@@ -250,15 +255,97 @@ export function searchHash(searcher, T, maxRounds) {
   return { stamp: null, rounds: maxRounds };
 }
 
-// Try up to `maxRounds` fresh X25519 keypairs whose public key, used as the
-// stamp over `material`, meets the target (RNS _loop_key).
+// Try up to `maxRounds` X25519 keypairs whose public key, used as the stamp
+// over `material`, meets the target (RNS _loop_key). Upstream draws a fresh
+// random key per round; any valid X25519 keypair is equally acceptable to
+// the verifier (it only hashes the public key), so we walk the scalar
+// instead, which is far cheaper than a full ladder per candidate:
+//
+//   priv_i = clamp(random) + 8·i          (stays clamped: low 3 bits 0, bit 254 set)
+//   P_i    = P_0 + i·(8·B)                (one Edwards addition per step)
+//   u_i    = (Z + Y) / (Z − Y)            (Edwards → Montgomery, batched inversion)
+//
+// Every hit is re-derived with x25519.getPublicKey before it is returned,
+// so a fault in this shortcut can only cost speed, never yield a bad key.
+const P25519 = (1n << 255n) - 19n;
+const KEY_BATCH = 128;
+let fastKeyOk = true;
+
+function modPow(b, e, m) {
+  let r = 1n; b %= m;
+  while (e > 0n) { if (e & 1n) r = (r * b) % m; b = (b * b) % m; e >>= 1n; }
+  return r;
+}
+
+function leBytesToBig(b) {
+  let v = 0n;
+  for (let i = b.length - 1; i >= 0; i--) v = (v << 8n) | BigInt(b[i]);
+  return v;
+}
+
+function bigToLe32(v, out, off) {
+  for (let i = 0; i < 32; i++) { out[off + i] = Number(v & 0xffn); v >>= 8n; }
+}
+
 export function searchKey(searcher, T, maxRounds) {
+  if (fastKeyOk) {
+    try { return searchKeyFast(searcher, T, maxRounds); }
+    catch (e) { fastKeyOk = false; console.warn('stamps: fast key search disabled:', e); }
+  }
   const { fb, holeOff } = searcher;
   for (let r = 1; r <= maxRounds; r++) {
     const priv = x25519.utils.randomPrivateKey();
     const pub = x25519.getPublicKey(priv);
     fb.set(pub, holeOff);
     if (leq(hashHole(searcher), T)) return { priv, pub, rounds: r };
+  }
+  return { priv: null, pub: null, rounds: maxRounds };
+}
+
+function searchKeyFast(searcher, T, maxRounds) {
+  const { fb, holeOff } = searcher;
+  const Point = ed25519.ExtendedPoint;
+  const n = ed25519.CURVE.n;
+  const seed = x25519.utils.randomPrivateKey();
+  seed[0] &= 248; seed[31] &= 127; seed[31] |= 64;
+  const s0 = leBytesToBig(seed);
+  if (s0 + 8n * BigInt(maxRounds + KEY_BATCH) >= (1n << 255n)) return { priv: null, pub: null, rounds: 0 };
+  const step = Point.BASE.multiply(8n);
+  let P = Point.BASE.multiply(s0 % n);
+  const num = new Array(KEY_BATCH), den = new Array(KEY_BATCH), acc = new Array(KEY_BATCH);
+  let done = 0;
+  while (done < maxRounds) {
+    const m = Math.min(KEY_BATCH, maxRounds - done);
+    // Collect projective (Z+Y, Z−Y) for P_done .. P_done+m-1.
+    for (let k = 0; k < m; k++) {
+      const { ey: Y, ez: Z } = P;
+      num[k] = (Z + Y) % P25519;
+      den[k] = ((Z - Y) % P25519 + P25519) % P25519;
+      P = P.add(step);
+    }
+    // Montgomery batch inversion of den[0..m).
+    let run = 1n;
+    for (let k = 0; k < m; k++) { acc[k] = run; run = (run * den[k]) % P25519; }
+    let inv = modPow(run, P25519 - 2n, P25519);
+    const u = new Array(m);
+    for (let k = m - 1; k >= 0; k--) {
+      u[k] = (num[k] * ((inv * acc[k]) % P25519)) % P25519;
+      inv = (inv * den[k]) % P25519;
+    }
+    for (let k = 0; k < m; k++) {
+      bigToLe32(u[k], fb, holeOff);
+      if (leq(hashHole(searcher), T)) {
+        const priv = new Uint8Array(32);
+        bigToLe32(s0 + 8n * BigInt(done + k), priv, 0);
+        const pub = x25519.getPublicKey(priv);
+        const cand = fb.subarray(holeOff, holeOff + 32);
+        if (pub.length !== 32 || !pub.every((x, i) => x === cand[i])) {
+          throw new Error('Edwards→Montgomery walk diverged from x25519');
+        }
+        return { priv, pub, rounds: done + k + 1 };
+      }
+    }
+    done += m;
   }
   return { priv: null, pub: null, rounds: maxRounds };
 }
@@ -276,14 +363,14 @@ const yieldTick = () => new Promise(r => setTimeout(r, 0));
 
 // Runs a search job until found or timed out. job = { kind: 'hash'|'key',
 // prefix, size, T }. Resolves { stamp } / { priv, pub } or null.
-async function runSearch(job, { timeoutMs = 0, onProgress } = {}) {
-  if (hasWorkers) {
+async function runSearch(job, { timeoutMs = 0, onProgress, inline = false } = {}) {
+  if (hasWorkers && !inline) {
     try { return await runInWorkers(job, timeoutMs, onProgress); }
     catch (e) { console.warn('stamps: worker search failed, running inline:', e); }
   }
   const searcher = makeSearcher(job.prefix, job.size);
   const deadline = timeoutMs ? Date.now() + timeoutMs : Infinity;
-  const chunk = job.kind === 'key' ? 64 : 20000;
+  const chunk = job.kind === 'key' ? 1024 : 20000;
   let total = 0;
   while (Date.now() < deadline) {
     const res = job.kind === 'key' ? searchKey(searcher, job.T, chunk) : searchHash(searcher, job.T, chunk);
@@ -347,7 +434,8 @@ function checkCost(cost, cap = STAMP_COST_CAP) {
 export async function generateStamp(workblock, cost, { size = LXMF_STAMP_SIZE, timeoutMs = 0, onProgress } = {}) {
   checkCost(cost);
   const T = targetWords(targetFromCost(cost));
-  const res = await runSearch({ kind: 'hash', prefix: workblock, size, T }, { timeoutMs, onProgress });
+  const inline = Number(cost) <= INLINE_HASH_MAX_COST;
+  const res = await runSearch({ kind: 'hash', prefix: workblock, size, T }, { timeoutMs, onProgress, inline });
   if (!res || !res.stamp) return null;
   return { stamp: res.stamp, value: stampValue(workblock, res.stamp), rounds: res.rounds };
 }
@@ -412,6 +500,21 @@ export function parseAnnounceExt(appData, destHash, publicKey, nameHash, require
 export function pathRequestStampMaterial(destHash, tag) {
   return concat(destHash, tag);
 }
+
+// dest(16) || transport_id(16) || tag(16) [|| 0xC1 0x00 || stamp(14)]
+// — 64 bytes stamped, 48 unstamped (RNS 1.6 Transport.request_path).
+export function buildPathRequestPayload(destHash, transportId, tag, stamp = null) {
+  const p = new Uint8Array(stamp ? 64 : 48);
+  p.set(destHash, 0);
+  p.set(transportId, 16);
+  p.set(tag, 32);
+  if (stamp) { p[48] = EXTPAYLOADMARKER; p[49] = 0x00; p.set(stamp, 50); }
+  return p;
+}
+
+// Whether the Edwards-walk key search is active (false once it ever
+// disagreed with x25519 and fell back to per-key ladders). For tests.
+export function fastKeySearchActive() { return fastKeyOk; }
 
 // ---- Misc -------------------------------------------------------------------
 

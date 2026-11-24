@@ -13,7 +13,7 @@ import { initLocationSharing } from './location-share.js';
 import { ReconnectController } from './reconnect.js';
 import { parsePacket, buildPacket, PACKET_ANNOUNCE, PACKET_DATA, PACKET_LINKREQ, PACKET_PROOF, DEST_SINGLE, DEST_LINK, DEST_PLAIN, HEADER_1, HEADER_2, TRANSPORT_BROADCAST, TRANSPORT_TRANSPORT, PACKET_TYPE_NAMES } from './reticulum.js';
 import { parseAnnounce, validateAnnounce, buildAnnounce, extractDisplayName, parseLxmfAppData, concatBytes, arraysEqual } from './announce.js';
-import { generateStamp, stampValid, destinationStampMaterial, DESTINATION_COST, DESTINATION_VALUE, LR_COST, STAMPLENGTH } from './stamps.js';
+import { generateStamp, stampValid, destinationStampMaterial, pathRequestStampMaterial, buildPathRequestPayload, DESTINATION_COST, DESTINATION_VALUE, LR_COST, PR_VALUE, PR_STAMP_TIMEOUT_MS, STAMPLENGTH } from './stamps.js';
 import { encrypt, decrypt } from './crypto.js';
 import { unpackMessage, unpackLinkMessage, verifyMessageSignature, packMessage } from './lxmf.js';
 import { Link, LINK_ACTIVE, LINK_CLOSED, computePacketFullHash } from './link.js';
@@ -1368,11 +1368,26 @@ async function requestPath(destHash) {
     });
   }
 
+  // Register the pending entry BEFORE the (async) stamp search so callers
+  // arriving meanwhile coalesce onto this request instead of starting their own.
+  const done = new Promise((resolve) => {
+    pendingPathRequests.set(destHashHex, { resolve, timer: null });
+  });
+
+  // SPEC §7.1 (RNS >= 1.6): dest || transport_id || tag || 0xC1 0x00 || stamp(14).
+  // Every node now carries a transport_id; a leaf uses an ephemeral one
+  // (it only lets relays spot "the next hop is the requester", §7.2.3).
+  // The stamp is PoW over dest || tag at PR_VALUE; if it can't be found
+  // we fall back to the unstamped 48-byte form, still accepted upstream.
   const tag = new Uint8Array(16);
   crypto.getRandomValues(tag);
-  const payload = new Uint8Array(32);
-  payload.set(destHash, 0);
-  payload.set(tag, 16);
+  let stamp = null;
+  try {
+    const res = await generateStamp(pathRequestStampMaterial(destHash, tag), PR_VALUE,
+      { size: STAMPLENGTH, timeoutMs: PR_STAMP_TIMEOUT_MS });
+    stamp = res?.stamp || null;
+  } catch (e) { log('err', `  path? stamp failed: ${e.message}`); }
+  const payload = buildPathRequestPayload(destHash, ephemeralTransportId, tag, stamp);
 
   const packet = buildPacket({
     headerType: HEADER_1,
@@ -1384,16 +1399,22 @@ async function requestPath(destHash) {
     payload,
   });
 
-  log('info', `  path? sent for ${destHashHex.substring(0,16)}... tag=${toHex(tag).substring(0,16)}`);
-  await rnode.sendPacket(packet);
-
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      pendingPathRequests.delete(destHashHex);
-      resolve(false);
+  log('info', `  path? sent for ${destHashHex.substring(0,16)}... tag=${toHex(tag).substring(0,16)}${stamp ? ' (stamped)' : ' (unstamped)'}`);
+  const entry = pendingPathRequests.get(destHashHex);
+  try {
+    if (!radioOn) throw new Error('radio off');
+    await rnode.sendPacket(packet);
+  } catch (e) {
+    if (entry) { pendingPathRequests.delete(destHashHex); entry.resolve(false); }
+    return done;
+  }
+  if (entry) {
+    entry.timer = setTimeout(() => {
+      if (pendingPathRequests.get(destHashHex) === entry) pendingPathRequests.delete(destHashHex);
+      entry.resolve(false);
     }, PATH_REQUEST_WAIT_MS);
-    pendingPathRequests.set(destHashHex, { resolve, timer });
-  });
+  }
+  return done;
 }
 
 // Try to learn a key-less contact's public key on demand. A path? request
@@ -1436,24 +1457,19 @@ async function recoverContactKey(contact) {
 //   leaf form (len == 32):     data[16:32] = tag
 //   transport form (len > 32): data[16:32] = transport_id, data[32:48] = tag
 async function handlePathRequest(pkt) {
-  if (pkt.payload.length < 17) {
-    // 16B target + at least 1B tag is the minimum acceptable shape.
-    log('info', '  path? rx — tagless or short payload, dropped per §7.2.1');
+  // SPEC §7.2.1 (RNS >= 1.6 parse_path_request): exactly three shapes.
+  //   32  dest || tag                                  (legacy leaf)
+  //   48  dest || transport_id || tag                  (unstamped)
+  //   64  dest || transport_id || tag || 0xC1 fl || stamp(14)
+  // Anything else is a protocol violation. We don't enforce the stamp
+  // (upstream doesn't by default either).
+  const len = pkt.payload.length;
+  if (len !== 32 && len !== 48 && len !== 64) {
+    log('info', `  path? rx — invalid length ${len}, dropped per §7.2.1`);
     return;
   }
   const target = pkt.payload.subarray(0, 16);
-  let tag;
-  if (pkt.payload.length > 32) {
-    // Transport-originator form; skip the 16B transport_id.
-    tag = pkt.payload.subarray(32);
-  } else {
-    tag = pkt.payload.subarray(16);
-  }
-  if (tag.length === 0) {
-    log('info', '  path? rx — tagless, dropped per §7.2.1');
-    return;
-  }
-  if (tag.length > 16) tag = tag.subarray(0, 16);
+  const tag = len === 32 ? pkt.payload.subarray(16, 32) : pkt.payload.subarray(32, 48);
 
   const targetHex = toHex(target);
   const tagHex = toHex(tag);
@@ -1958,6 +1974,13 @@ function defaultLinkTimeoutMs(destHashHex) {
 // signature failure. The caller then uses link.encrypt to wrap
 // payloads and routes them through sendViaLink. timeoutMs null =
 // transport-appropriate default (defaultLinkTimeoutMs).
+// SPEC §7.1: a leaf's path requests carry an ephemeral transport_id, like
+// upstream's per-start ephemeral transport identity. Fresh per page load.
+const ephemeralTransportId = crypto.getRandomValues(new Uint8Array(16));
+
+// destHex -> lr_cost whose link-request stamp search timed out this session.
+const lrStampGaveUp = new Map();
+
 async function openLinkToContact(contact, timeoutMs = null) {
   if (!radioOn) throw new Error('Radio not on');
   if (!contact || !contact.identity || !contact.identity.sigPubKey) {
@@ -1978,10 +2001,26 @@ async function openLinkToContact(contact, timeoutMs = null) {
   // Resolve patience AFTER the preamble — a path response updates hops.
   if (timeoutMs == null) timeoutMs = defaultLinkTimeoutMs(toHex(contact.destHash));
 
-  const { link, requestData } = Link.createInitiator(
-    contact.identity.sigPubKey,
-    contact.destHash,
-  );
+  // SPEC §6.1.1: stamp the LINKREQUEST key when the destination announced
+  // a link-request cost (§4.7). Skipped if a previous attempt at this cost
+  // timed out this session — retrying would just burn another 15 s.
+  const destHex = toHex(contact.destHash);
+  const lrCost = contact.lrCost ?? contacts.get(destHex)?.lrCost ?? null;
+  let link, requestData;
+  if (lrCost && lrStampGaveUp.get(destHex) !== lrCost) {
+    log('info', `  Stamping link request (cost ${lrCost})…`);
+    const r = await Link.createInitiatorStamped(contact.identity.sigPubKey, contact.destHash, lrCost);
+    ({ link, requestData } = r);
+    if (r.stamped) {
+      log('info', `  Link request stamped: value ${r.value} in ${(r.ms / 1000).toFixed(1)}s`);
+    } else {
+      lrStampGaveUp.set(destHex, lrCost);
+      log('info', `  Link-request stamp (cost ${lrCost}) not found in ${(r.ms / 1000).toFixed(1)}s — sending unstamped (accepted unless the node enforces stamps)`);
+    }
+    if (!radioOn) throw new Error('Radio not on');
+  } else {
+    ({ link, requestData } = Link.createInitiator(contact.identity.sigPubKey, contact.destHash));
+  }
 
   // SPEC §2.3 originator HEADER_1 → HEADER_2 conversion, identical to the
   // messaging path: a LINKREQUEST to a destination >= 1 hop away must carry
@@ -2349,9 +2388,8 @@ async function pnSyncNow(trigger = 'manual') {
     }
     pnSetStatus('note: node announced itself paused — it may not answer');
   }
-  if (state && state.stampCost > 0) {
-    log('info', `  PN sync: node advertises retrieval stamp cost ${state.stampCost} — stamps are not implemented, the node may refuse or ignore us`);
-  }
+  // §5.8.5: the announced stamp_cost gates message *submission* to the
+  // node (propagation stamps), not /get retrieval — nothing to do here.
 
   pnState.syncing = true;
   pnState.lastAttemptAt = Date.now();
@@ -2363,6 +2401,7 @@ async function pnSyncNow(trigger = 'manual') {
     await identity.loadFromPublicKey(new Uint8Array(node.publicKey));
     link = await openLinkToContact({
       identity, destHash: hexToBytes(node.hash), displayName: label, hash: node.hash,
+      lrCost: node.lrCost ?? null,
     });
     await sendLinkIdentify(link);
 
@@ -2526,7 +2565,7 @@ async function nnNodeContact(destHashHex) {
   const identity = new Identity();
   await identity.loadFromPublicKey(new Uint8Array(node.publicKey));
   const destHash = hexToBytes(destHashHex);
-  return { identity, destHash, displayName: node.displayName || destHashHex.slice(0, 8), hash: destHashHex };
+  return { identity, destHash, displayName: node.displayName || destHashHex.slice(0, 8), hash: destHashHex, lrCost: node.lrCost ?? null };
 }
 
 // Get an active link to destHashHex, reusing the current browse link when

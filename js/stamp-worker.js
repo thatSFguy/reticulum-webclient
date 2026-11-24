@@ -11,7 +11,7 @@ import { makeSearcher, searchHash, searchKey } from './stamps.js';
 self.onmessage = (ev) => {
   const job = ev.data;
   const searcher = makeSearcher(new Uint8Array(job.prefix), job.size);
-  const chunk = job.kind === 'key' ? 64 : 200000;
+  const chunk = job.kind === 'key' ? 4096 : 200000;
   let total = 0;
   for (;;) {
     const res = job.kind === 'key'

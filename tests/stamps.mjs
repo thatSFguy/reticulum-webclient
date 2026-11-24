@@ -23,12 +23,14 @@ import { Sha256, sha256Sync, hkdfSha256Sync } from "../js/sha256.js";
 import {
   targetFromCost, stampValue, stampValueLegacy, stampValid, stampWorkblock,
   generateStamp, generateStampedKey, destinationStampMaterial, pathRequestStampMaterial,
+  buildPathRequestPayload, fastKeySearchActive,
   DESTINATION_VALUE, DESTINATION_COST, LR_COST, PR_VALUE, STAMPLENGTH,
 } from "../js/stamps.js";
+import { Link } from "../js/link.js";
 import { Identity, computeDestinationHash, computeNameHash } from "../js/identity.js";
 import { buildAnnounce, parseAnnounce, validateAnnounce, extractDisplayName, parseLxmfAppData } from "../js/announce.js";
 import { parsePnAppData } from "../js/propagation.js";
-import { buildPacket, parsePacket, HEADER_1, DEST_SINGLE, PACKET_ANNOUNCE } from "../js/reticulum.js";
+import { buildPacket, parsePacket, HEADER_1, DEST_SINGLE, DEST_PLAIN, PACKET_ANNOUNCE, PACKET_DATA, PACKET_LINKREQ, TRANSPORT_BROADCAST } from "../js/reticulum.js";
 
 let pass = 0, fail = 0;
 const errs = [];
@@ -145,12 +147,31 @@ async function vectors() {
     out.keystamp = { material: toHex(material), cost: 8, priv: toHex(res.priv), pub: toHex(res.pub), value: res.value };
   }
 
-  // Path-request stamp (§7.1): over dest_hash || tag at PR_VALUE.
+  ok(fastKeySearchActive(), "Edwards-walk key search fell back to per-key ladders");
+
+  // Stamped LINKREQUEST at the upstream default LR_COST (§6.1.1), built the
+  // way openLinkToContact does it.
   {
-    const dest = rnd(16), tag = rnd(16);
+    const dest = rnd(16), peerSig = rnd(32);
+    const r = await Link.createInitiatorStamped(peerSig, dest, LR_COST, { timeoutMs: 120000 });
+    ok(r.stamped, "createInitiatorStamped did not stamp at LR_COST");
+    const pkt = buildPacket({ headerType: HEADER_1, destType: DEST_SINGLE, packetType: PACKET_LINKREQ, destHash: dest, context: 0x00, payload: r.requestData });
+    out.linkrequest = { packet: toHex(pkt), dest: toHex(dest), cost: LR_COST, value: r.value, ms: r.ms, priv: toHex(r.link.ourX25519Priv) };
+    // Out-of-range / absent cost must not stamp.
+    const u = await Link.createInitiatorStamped(peerSig, dest, null);
+    ok(!u.stamped && u.requestData.length === 67, "null lr_cost should give a plain 67-byte request");
+  }
+
+  // Path request (§7.1) exactly as requestPath builds it: 64-byte stamped form.
+  {
+    const dest = rnd(16), tag = rnd(16), tid = rnd(16);
     const res = await generateStamp(pathRequestStampMaterial(dest, tag), PR_VALUE, { size: STAMPLENGTH });
     if (!res) throw new Error("path-request stamp generation failed");
-    out.prstamp = { dest: toHex(dest), tag: toHex(tag), stamp: toHex(res.stamp) };
+    const payload = buildPathRequestPayload(dest, tid, tag, res.stamp);
+    ok(payload.length === 64 && buildPathRequestPayload(dest, tid, tag).length === 48, "path-request payload lengths");
+    const pkt = buildPacket({ headerType: HEADER_1, destType: DEST_PLAIN, transportType: TRANSPORT_BROADCAST, packetType: PACKET_DATA,
+      destHash: fromHex("6b9f66014d9853faab220fba47d02761"), context: 0x00, payload });
+    out.prstamp = { dest: toHex(dest), tag: toHex(tag), transportId: toHex(tid), stamp: toHex(res.stamp), payload: toHex(payload), packet: toHex(pkt) };
   }
 
   // Full stamped announce at the upstream generation value (§4.7).
