@@ -22,6 +22,7 @@ import { sha256 } from './identity.js';
 import { hkdfDerive, tokenEncrypt, tokenDecrypt } from './crypto.js';
 import { HEADER_1, TRUNCATED_HASHLENGTH } from './reticulum.js';
 import { concatBytes } from './announce.js';
+import { generateStampedKey, LINK_COST_CAP, LINK_STAMP_TIMEOUT_MS } from './stamps.js';
 
 export const ECPUBSIZE      = 64;   // 32 X25519 + 32 Ed25519
 export const SIGLENGTH      = 64;   // Ed25519 signature
@@ -220,7 +221,11 @@ export class Link {
   // Returns {link, requestData}. The caller wraps requestData in a
   // PACKET_LINKREQ and transmits it, then feeds any incoming LRPROOF
   // back to link.validateProof().
-  static createInitiator(peerLongTermSigPub, peerDestHash) {
+  //
+  // `stampedKey` ({ priv, pub } X25519, plus the Ed25519 pair it was bound
+  // to) comes from createInitiatorStamped (SPEC §6.1.1); without it both
+  // ephemerals are fresh random keys — an unstamped request.
+  static createInitiator(peerLongTermSigPub, peerDestHash, stampedKey = null) {
     const link = new Link();
     link.isInitiator = true;
     link.peerLongTermSigPub = new Uint8Array(peerLongTermSigPub);
@@ -231,10 +236,17 @@ export class Link {
     // The Ed25519 pub goes into the LINKREQUEST body as bytes 32..63
     // but the initiator's identity is NOT authenticated to the
     // responder by this — it's just a fresh key per session.
-    link.ourX25519Priv = x25519.utils.randomPrivateKey();
-    link.ourX25519Pub  = x25519.getPublicKey(link.ourX25519Priv);
-    link.ourSigPriv    = ed25519.utils.randomPrivateKey();
-    link.ourSigPub     = ed25519.getPublicKey(link.ourSigPriv);
+    if (stampedKey) {
+      link.ourX25519Priv = stampedKey.priv;
+      link.ourX25519Pub  = stampedKey.pub;
+      link.ourSigPriv    = stampedKey.sigPriv;
+      link.ourSigPub     = stampedKey.sigPub;
+    } else {
+      link.ourX25519Priv = x25519.utils.randomPrivateKey();
+      link.ourX25519Pub  = x25519.getPublicKey(link.ourX25519Priv);
+      link.ourSigPriv    = ed25519.utils.randomPrivateKey();
+      link.ourSigPub     = ed25519.getPublicKey(link.ourSigPriv);
+    }
 
     link.signallingBytes = encodeSignalling(link.mtu, link.mode);
 
@@ -245,6 +257,33 @@ export class Link {
     ]);
 
     return { link, requestData };
+  }
+
+  // SPEC §6.1.1 (RNS >= 1.6): when the destination announced a link-request
+  // cost (§4.7 trailer), the initiator's ephemeral X25519 key is itself a
+  // proof-of-work stamp: SHA-256(dest_hash || ed25519_pub || x25519_pub)
+  // must meet target(lr_cost). The Ed25519 key is drawn first because it
+  // fixes the material; X25519 keys are then searched. No bytes change on
+  // the wire. Upstream gives up after LINK_STAMP_TIMEOUT and closes the
+  // link; we instead fall back to an unstamped request, which responders
+  // accept unless they enforce stamps. Resolves { link, requestData,
+  // stamped, value, ms }.
+  static async createInitiatorStamped(peerLongTermSigPub, peerDestHash, lrCost, { timeoutMs = LINK_STAMP_TIMEOUT_MS } = {}) {
+    const cost = Number(lrCost);
+    if (!(cost > 0) || cost > LINK_COST_CAP) {
+      return { ...Link.createInitiator(peerLongTermSigPub, peerDestHash), stamped: false, value: null, ms: 0 };
+    }
+    const t0 = Date.now();
+    const sigPriv = ed25519.utils.randomPrivateKey();
+    const sigPub = ed25519.getPublicKey(sigPriv);
+    const material = concatBytes([new Uint8Array(peerDestHash), sigPub]);
+    const key = await generateStampedKey(material, cost, { timeoutMs });
+    const ms = Date.now() - t0;
+    if (!key) {
+      return { ...Link.createInitiator(peerLongTermSigPub, peerDestHash), stamped: false, value: null, ms };
+    }
+    const r = Link.createInitiator(peerLongTermSigPub, peerDestHash, { priv: key.priv, pub: key.pub, sigPriv, sigPub });
+    return { ...r, stamped: true, value: key.value, ms };
   }
 
   // Tell the initiator link what its link_id is, computed from the

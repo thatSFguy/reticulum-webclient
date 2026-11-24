@@ -113,6 +113,9 @@ Everything from the original phased plan shipped long ago, plus a lot the plan d
 - Announces (send/receive/validate, ratchet field, display names, path responses)
 - **Announce stamps** (§4.7, RNS 1.6) — validate/strip the trailer and record the
   peer's link-request cost; generate our own destination stamp once (persisted)
+- **Link-request stamps** (§6.1.1) — stamped ephemeral X25519 key when the destination
+  announced a cost (falls back to unstamped on timeout); **stamped path requests**
+  (§7.1, 64-byte form with ephemeral transport_id); inbound path? lengths per §7.2.1
 - Opportunistic LXMF send/receive with delivery proofs and retries
 - **Ratchets** — encrypt to the peer's announced ratchet key; rotate our own
 - **Links** — handshake, session crypto, keepalive, LXMF-over-Link

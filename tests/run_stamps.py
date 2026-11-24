@@ -89,8 +89,27 @@ def main():
     check(X25519PrivateKey.from_private_bytes(priv).public_key().public_bytes() == pub, "X25519 priv -> pub matches")
     check(Stamps.stamp_valid(pub, k["cost"], mat), f"key stamp valid at cost {k['cost']}")
 
-    print(f"{INFO} path-request stamp")
+    print(f"{INFO} stamped LINKREQUEST (value {v['linkrequest']['value']}, {v['linkrequest']['ms']} ms)")
+    lr = v["linkrequest"]
+    lp = Packet(None, None)
+    lp.raw = bytes.fromhex(lr["packet"])
+    lp.unpack()
+    xpub, edpub = lp.data[:32], lp.data[32:64]
+    check(lp.packet_type == RNS.Packet.LINKREQUEST and len(lp.data) == 67, "LINKREQUEST shape (67 bytes, signalling kept)")
+    check(Stamps.stamp_valid(xpub, lr["cost"], bytes.fromhex(lr["dest"]) + edpub),
+          f"RNS accepts the stamped key at lr_cost {lr['cost']} (material dest||ed25519_pub)")
+    check(X25519PrivateKey.from_private_bytes(bytes.fromhex(lr["priv"])).public_key().public_bytes() == xpub,
+          "link X25519 private key matches the stamped public key")
+
+    print(f"{INFO} path request")
     p = v["prstamp"]
+    pp = Packet(None, None)
+    pp.raw = bytes.fromhex(p["packet"])
+    pp.unpack()
+    check(pp.destination_hash.hex() == "6b9f66014d9853faab220fba47d02761" and len(pp.data) == 64, "path? packet: PLAIN dest, 64-byte payload")
+    parsed = RNS.Transport.parse_path_request(pp.data)
+    check(parsed is not None and parsed[0].hex() == p["dest"] and parsed[1].hex() == p["transportId"] and parsed[2].hex() == p["tag"],
+          "RNS.Transport.parse_path_request splits dest / transport_id / tag", repr(parsed))
     check(RNS.Transport.validate_pr_stamp(bytes.fromhex(p["stamp"]), bytes.fromhex(p["dest"]), bytes.fromhex(p["tag"])),
           "RNS.Transport.validate_pr_stamp accepts it at PR_COST")
 
