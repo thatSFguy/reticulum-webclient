@@ -5,8 +5,8 @@
 // REQUEST/RESPONSE protocol over an identify()-d Link:
 //
 //   /get [null, null]                  → [transient_id, ...] listing
-//   /get [wanted, have, limit_kb]      → [timebase, [lxmf_data, ...]] bundle,
-//                                        and the node purges `have` ids
+//   /get [wanted, have, limit_kb]      → [lxmf_data, ...] flat list (SPEC
+//                                        §5.8.3), and the node purges `have` ids
 //
 // Each lxmf_data blob is dest_hash(16) || ciphertext — the same encrypted
 // body the sender produced; the propagation node never decrypts it. These
@@ -14,19 +14,29 @@
 
 'use strict';
 
-import { decode as msgpackDecode } from '@msgpack/msgpack';
+import { decode as msgpackDecode, decodeMulti as msgpackDecodeMulti } from '@msgpack/msgpack';
+
+// First msgpack object only — tolerate an unvalidated RNS 1.6 announce
+// stamp trailer (SPEC §4.7) after it, as umsgpack does.
+function decodeFirst(bytes) {
+  for (const v of msgpackDecodeMulti(bytes)) return v;
+  throw new Error('empty msgpack buffer');
+}
 
 export const PN_NAME     = 'lxmf.propagation';
 export const PN_GET_PATH = '/get';
 
 // LXMPeer error codes returned as a bare integer RESPONSE (SPEC §5.8.2).
+// Not contiguous: 0xf2 is unallocated upstream.
 const PN_ERROR_NAMES = {
   0xf0: 'not identified on link (ERROR_NO_IDENTITY)',
   0xf1: 'access denied (ERROR_NO_ACCESS)',
-  0xf2: 'rate-limited, retry later (ERROR_THROTTLED)',
   0xf3: 'invalid key (ERROR_INVALID_KEY)',
   0xf4: 'malformed request (ERROR_INVALID_DATA)',
-  0xf5: 'not found (ERROR_NOT_FOUND)',
+  0xf5: 'invalid stamp (ERROR_INVALID_STAMP)',
+  0xf6: 'rate-limited, retry later (ERROR_THROTTLED)',
+  0xfd: 'not found (ERROR_NOT_FOUND)',
+  0xfe: 'timed out (ERROR_TIMEOUT)',
 };
 
 export function pnErrorName(code) {
@@ -44,7 +54,7 @@ export function pnResponseIsError(response) {
 // shape violation; callers treat that as "node config unknown".
 export function parsePnAppData(bytes) {
   try {
-    const d = msgpackDecode(bytes);
+    const d = decodeFirst(bytes);
     if (!Array.isArray(d) || d.length < 7) return null;
     const costs = d[5];
     if (!Array.isArray(costs) || costs.length < 3) return null;
@@ -80,8 +90,9 @@ export function normalizeIdList(response) {
 }
 
 // Normalize a /get message-fetch RESPONSE to { timebase, messages }.
-// Canonical shape is [timebase, [lxmf_data, ...]] (SPEC §5.8.3); accept a
-// still-packed msgpack blob and a bare blob list defensively.
+// Upstream returns a flat [lxmf_data, ...] list (SPEC §5.8.3, corrected
+// 2026-08-28). [timebase, [lxmf_data, ...]] is the *upload* envelope
+// (§5.8.2); it's still accepted defensively, as is a still-packed blob.
 export function normalizeMessageBundle(response) {
   let v = response;
   if (v instanceof Uint8Array) {

@@ -1,0 +1,94 @@
+{
+  "_about": "Announce test vectors. Each entry's `expected.wire_bytes_hex` is the full packed announce bytes (header + body). Drop them into a fresh RNS.Packet via the inbound path and call RNS.Identity.validate_announce; it MUST accept. The `expected.fields` block decomposes the wire bytes into named slices per SPEC.md S4.1 for human inspection. Regenerate with the script in `generator_script`.",
+  "vectors": [
+    {
+      "label": "alice_lxmf_no_ratchet",
+      "context_flag": 0,
+      "with_ratchet": false,
+      "inputs": {
+        "identity_label": "alice",
+        "destination_full_name": "vectors.alice_announce_no_ratchet",
+        "random_hash_prefix_hex": "a1a2a3a4a5",
+        "random_hash_timestamp": 1700000000,
+        "ratchet_priv_hex": null,
+        "app_data_msgpack_hex": "92c409416c6963655465737400",
+        "app_data_decoded": [
+          "AliceTest",
+          0
+        ],
+        "destination_stamp_hex": "32e1213a71282249808106cbda75",
+        "note": "body_app_data_hex is app_data_msgpack_hex followed by the S4.7 18-byte trailer: c1 00 || destination_stamp(14) || lr_cost (fraction byte first; 80 0c = 12.5, the default LR_COST)."
+      },
+      "expected": {
+        "destination_hash_hex": "d9587f0be518490591c181755404d851",
+        "wire_bytes_hex": "0100d9587f0be518490591c181755404d8510076fce269b2356a51b6a832a1a25099155acb20733b453f9538aaa8069e854d5a780708b44424373474ee1607c3f2b4a1cd5643de508e106e6b8cf4a10f00ec7c8b5739ff0fe7afaf7157a1a2a3a4a5006553f100895a8fc9d909640e6669663975ac387c179c3bb57a93bd1563bb9d1aa42dc932e72247e1ed1dec3c19649d80f79fe4d61b86de4487706e031e9ca9958325ed0092c409416c6963655465737400c10032e1213a71282249808106cbda75800c",
+        "fields": {
+          "header_flags_hex": "01",
+          "header_hops_hex": "00",
+          "header_dest_hash_hex": "d9587f0be518490591c181755404d851",
+          "header_context_hex": "00",
+          "body_public_key_hex": "76fce269b2356a51b6a832a1a25099155acb20733b453f9538aaa8069e854d5a780708b44424373474ee1607c3f2b4a1cd5643de508e106e6b8cf4a10f00ec7c",
+          "body_name_hash_hex": "8b5739ff0fe7afaf7157",
+          "body_random_hash_hex": "a1a2a3a4a5006553f100",
+          "body_signature_hex": "895a8fc9d909640e6669663975ac387c179c3bb57a93bd1563bb9d1aa42dc932e72247e1ed1dec3c19649d80f79fe4d61b86de4487706e031e9ca9958325ed00",
+          "body_app_data_hex": "92c409416c6963655465737400c10032e1213a71282249808106cbda75800c"
+        }
+      },
+      "rns_version_at_generation": "1.6.1",
+      "generator_script": "tools/regen_announces.py",
+      "verifies_spec_sections": [
+        "2.1",
+        "4.1",
+        "4.2",
+        "4.3",
+        "4.5",
+        "4.7"
+      ]
+    },
+    {
+      "label": "alice_lxmf_with_ratchet",
+      "context_flag": 1,
+      "with_ratchet": true,
+      "inputs": {
+        "identity_label": "alice",
+        "destination_full_name": "vectors.alice_announce_with_ratchet",
+        "random_hash_prefix_hex": "a1a2a3a4a5",
+        "random_hash_timestamp": 1700000000,
+        "ratchet_priv_hex": "b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0",
+        "app_data_msgpack_hex": "92c409416c6963655465737400",
+        "app_data_decoded": [
+          "AliceTest",
+          0
+        ],
+        "destination_stamp_hex": "add495d12a15ad4b5189764bb8e5",
+        "note": "body_app_data_hex is app_data_msgpack_hex followed by the S4.7 18-byte trailer: c1 00 || destination_stamp(14) || lr_cost (fraction byte first; 80 0c = 12.5, the default LR_COST)."
+      },
+      "expected": {
+        "destination_hash_hex": "141410d233872609cf7b9f075afb4ebb",
+        "wire_bytes_hex": "2100141410d233872609cf7b9f075afb4ebb0076fce269b2356a51b6a832a1a25099155acb20733b453f9538aaa8069e854d5a780708b44424373474ee1607c3f2b4a1cd5643de508e106e6b8cf4a10f00ec7c5130f0a9b2e01f693bd0a1a2a3a4a5006553f100cd700e88f9e99b19c1a8a8dcd58182fd101e5e032a69ce317fde23e8ee265c5156a8381c257dbe0151dc615a4ce90cd82e631238e94316d3e01212355a5f3af2f42b659e784dd4adc4a600b3e0e97c09d3a24b1379a46f33ea7273d405382b0192c409416c6963655465737400c100add495d12a15ad4b5189764bb8e5800c",
+        "fields": {
+          "header_flags_hex": "21",
+          "header_hops_hex": "00",
+          "header_dest_hash_hex": "141410d233872609cf7b9f075afb4ebb",
+          "header_context_hex": "00",
+          "body_public_key_hex": "76fce269b2356a51b6a832a1a25099155acb20733b453f9538aaa8069e854d5a780708b44424373474ee1607c3f2b4a1cd5643de508e106e6b8cf4a10f00ec7c",
+          "body_name_hash_hex": "5130f0a9b2e01f693bd0",
+          "body_random_hash_hex": "a1a2a3a4a5006553f100",
+          "body_signature_hex": "56a8381c257dbe0151dc615a4ce90cd82e631238e94316d3e01212355a5f3af2f42b659e784dd4adc4a600b3e0e97c09d3a24b1379a46f33ea7273d405382b01",
+          "body_app_data_hex": "92c409416c6963655465737400c100add495d12a15ad4b5189764bb8e5800c",
+          "body_ratchet_pub_hex": "cd700e88f9e99b19c1a8a8dcd58182fd101e5e032a69ce317fde23e8ee265c51"
+        }
+      },
+      "rns_version_at_generation": "1.6.1",
+      "generator_script": "tools/regen_announces.py",
+      "verifies_spec_sections": [
+        "2.1",
+        "4.1",
+        "4.2",
+        "4.3",
+        "4.5",
+        "4.7"
+      ]
+    }
+  ]
+}

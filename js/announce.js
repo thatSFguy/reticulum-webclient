@@ -9,13 +9,22 @@
 'use strict';
 
 import { ed25519 } from '@noble/curves/ed25519';
-import { decode as msgpackDecode } from '@msgpack/msgpack';
+import { decodeMulti as msgpackDecodeMulti } from '@msgpack/msgpack';
 import { Identity, computeDestinationHash, computeNameHash, sha256, truncatedHash } from './identity.js';
 import { KEYSIZE, SIGLENGTH, NAME_HASH_LENGTH, TRUNCATED_HASHLENGTH } from './reticulum.js';
 import { toHex } from './kiss.js';
+import { parseAnnounceExt, buildAnnounceExt, DESTINATION_COST } from './stamps.js';
 
 // Parse an announce packet's payload (data after Reticulum header).
-// Returns { publicKey, nameHash, randomHash, ratchet, signature, appData, identityHash, destHash }
+// Returns { publicKey, nameHash, randomHash, ratchet, signature, appData,
+//           signedAppData, stamp, identityHash, destHash }
+//
+// `signedAppData` is app_data exactly as it rode the wire (what the §4.2
+// signature covers). `appData` is the application part: since RNS 1.6
+// app_data ends with an 18-byte stamp trailer (SPEC §4.7), and — like
+// upstream Identity.validate_announce — we strip it only when the stamp
+// validates at DESTINATION_COST. `stamp` = { stamped, valid, value, lrCost };
+// lrCost is the link-request cost the destination wants (§6.1.1), or null.
 export async function parseAnnounce(payload, contextFlag, destHashFromHeader) {
   if (payload.length < KEYSIZE + NAME_HASH_LENGTH + NAME_HASH_LENGTH + SIGLENGTH) {
     return null;  // too short
@@ -51,15 +60,20 @@ export async function parseAnnounce(payload, contextFlag, destHashFromHeader) {
   }
   const destHash = destHashFromHeader || expectedDestHash;
 
+  const ext = parseAnnounceExt(appData, destHash, publicKey, nameHash, DESTINATION_COST);
+
   return {
-    publicKey, nameHash, randomHash, ratchet, signature, appData,
+    publicKey, nameHash, randomHash, ratchet, signature,
+    appData: ext.appData, signedAppData: appData,
+    stamp: { stamped: ext.stamped, valid: ext.valid, value: ext.value, lrCost: ext.lrCost },
     identityHash, destHash, appName: 'lxmf.delivery',
   };
 }
 
 // Validate an announce's Ed25519 signature
 export function validateAnnounce(announce, destHashFromHeader) {
-  const { publicKey, nameHash, randomHash, ratchet, signature, appData } = announce;
+  const { publicKey, nameHash, randomHash, ratchet, signature } = announce;
+  const appData = announce.signedAppData ?? announce.appData;
 
   // Build signed_data = dest_hash + public_key + name_hash + random_hash + [ratchet] + app_data
   const parts = [destHashFromHeader, publicKey, nameHash, randomHash];
@@ -88,9 +102,14 @@ export function validateAnnounce(announce, destHashFromHeader) {
 // header's `contextFlag` bit to 1 so receivers know to parse the
 // extra 32 bytes. The returned `hasRatchet` flag is a convenience
 // for the caller that drives `buildPacket`.
-export async function buildAnnounce(identity, appName = 'lxmf.delivery', appData = new Uint8Array(0), ratchetPub = null) {
+//
+// If `destStamp` (14 bytes, SPEC §4.7) is supplied, the RNS 1.6 extension
+// trailer `0xC1 00 || stamp || lr_cost` is appended to app_data before
+// signing, advertising `lrCost` as our inbound link-request cost.
+export async function buildAnnounce(identity, appName = 'lxmf.delivery', appData = new Uint8Array(0), ratchetPub = null, destStamp = null, lrCost = undefined) {
   const nameHash = await computeNameHash(appName);
   const destHash = await computeDestinationHash(appName, identity.hash);
+  if (destStamp) appData = concatBytes([appData, buildAnnounceExt(destStamp, lrCost)]);
 
   // random_hash is 5 random bytes + 5-byte big-endian uint40 of the
   // emission Unix timestamp. Upstream RNS reads the trailing 5 bytes
@@ -128,16 +147,56 @@ export async function buildAnnounce(identity, appName = 'lxmf.delivery', appData
   return { destHash, payload, hasRatchet: !!ratchetPub };
 }
 
+// Decode the FIRST msgpack object in `bytes`, ignoring anything after it
+// (umsgpack semantics). SPEC §4.3: a parser MUST NOT require the value to
+// end the buffer — an RNS 1.6 stamp trailer we couldn't validate (§4.7)
+// is still attached. Throws if the buffer doesn't start with msgpack.
+export function decodeFirstMsgpack(bytes) {
+  for (const v of msgpackDecodeMulti(bytes)) return v;
+  throw new Error('empty msgpack buffer');
+}
+
+// Return app_data with a trailing §4.7 extension removed if one is
+// structurally present (marker byte in the right place), regardless of
+// whether its stamp validated. Display-only helper: upstream keeps an
+// unvalidated trailer, but no application field ever ends in one.
+export function withoutAnnounceExt(appData) {
+  if (appData && appData.length >= 18 && appData[appData.length - 18] === 0xC1
+      && (appData[appData.length - 1] & 0x80) === 0) {
+    return appData.subarray(0, appData.length - 18);
+  }
+  return appData;
+}
+
+// Parse the LXMF delivery announce app_data (SPEC §4.3):
+//   [display_name(bin), stamp_cost_int|nil, [SF_*]?, stamp_cost_frac|nil]
+// Returns { name, stampCost } — stampCost is the cost a sender must pay
+// to message this destination (§5.7.4), validated to 1 <= c < 100, else
+// null. Element [3] (exact fractional cost, LXMF 1.3) wins over [1].
+export function parseLxmfAppData(appData) {
+  const out = { name: extractDisplayName(appData), stampCost: null };
+  try {
+    const d = decodeFirstMsgpack(appData);
+    if (Array.isArray(d)) {
+      let c = null;
+      if (d.length > 3 && typeof d[3] === 'number') c = d[3];
+      else if (d.length > 1 && typeof d[1] === 'number') c = d[1];
+      if (c !== null && Number.isFinite(c) && c >= 1 && c < 100) out.stampCost = c;
+    }
+  } catch { /* not msgpack — no cost */ }
+  return out;
+}
+
 // Extract display name from announce app_data.
 // LXMF/Sideband announces app_data as msgpack, typically:
-//   [display_name_bytes, stamp_cost]
+//   [display_name_bytes, stamp_cost, ...]
 // or sometimes a raw UTF-8 string. Try msgpack first, fall back to UTF-8.
 export function extractDisplayName(appData) {
   if (!appData || appData.length === 0) return null;
 
-  // Try msgpack decode
+  // Try msgpack decode (first object only; trailing bytes tolerated)
   try {
-    const decoded = msgpackDecode(appData);
+    const decoded = decodeFirstMsgpack(appData);
     if (Array.isArray(decoded) && decoded.length > 0) {
       // First element is the display name (bytes or string)
       const name = decoded[0];
@@ -154,9 +213,12 @@ export function extractDisplayName(appData) {
     // Not valid msgpack — fall through to raw UTF-8
   }
 
-  // Fall back: try raw UTF-8 (strict, returns null on invalid bytes)
+  // Fall back: try raw UTF-8 (strict, returns null on invalid bytes),
+  // minus any unvalidated §4.7 trailer (0xC1 is never valid UTF-8).
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(appData);
+    const body = withoutAnnounceExt(appData);
+    if (!body.length) return null;
+    return new TextDecoder('utf-8', { fatal: true }).decode(body);
   } catch {
     return null;
   }
