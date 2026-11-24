@@ -82,6 +82,10 @@ export function parsePacket(data) {
     payload     = data.subarray(2 + 2 * TRUNCATED_HASHLENGTH + 1);
   }
 
+  // SPEC §2.2 (RNS >= 1.5.2): an empty data field is malformed — the
+  // shortest conformant frames are 20 (HEADER_1) / 36 (HEADER_2) bytes.
+  if (payload.length === 0) return null;
+
   return {
     raw: data, flags, hops, headerType, contextFlag, transportType,
     destType, packetType, destHash, transportId, context, payload,

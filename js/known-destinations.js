@@ -25,6 +25,10 @@ export const KNOWN_DESTINATIONS = {
   '9efb9c771eeb5ae90ea6': { name: 'rnstransport.broadcasts',         label: 'RNS transport broadcast' },
   '4848a053c16415bed6c8': { name: 'rnstransport.remote.management',  label: 'RNS remote management' },
   '3eea23374d2a3aedf2cc': { name: 'rlr.telemetry',                   label: 'RLR telemetry beacon' },
+  '55aa39e85c3e045e9cb1': { name: 'rnstransport.discovery.interface', label: 'Discoverable interface' },
+  '9e059549ef49a8c64d18': { name: 'rnstransport.info.blackhole',     label: 'Blackhole list publisher' },
+  '4576672b3f55049c2e46': { name: 'lxmf.propagation.control',        label: 'LXMF propagation control' },
+  'ac9fd3a81e4036f86e1d': { name: 'rrc.hub',                         label: 'RRC chat hub' },
 };
 
 // Look up a name_hash in the table. Accepts either a hex string or

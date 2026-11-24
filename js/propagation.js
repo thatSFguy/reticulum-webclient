@@ -52,6 +52,14 @@ export function pnResponseIsError(response) {
 // Element [5] MUST be a 3-element list — misparsing it as an int is the
 // classic interop break the spec warns about. Returns null on any
 // shape violation; callers treat that as "node config unknown".
+function pnMetaName(meta) {
+  if (!meta || typeof meta !== 'object') return null;
+  const v = meta instanceof Map ? meta.get(0x01) : (meta[1] ?? meta['1']);
+  if (v instanceof Uint8Array) return new TextDecoder('utf-8', { fatal: false }).decode(v) || null;
+  if (typeof v === 'string') return v || null;
+  return null;
+}
+
 export function parsePnAppData(bytes) {
   try {
     const d = decodeFirst(bytes);
@@ -67,6 +75,9 @@ export function parsePnAppData(bytes) {
       stampCostFlexibility: Number(costs[1]) || 0,
       peeringCost:          Number(costs[2]) || 0,
       metadata:             d[6] ?? null,
+      // §5.9.5: PN_META_NAME (0x01) in element [6] is the node's name, as
+      // msgpack BIN (other keys in the same map are str — don't assume).
+      name:                 pnMetaName(d[6]),
     };
   } catch {
     return null;
